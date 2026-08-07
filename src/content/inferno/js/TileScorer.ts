@@ -437,6 +437,25 @@ export const NPC_DISTANCE_PENALTY = 0.01;
 export const SAFE_SPOT_MIN = 0.1;
 
 /**
+ * Paid on tiles a shot can be taken from, divided by how many attackers can shoot BACK.
+ *
+ * `npcReachSoon` says a fight is available but nothing about the terms of it. Between two
+ * tiles that both let us hit something, the one three mobs are looking at is a far worse place
+ * to stand than the one where only the target can see us - and until now those scored
+ * identically on reach and were separated only by whatever `damageTaken` happened to make of
+ * them, which is nothing at all while every incoming attack is prayable.
+ *
+ * Full value when at most one attacker has the tile, halved at two, a third at three. It only
+ * applies where reach already does: this is about choosing WHICH fight to take, and a tile we
+ * cannot shoot from is not a fight.
+ *
+ * The divisor is floored at one so an unwatched tile is worth the same as a tile only the
+ * target itself watches, rather than infinity. Reaching a mob that cannot reach back is
+ * already the best case and gets the full point either way.
+ */
+export const LOS_BONUS = 1;
+
+/**
  * Cap on the settle simulation behind the safe-spot claim.
  *
  * "Settled" is detected by fixed point, not by running the cap out, so this is a backstop
@@ -693,6 +712,8 @@ export function distanceToNearestMob(region: Region, player: Player): number | n
 export interface ScoreParts {
   barrageReach: number;
   npcReachSoon: number;
+  /** `LOS_BONUS` shared between everything that can shoot this tile; 0 without reach. */
+  losBonus: number;
   safeSpot: number;
   damageTaken: number;
   threats: number;
@@ -728,6 +749,27 @@ function scoreRoute(
   const arrivesInWindow =
     route.length - 1 <= PLAYER_TILES_PER_TICK * NPC_REACH_ARRIVAL_TICKS;
 
+  /**
+   * Standing inside a mob's footprint. Nothing can be attacked from here.
+   *
+   * The engine is unambiguous: `LocationUtils.closestPointTo` returns the player's OWN tile
+   * when the player is inside the footprint, and `hasLineOfSight` from a tile to itself trips
+   * its `collisionMath` guard and returns false. `isAttackable` therefore refuses, and so does
+   * the mob in the other direction - being underneath is the one place neither side can act.
+   *
+   * The reach test could not see that, because it runs INSIDE the simulation and the
+   * simulation has already moved. `simulateTrajectory` steps mobs before it calls back, and
+   * `stepMob` always shuffles a mob off a player standing under it - so by the time reach was
+   * judged the mob had stepped aside and the tile banked a point for a shot that cannot be
+   * taken while standing there, on the strength of a shuffle whose direction is a coin flip.
+   *
+   * Judged at tick 0, against where the mobs really are, for the same reason `barrageReach`
+   * is: this is a claim about the tile as it is now, not about a future the projection made up.
+   */
+  const destinationUnderMob = mobs.some((mob) =>
+    playerIsUnder(mob, destination.x, destination.y),
+  );
+
   // Reach means: standing on this tile, the engine would actually let a shot off at a mob -
   // either where it stands right now, or where the simulation walks it within
   // NPC_REACH_WINDOW_TICKS of our arrival. `snapshotPlayerCanSeeMob` is the same test
@@ -747,7 +789,26 @@ function scoreRoute(
   // reached cannot be called safe.
   let arrived = false;
   let arrivalTick = 0;
-  let destinationExposed = false;
+
+  /**
+   * Every attacker that has this destination in sight and range at ANY tick from arrival to
+   * the end of the horizon - the mobs that will get to shoot at us for standing here.
+   *
+   * Distinct mobs, over the whole window, and both halves of that matter. Counting a single
+   * tick was wrong for the reason every other one-instant judgement in this file was wrong:
+   * the mobs are still walking when we arrive, so a tile one mob can see on the arrival tick
+   * and three can see four ticks later reads as quiet at exactly the moment it is being
+   * surrounded. And counting the WORST tick rather than the distinct set would miss two mobs
+   * that take turns - each alone on its tick, both shooting us.
+   *
+   * `mob.attacks` filters out anything that cannot hurt us (nibblers chase pillars), and
+   * `mobSeesPlayer` is line of sight AND range, so this is "will shoot me here" rather than
+   * "is pointing this way". Identity works as a set key because `simulateTrajectory` copies
+   * the mobs once and steps the same objects every tick.
+   */
+  const watchers = new Set<SimMob>();
+  // Everything that could possibly join the set, so the scan can stop once they all have.
+  const attackerCount = mobs.reduce((total, mob) => (mob.attacks ? total + 1 : total), 0);
 
   // Play the walk forward twelve ticks once, then plan the best overhead sequence against
   // whatever fires. What survives that plan is what this move actually costs - and whether
@@ -774,6 +835,7 @@ function scoreRoute(
       // independent knobs - a far tile no longer spends its mob patience on its own walk.
       if (
         arrivesInWindow &&
+        !destinationUnderMob &&
         npcReachSoon === 0 &&
         tick - arrivalTick <= NPC_REACH_WINDOW_TICKS
       ) {
@@ -794,19 +856,21 @@ function scoreRoute(
       // attack-cooldown fires no shot the sim could record, but it holds the tile at gunpoint
       // all the same. Judged against the PROJECTED positions on each tick, so a meleer that
       // will walk around the pillar during the window correctly spoils the tile.
-      if (!destinationExposed) {
+      if (watchers.size < attackerCount) {
         for (const mob of simMobs) {
-          if (!mob.attacks) {
+          if (!mob.attacks || watchers.has(mob)) {
             continue;
           }
           if (mobSeesPlayer(snapshot, mob, px, py)) {
-            destinationExposed = true;
-            break;
+            watchers.add(mob);
           }
         }
       }
     },
   );
+  // Exposure is now just "did anything ever have it": one gathering pass, so the safe-spot
+  // test and the watcher count can never disagree about who can see this tile.
+  const destinationExposed = watchers.size > 0;
   const damageTaken = planOverheads(threats).damage;
 
   // Safe means: something is on the board to be safe FROM, the walk is clean (whatever fires
@@ -815,10 +879,16 @@ function scoreRoute(
   // us standing on it, which is what `settlesSafe` extends the simulation to prove. The
   // horizon evidence runs first because it is already paid for; the settle pass only runs for
   // tiles that survive everything else.
+  // Never under a mob. Being inside a footprint LOOKS perfectly safe - the mob cannot attack
+  // what it is standing on, so nothing fires and nothing watches - but it is safe for exactly
+  // one tick: `stepMob` reproduces the engine shuffling the mob off the player, and the
+  // direction of that shuffle is a coin flip nothing can predict. Measured on a size 4 meleer:
+  // its whole 4x4 footprint scored 2 to 2.79 - reach 1, los 1 (nothing can see you), safe 0.78
+  // - the best tiles on the grid, from a position where the bot can neither hit nor be hit.
   let safeSpot = 0;
-  const anyAttacker = mobs.some((mob) => mob.attacks);
   if (
-    anyAttacker &&
+    !destinationUnderMob &&
+    attackerCount > 0 &&
     arrived &&
     !destinationExposed &&
     damageTaken === 0 &&
@@ -830,16 +900,26 @@ function scoreRoute(
     safeSpot = Math.max(SAFE_SPOT_MIN, SAFE_SPOT_BONUS - penalty);
   }
 
+  // Only where a shot is actually available - see LOS_BONUS. Divided by everything that gets
+  // to shoot back across the whole post-arrival window, not by a single tick's worth.
+  const losBonus = npcReachSoon > 0 ? LOS_BONUS / Math.max(1, watchers.size) : 0;
+
   const parts: ScoreParts = {
     barrageReach: barrageReach(snapshot, focus, route),
     npcReachSoon,
+    losBonus,
     safeSpot,
     damageTaken,
     threats: threats.length,
   };
 
   return {
-    score: parts.barrageReach + parts.npcReachSoon + parts.safeSpot - parts.damageTaken,
+    score:
+      parts.barrageReach +
+      parts.npcReachSoon +
+      parts.losBonus +
+      parts.safeSpot -
+      parts.damageTaken,
     parts,
   };
 }
