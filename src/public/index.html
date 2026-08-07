@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, user-scalable=no" />
+    <link rel="manifest" href="./manifest.json" />
+    <link rel="icon" type="image/png" href="./webappicon.png" />
+    <title>Inferno Simulator</title>
+    <style>
+      @font-face {
+        font-family: "OSRS";
+        src:
+          url(./assets/fonts/RuneScape-UF.woff2) format("woff2"),
+          url(./assets/fonts/RuneScape-UF.woff) format("woff");
+      }
+
+      @font-face {
+        font-family: "Stats_11";
+        src:
+          url(./assets/fonts/RuneScape-Plain-11.woff2) format("woff2"),
+          url(./assets/fonts/RuneScape-Plain-11.woff) format("woff");
+      }
+
+      @font-face {
+        font-family: "Stats_12";
+        src:
+          url(./assets/fonts/RuneScape-Plain-12.woff2) format("woff2"),
+          url(./assets/fonts/RuneScape-Plain-12.woff) format("woff");
+      }
+
+      body {
+        overscroll-behavior: contain;
+        overscroll-behavior-y: none;
+        font-family: "OSRS";
+        background: black;
+        font-weight: normal;
+        font-style: normal;
+        color: #ffff00;
+        margin: 0;
+        overflow-y: hidden;
+      }
+
+      #world {
+        position: fixed;
+      }
+
+      .hidden {
+        display: none !important;
+      }
+
+      hr {
+        border-top: 1px solid #ffff00;
+        border-bottom: 0;
+      }
+
+      button,
+      input[type="text"],
+      #right_panel a,
+      select {
+        border: 1px #ffff00 solid;
+        background-color: black;
+        padding: 10px 0;
+        text-align: center;
+        text-decoration: none;
+        display: inline-block;
+        font-size: 16px;
+        margin: 4px 2px;
+        cursor: pointer;
+        font-family: "OSRS";
+        color: #ffff00;
+        width: 100%;
+      }
+
+      select {
+        text-align: center;
+        text-align-last: center;
+      }
+
+      input[type="checkbox"] {
+        width: 30px;
+      }
+
+      #player_tile {
+        width: 100%;
+        text-align: center;
+        padding: 6px 0;
+        margin: 4px 0;
+        border: 1px solid #555500;
+        font-size: 16px;
+        color: #ffff00;
+      }
+
+      /* Automation toggle: red while off, green while running. */
+      #toggleAutomation {
+        background-color: #7a0f0f;
+        border-color: #ff5555;
+        color: #ffffff;
+        font-weight: bold;
+      }
+
+      /*
+       * Automation log. Selectable text in the sidebar rather than painted on the canvas, so a
+       * run of ticks can actually be copied out and read - the overlay banner shows only the
+       * current tick and cannot be selected.
+       */
+      #automation_log_section {
+        margin-top: 6px;
+      }
+
+      #automation_log_header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 11px;
+        color: #ffff00;
+      }
+
+      #automation_log {
+        max-height: 190px;
+        overflow: auto;
+        margin: 2px 0 0 0;
+        padding: 3px;
+        background: #0d0d0d;
+        border: 1px solid #3a3a3a;
+        color: #d8d8d8;
+        font-family: monospace;
+        font-size: 10px;
+        line-height: 1.35;
+        white-space: pre;
+        user-select: text;
+      }
+
+      #toggleAutomation.enabled {
+        background-color: #12661f;
+        border-color: #55ff55;
+        color: #ffffff;
+      }
+
+      .stats-font-11 {
+        font-family: "Stats_11";
+        font-size: 11px;
+      }
+
+      .stats-font-12 {
+        font-family: "Stats_12";
+        font-size: 12px;
+      }
+
+      #disclaimer_panel {
+        display: inline;
+        position: absolute;
+        bottom: 4px;
+        left: 4px;
+        text-align: left;
+        pointer-events: none;
+      }
+
+      #right_panel {
+        display: inline-block;
+        width: 200px;
+        top: 0;
+        right: 14px;
+        height: 100vh;
+        position: absolute;
+        background: black;
+        padding: 30px 10px;
+        overflow-y: auto;
+        overflow-x: hidden;
+      }
+
+      #set_timer {
+        width: 203px;
+        height: 130px;
+        background: #282828;
+        text-align: center;
+        color: white;
+        font-size: 60px;
+      }
+
+      #set_timer button {
+        width: 96%;
+      }
+
+      canvas {
+        image-rendering: pixelated;
+      }
+
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
+      #death_modal {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.7);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1000;
+      }
+
+      .death-modal-content {
+        background: black;
+        border: 1px solid #ffff00;
+        padding: 30px 24px;
+        width: 360px;
+        max-width: 90%;
+        text-align: center;
+        font-family: "OSRS";
+        color: #ffff00;
+      }
+
+      .death-modal-content h2 {
+        font-family: "OSRS";
+        color: #ffff00;
+        font-weight: normal;
+        margin: 0 0 20px 0;
+        font-size: 28px;
+      }
+
+      .death-modal-content button {
+        font-family: "OSRS";
+        font-size: 18px;
+        padding: 10px 0;
+        margin: 6px 0;
+        width: 100%;
+        background: black;
+        color: #ffff00;
+        border: 1px solid #ffff00;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <h1 class="sr-only">Inferno Simulator</h1>
+
+    <canvas id="world" onselectstart="return false" oncontextmenu="return false"></canvas>
+    <div id="disclaimer_panel">All assets are property of Jagex.</div>
+
+    <div id="death_modal" class="hidden">
+      <div class="death-modal-content">
+        <h2>Oh dear, you died..</h2>
+        <button id="death_close">Close</button>
+      </div>
+    </div>
+
+    <div id="right_panel">
+      <div id="sidebar_content"><!-- replaced by the Region -->Loading content...</div>
+      <button id="reset">Reset</button>
+      <button id="settings">Settings</button>
+      <hr />
+      <span style="display: none;">More settings:</span>
+      <div style="width: 100%; text-align: center; padding-top: 10px; padding-bottom: 10px; display: none;">
+        <input type="color" id="tileMarkerColor" name="tileMarkerColor" value="#FF0000" />
+        <label for="tileMarkerColor">Tile Markers</label>
+      </div>
+      <div style="width: 100%; text-align: center; padding-top: 10px; padding-bottom: 10px">
+        <input type="checkbox" id="use3dView" name="use3dView" />
+        <label for="use3dView">Use 3D View (Experimental)</label>
+        <div id="gpu_warning"></div>
+      </div>
+    </div>
+
+    <!-- OffscreenCanvas polyfill -->
+    <script>
+      if (!window.OffscreenCanvas) {
+        window.OffscreenCanvas = class OffscreenCanvas {
+          constructor(width, height) {
+            this.canvas = document.createElement("canvas");
+            this.canvas.width = width;
+            this.canvas.height = height;
+
+            this.canvas.convertToBlob = () => {
+              return new Promise((resolve) => {
+                this.canvas.toBlob(resolve);
+              });
+            };
+
+            return this.canvas;
+          }
+        };
+      }
+    </script>
+
+    <script src="./main.js"></script>
+  </body>
+</html>
