@@ -7,35 +7,49 @@ import { attackReachFor } from "./TargetPlanner";
 import { visibleMobs } from "./Visibility";
 
 /**
- * What to attack, by a fixed priority band and then by distance.
+ * What to attack, by a per-mob priority and then by distance.
  *
- * DELIBERATELY SIMPLE, AND DELIBERATELY TEMPORARY. This is here to get the bot grinding so the
- * rest of the picture can be looked at with one fewer moving part, not because a priority list is
- * the right long-term answer. `TargetPlanner.chooseTarget` is the real one - it prices a target by
- * simulating the fight without it, which already includes the pillar damage a nibbler would do -
- * and swapping to it is a one line change at the call site in InfernoAutomation.
+ * A priority list is still not the long-term answer - `TargetPlanner.chooseTarget` prices a
+ * target by simulating the fight without it, and swapping to it is a one line change at the
+ * call site in InfernoAutomation - but it is now a real ordering rather than three bands with
+ * everything piled into the middle one.
  *
- * The bands encode three judgements that the counterfactual works out for itself:
+ * The numbers below are the whole ranking; the table in SCORING_STATUS.md is the same list with
+ * the reasoning written out. What the ordering CANNOT express is anything that changes during a
+ * fight: remaining hitpoints, ticks to kill, the cost of a gear switch, or what a mob is about
+ * to do. Those are the counterfactual's job.
  *
- *   - nibblers first, because the damage they do is to the PILLARS, and a pillar lost is
- *     permanent for the rest of the run;
- *   - blobs last, because killing one replaces it with three bloblets, so it is not pure gain;
- *   - everything else in the middle, separated only by how near it is.
+ * The shield is listed at 0 for completeness, but it never reaches this function - it is
+ * excluded upstream by `AttackPlanner.isAttackable`, which now refuses any mob whose own
+ * `canBeAttacked()` says no. Priority cannot express "unkillable": a 0 still wins when it is
+ * the only thing in reach.
  */
+const PRIORITY: Record<string, number> = {
+  [EntityNames.JAL_NIB]: 10, // nibbler - pillar damage is permanent
+  [EntityNames.JAL_IM_KOT]: 8, // meleer - 49 max, digs when starved
+  [EntityNames.JAL_MEJ_RAJ]: 7, // bat
+  [EntityNames.JAL_AK_REK_KET]: 7, // melee bloblet
+  [EntityNames.JAL_AK_REK_MEJ]: 7, // magic bloblet
+  [EntityNames.JAL_AK_REK_XIL]: 7, // ranged bloblet
+  [EntityNames.JAL_ZEK]: 6, // mager - 70 max, resurrects dead mobs
+  [EntityNames.JAL_XIL]: 5, // ranger - 46 max
+  [EntityNames.YT_HUR_KOT]: 2, // Jad healer
+  [EntityNames.JAL_MEJ_JAK]: 2, // Zuk healer
+  [EntityNames.JAL_TOK_JAD]: 1,
+  [EntityNames.TZ_KAL_ZUK]: 1,
+  [EntityNames.JAL_AK]: 1, // blob - killing it spawns three bloblets, so not pure gain
+  [EntityNames.INFERNO_SHIELD]: 0, // never targeted; see the note above
+};
 
-export const NIBBLER_PRIORITY = 10;
+/**
+ * Anything not in the table: mid-list, so a mob nobody has ranked is neither ignored nor
+ * rushed. Every mob the Inferno spawns IS ranked, so this only catches something new.
+ */
 export const DEFAULT_PRIORITY = 5;
-export const BLOB_PRIORITY = 1;
 
 export function killPriority(mob: Mob): number {
-  switch (mob.mobName()) {
-    case EntityNames.JAL_NIB:
-      return NIBBLER_PRIORITY;
-    case EntityNames.JAL_AK:
-      return BLOB_PRIORITY;
-    default:
-      return DEFAULT_PRIORITY;
-  }
+  const priority = PRIORITY[mob.mobName()];
+  return priority === undefined ? DEFAULT_PRIORITY : priority;
 }
 
 /** Chebyshev distance, which is how OSRS measures reach. */

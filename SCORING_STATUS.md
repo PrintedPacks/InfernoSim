@@ -52,3 +52,49 @@ called. Update this table whenever a term is added, removed, or swapped in.
 |---|---|---|---|
 | Tile grid (`Show tile grid` checkbox) | `TileGrid.ts` | **Live** | In-world overlay of all 441 scored tiles, coloured by score, labelled to 1 decimal — coarse by design, 441 labels share the screen |
 | Debug Panel (`Debug Panel` button, sidebar) | `DebugPanel.ts` | **Live** | Floating panel, exact (unrounded) numbers. Currently one row: distance (Chebyshev) from the player to the nearest live mob, via `TileScorer.distanceToNearestMob` — same input `safeSpot`'s penalty reads, just not rounded for a tile label. Add more rows in `InfernoRegion.updateDebugPanel()` as needed |
+
+# ATTACKING
+
+## Target priority — `KillPriority.chooseByPriority`
+
+Per-mob priority (`PRIORITY` in `KillPriority.ts`), highest killed first, distance breaking ties
+within a score. `DEFAULT_PRIORITY` (5) catches anything not listed — every mob the Inferno
+spawns is listed, so it only applies to something new.
+
+| Score | NPC | Role |
+|:-----:|-----|------|
+| **10** | `Jal-Nib` | nibbler — eats pillars, damage is permanent |
+| 8 | `Jal-ImKot` | meleer — 49 max hit, digs when starved |
+| 7 | `Jal-MejRah` | bat |
+| 7 | `Jal-AkRek-Ket` | melee bloblet — 15 hp |
+| 7 | `Jal-AkRek-Mej` | magic bloblet — 15 hp |
+| 7 | `Jal-AkRek-Xil` | ranged bloblet — 15 hp |
+| 6 | `Jal-Zek` | mager — 70 max hit, resurrects dead mobs |
+| 5 | `Jal-Xil` | ranger — 46 max hit |
+| 2 | `Yt-HurKot` | Jad healer |
+| 2 | `Jal-MejJak` | Zuk healer |
+| 1 | `JalTok-Jad` | Jad |
+| 1 | `TzKal-Zuk` | Zuk |
+| 1 | `Jal-Ak` | blob — killing it spawns 3 bloblets, so not pure gain |
+| **0** | `Inferno shield` | Zuk's moving shield — **never targeted**, excluded upstream |
+
+**Selection rules, in order:** loaded Ice Barrage overrides everything (`bestBarrageNibbler`,
+most unfrozen nibblers in the 3×3 blast) → filter to mobs visible, alive, **attackable**
+(`canBeAttacked()`) and reachable *with that mob's own gear-set range* → highest priority →
+nearest within that priority (Chebyshev) → **sticky** (current target held unless strictly
+outranked or unreachable) → reset on every reposition, since `moveTo()` interrupts combat.
+
+**Resolved 2026-08:** the shield is no longer targetable by us. `AttackPlanner.isAttackable`
+now asks the mob's own `canBeAttacked()`, which `ZukShield` sets false — so it is filtered out
+before priority is consulted (a 0 would still win when it is the only thing in reach). Nothing
+about the mobs changed: the shield still blocks, and whatever the engine points at it still
+attacks it.
+
+**Known gaps**
+
+- Nothing prices remaining hp, ticks-to-kill, gear-switch cost, or what a mob is about to do.
+  `TargetPlanner.chooseTarget` does — built, not wired.
+
+# STUCK TEST
+
+http://localhost:8000/?wave=1&akrekxil=[[18,10],[18,8]]&akrekket=[[18,11]]&akrekmej=[[18,9]]&nibblers=false&x=29&y=18

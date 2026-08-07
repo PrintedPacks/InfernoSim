@@ -38,6 +38,16 @@ export function isAttackable(
   if (!mob || mob.dying > -1) {
     return false;
   }
+  // The mob's own veto, and the only thing that models "you cannot kill this". Zuk's shield
+  // sets `canBeAttacked()` false (and `selectable` false) precisely because it is scenery with
+  // hitpoints: it is in region.mobs, it is drawn, it is enormous, and it is parked next to the
+  // player for the whole of wave 69 - so without this it is simply the nearest thing in reach
+  // and the bot would sit clicking it forever. Asked of the mob rather than by name so anything
+  // else the engine marks unattackable is covered too. Nothing here changes what the MOBS do:
+  // the shield still blocks and is still attacked by whatever the engine points at it.
+  if (typeof mob.canBeAttacked === "function" && !mob.canBeAttacked()) {
+    return false;
+  }
   return LineOfSight.playerHasLineOfSightOfMob(
     region,
     player.location.x,
