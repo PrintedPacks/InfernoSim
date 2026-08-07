@@ -3,7 +3,6 @@
 import { EntityNames, Location, Mob, Player, Region } from "osrs-sdk";
 
 import { ArenaSnapshot, snapshotPlayerCanSeeMob } from "./ArenaSnapshot";
-import { InfernoSettings } from "./InfernoSettings";
 import { planOverheads } from "./OverheadPlanner";
 import { BARRAGE_RANGE, NibblerThreat, nibblerThreats } from "./PillarDefence";
 import { attackReachFor } from "./TargetPlanner";
@@ -47,18 +46,25 @@ import { visibleMobs } from "./Visibility";
  * the bot camped a tile scored reach 1, clicking attack at a mob the engine refused to fire at,
  * until its prayer ran out. Reach that cannot be cashed on the tick it is claimed is not reach.
  *
- * `safeSpot` is up to SAFE_SPOT_BONUS when the move survives the walk and ends somewhere nothing
- * can shoot: the twelve tick simulation's planned overheads stop everything that fires en route
- * (`damageTaken === 0`), and from the tick we arrive to the end of the horizon no attacking mob
- * ever has the destination within its line of sight and range - judged geometrically against the
- * PROJECTED mob positions, not by whether a shot happened to fire, because a mob mid-cooldown
- * fires nothing while holding the tile at gunpoint. The journey is deliberately NOT part of the
- * safety claim: getting shot at on the way to cover is what `damageTaken` prices, and demanding a
+ * `safeSpot` is up to SAFE_SPOT_BONUS when the move ends on a TRUE safespot. Three parts. The
+ * walk is clean: the twelve tick simulation's planned overheads stop everything that fires en
+ * route (`damageTaken === 0`) - the journey is deliberately NOT part of the safety claim,
+ * because getting shot at on the way to cover is what `damageTaken` prices, and demanding a
  * fire-free trajectory meant that under any incoming fire NO tile could earn the bonus, the grid
- * went flat, and the bot stood mid-arena flicking prayer until it died of it. Among safe tiles it
- * is shaded down by NPC_DISTANCE_PENALTY per tile of Chebyshev distance to the NEAREST live mob -
- * a pure tie-breaker, since `damageTaken` cannot tell two safe tiles apart, and the closer one is
- * the tile the bot can actually do something from once it stops being safe - floored at
+ * went flat, and the bot stood mid-arena flicking prayer until it died of it. The destination is
+ * unexposed for the horizon: from arrival to tick twelve no attacking mob has it within line of
+ * sight and range - judged geometrically against the PROJECTED positions, not by whether a shot
+ * happened to fire, because a mob mid-cooldown fires nothing while holding the tile at gunpoint.
+ * And the destination SETTLES: the simulation is extended with the player parked until the board
+ * reaches a fixed point, with the tile still unseen the whole way - see `settlesSafe`. Twelve
+ * quiet ticks are not safety: a mob thirteen ticks away passed the old test, so a tile that was
+ * merely FAR earned the same bonus as one behind a pillar forever, and "far" is what the
+ * distance penalty is for, not the bonus. No attackers on the board means no bonus - with
+ * nothing to be safe from the term is 0, not a free 0.8, which also keeps the empty-arena
+ * hold-position score at an honest zero. Among safe tiles it is shaded down by
+ * NPC_DISTANCE_PENALTY per tile of Chebyshev distance to the NEAREST live mob - a pure
+ * tie-breaker, since `damageTaken` cannot tell two safe tiles apart, and the closer one is the
+ * tile the bot can actually do something from once it stops being safe - floored at
  * SAFE_SPOT_MIN (0.1) so a safe tile far from everything still beats an unsafe one. Deliberately
  * a small fraction throughout, never a full point - it exists to break ties `damageTaken` already
  * scores identically, not to compete with real damage avoided.
@@ -384,16 +390,111 @@ export const NPC_DISTANCE_PENALTY = 0.01;
 export const SAFE_SPOT_MIN = 0.1;
 
 /**
- * EXPERIMENTAL stand-still decay, behind the sidebar's "Stand-still decay" toggle
- * (InfernoSettings.tileDecay). Off by default, and deliberately a toggle rather than a term:
- * it is an unproven idea that may need ripping out wholesale.
+ * Cap on the settle simulation behind the safe-spot claim.
  *
- * While mobs are alive but NO fighting is happening - the player has not fired recently and
- * nothing is in the air towards them - the score of the tile the player is STANDING ON decays
- * by TILE_DECAY_PER_STEP every TILE_DECAY_INTERVAL_TICKS. Nothing else changes: every other
- * tile keeps its honest score, so the decay only ever lowers the bar that "hold position" sets
- * in bestMove. The idea is to break standoffs - a wave cannot end while both sides camp, so
- * the longer nothing happens, the less credible "stay put" becomes as an answer.
+ * "Settled" is detected by fixed point, not by running the cap out, so this is a backstop
+ * rather than a horizon: the longest freeze in the arena is 32 ticks, a mob crossing the whole
+ * interior needs about 29 more, and the longest walk the bonus can gate on is 11 - so 80 is
+ * past anything that can still be in flight. A pass that reaches the cap without settling or
+ * being seen has proven nothing, and proven-nothing means no bonus.
+ */
+export const SAFE_SPOT_SETTLE_TICKS = 80;
+
+/**
+ * The other half of the safe-spot claim: parked on this destination, the mobs finish reacting
+ * and the board reaches a fixed point with the tile still unseen. Twelve quiet ticks are not
+ * that claim - a mob thirteen ticks away satisfies the horizon test from a tile that is merely
+ * far - and the difference is exactly the one between "quiet for now" and a safespot.
+ *
+ * Fixed point means two consecutive ticks in which no mob moved and none is in a transient
+ * state - frozen, stunned, mid-dig, or still in the post-dig movement freeze of delay > speed.
+ * Two, not one: the transient counters decrement a phase AFTER movement reads them, so a single
+ * unchanged tick can be a mob's last frozen breath rather than a jam. The simulation is
+ * deterministic with the player parked, so an unchanged, transient-free transition repeats
+ * itself forever - which is what lets a bounded check make an unbounded claim.
+ *
+ * Digs are stripped (`canDig` off) before simulating, deliberately. The meleer's dig triggers
+ * precisely when it cannot reach you, so pricing it here would zero the bonus for every tile
+ * exactly when the bot is starving the meleer - the moment this term matters most - and the dig
+ * surfaces beside you wherever you stand, so it cannot tell tiles apart anyway. The dig stays
+ * priced by `damageTaken` whenever it falls inside the twelve tick horizon.
+ */
+function settlesSafe(snapshot: ArenaSnapshot, mobs: SimMob[], route: Location[]): boolean {
+  const undiggable = mobs.map((mob) => (mob.canDig ? { ...mob, canDig: false } : mob));
+  const destination = route[route.length - 1];
+
+  let exposed = false;
+  let settled = false;
+  let stableTicks = 0;
+  let previous: string | null = null;
+
+  simulateTrajectory(
+    snapshot,
+    undiggable,
+    route,
+    SAFE_SPOT_SETTLE_TICKS,
+    (_tick, simMobs, px, py) => {
+      if (px !== destination.x || py !== destination.y) {
+        return; // still walking; the journey is damageTaken's business, not this claim's
+      }
+      for (const mob of simMobs) {
+        if (mob.attacks && mobSeesPlayer(snapshot, mob, px, py)) {
+          exposed = true;
+          return true;
+        }
+      }
+      let transient = false;
+      const positions: string[] = [];
+      for (const mob of simMobs) {
+        if (mob.frozen > 0 || mob.stunned > 0 || mob.digTicks > 0 || mob.delay > mob.speed) {
+          transient = true;
+          break;
+        }
+        positions.push(`${mob.x},${mob.y}`);
+      }
+      if (transient) {
+        stableTicks = 0;
+        previous = null;
+        return;
+      }
+      const board = positions.join(";");
+      stableTicks = board === previous ? stableTicks + 1 : 0;
+      previous = board;
+      if (stableTicks >= 2) {
+        settled = true;
+        return true;
+      }
+    },
+  );
+
+  return settled && !exposed;
+}
+
+/**
+ * Stand-still decay - a standard part of the score since 2026-08, when it was promoted from an
+ * experiment behind a sidebar toggle.
+ *
+ * While the board is SETTLED - no live mob moved since the previous tick - with mobs alive and
+ * the player not fighting back, the score of the tile the player is STANDING ON decays by
+ * TILE_DECAY_PER_STEP every TILE_DECAY_INTERVAL_TICKS. Nothing else changes: every other tile
+ * keeps its honest score, so the decay only ever lowers the bar that "hold position" sets in
+ * bestMove. The idea is to break standoffs - a wave cannot end while the bot contributes
+ * nothing, so the longer that lasts, the less credible "stay put" becomes as an answer.
+ *
+ * The settled gate matters as much as the quiet one. A standoff is a claim about BOTH sides
+ * having stopped: while the mobs are still reacting - unjamming, re-pathing, chasing - the
+ * position is still resolving itself, and pressuring the bot to abandon a verdict the board
+ * has not finished answering is exactly the churn that produced the oscillation bugs. So the
+ * standoff clocks PAUSE (they do not reset) while any mob is moving, and only accrue once the
+ * mobs have parked.
+ *
+ * Incoming fire deliberately does NOT reset the clocks. It used to, and that exception was
+ * exactly what the prayer camp exploited: parked on one tile, firing nothing, praying against
+ * everything that came in, the old decay read the incoming shots as "activity" and forgave the
+ * camp every tick - so the one standoff that actually kills (full-hp mobs, prayer 0) was the
+ * one it could not touch. A second mechanism existed to cover that case (run-away pressure, a
+ * grid-wide tilt away from the mobs after 15 parked ticks); it is replaced by this clock, which
+ * covers both standoffs with one rule: only the player fighting back forgives a camp.
  *
  * TWO slots, not one: the PREVIOUS camp keeps its accumulated charge while the current one
  * accrues. With a single slot the decay produced a two-tile shuffle - nudged off tile A, the
@@ -402,8 +503,6 @@ export const SAFE_SPOT_MIN = 0.1;
  * a genuinely different answer. Two slots is deliberate and enough: the failure mode is the
  * A-B oscillation, and a third camp means the bot is actually exploring. Moving back onto the
  * remembered tile swaps the slots, so its clock RESUMES rather than restarts.
- *
- * Any combat activity, in either direction, clears both slots outright.
  *
  * The decay is applied to the SCORE only, not recorded in ScoreParts - so while it is active,
  * the dumped score of a charged tile reads lower than the sum of its columns. That gap IS the
@@ -424,6 +523,8 @@ let currentCamp: DecaySlot | null = null;
 let previousCamp: DecaySlot | null = null;
 /** World tick the clocks were last advanced on, so double scoring in one tick counts once. */
 let idleObservedAtTick = -1;
+/** Last tick's live-mob positions, for the settled gate - see the header above. */
+let lastBoardSignature = "";
 
 function updateStandStillDecay(region: Region, player: Player) {
   const tick = region.world?.globalTickCounter ?? -1;
@@ -432,22 +533,28 @@ function updateStandStillDecay(region: Region, player: Player) {
   }
   idleObservedAtTick = tick;
 
-  // Both anti-wedge clocks advance behind the same once-per-tick guard.
-  updateRunAwayPressure(region, player);
-
-  const mobsAlive = visibleMobs(region).some((mob: Mob) => mob.dying === -1);
+  const mobs = visibleMobs(region);
+  const mobsAlive = mobs.some((mob: Mob) => mob.dying === -1);
   // Fired recently: attackDelay is the weapon cooldown counting down from the last shot.
   const attacking = (player.attackDelay ?? 0) > 0;
-  // Being attacked: something is literally in the air towards us.
-  const underFire =
-    ((player as unknown as { incomingProjectiles?: unknown[] }).incomingProjectiles?.length ??
-      0) > 0;
 
-  // Real activity, either direction, ends the standoff: both camps are forgiven.
-  if (!InfernoSettings.tileDecay || !mobsAlive || attacking || underFire) {
+  // Settled: no live mob moved since the previous tick. The clocks below are claims about a
+  // standoff, and a standoff needs both sides stopped - see the header.
+  const signature = mobs
+    .filter((mob: Mob) => mob.dying === -1)
+    .map((mob: Mob) => `${mob.location.x},${mob.location.y}`)
+    .join(";");
+  const settled = signature !== "" && signature === lastBoardSignature;
+  lastBoardSignature = signature;
+
+  // Only fighting back forgives a camp - incoming fire deliberately does not, see the header.
+  if (!mobsAlive || attacking) {
     currentCamp = null;
     previousCamp = null;
     return;
+  }
+  if (!settled) {
+    return; // the mobs are still reacting: the clocks pause, none resets
   }
 
   const px = player.location.x;
@@ -496,54 +603,6 @@ export function standStillDecayAt(x: number, y: number): number {
 /** The decay on the current camp - kept for probes and debugging readouts. */
 export function standStillDecay(): number {
   return slotDecay(currentCamp);
-}
-
-/**
- * EXPERIMENTAL run-away pressure, the second half of the anti-wedge experiment and behind the
- * same "Stand-still decay" toggle. The first decay handles the QUIET standoff - nobody
- * shooting either way. This one handles the prayer camp: parked on one tile, shooting
- * nothing, doing nothing but praying against whatever comes in. That state resets the first
- * decay's clock (incoming fire counts as activity there), so without this it can last
- * forever - which is exactly what a late-wave wedge looks like.
- *
- * After RUN_AWAY_TRIGGER_TICKS on the same tile without firing a shot (mobs alive, incoming
- * fire irrelevant), every candidate tile is biased by RUN_AWAY_PER_TILE times its Chebyshev
- * distance to the nearest live mob - so the grid tilts away from the mobs and running becomes
- * the best-scoring move. Repositioning is the point, not retreat for its own sake: walking
- * out re-phases every parked mob (they lose line of sight, unjam, and re-path), which is the
- * one thing a camped bot can do to change a fight it is not winning.
- *
- * Firing a shot or moving a tile resets the clock. Applied to the SCORE only, same as the
- * stand-still decay, so a dumped grid under pressure reads higher than its columns sum by
- * exactly the distance bias.
- */
-export const RUN_AWAY_TRIGGER_TICKS = 15;
-export const RUN_AWAY_PER_TILE = 0.1;
-
-/** Consecutive ticks parked on one tile without firing, while mobs are alive. */
-let campTicks = 0;
-let campX = -1;
-let campY = -1;
-
-function updateRunAwayPressure(region: Region, player: Player) {
-  // Called from inside updateStandStillDecay, BEHIND its once-per-tick guard - never call
-  // this directly, or a tick the debug grid double-scores would count twice.
-  const mobsAlive = visibleMobs(region).some((mob: Mob) => mob.dying === -1);
-  const attacking = (player.attackDelay ?? 0) > 0;
-  const moved = player.location.x !== campX || player.location.y !== campY;
-  campX = player.location.x;
-  campY = player.location.y;
-
-  if (!InfernoSettings.tileDecay || !mobsAlive || attacking || moved) {
-    campTicks = 0;
-    return;
-  }
-  campTicks++;
-}
-
-/** Per-tile-of-distance reward for getting away from the mobs. 0 until the camp trips it. */
-export function runAwayPressure(): number {
-  return campTicks >= RUN_AWAY_TRIGGER_TICKS ? RUN_AWAY_PER_TILE : 0;
 }
 
 function chebyshevDistance(a: Location, b: Location): number {
@@ -704,15 +763,21 @@ function scoreRoute(
   );
   const damageTaken = planOverheads(threats).damage;
 
-  // Safe means: the walk is clean (whatever fires en route, the planned overheads stop all of
-  // it) AND once we are standing there, nothing has the tile in range for the rest of the
-  // horizon. The old test - no attack fires during the whole twelve ticks, walk included -
-  // conflated the journey with the destination: standing anywhere under fire meant every
-  // candidate's trajectory contained an incoming attack, so no tile in the grid could ever
-  // earn the bonus and the score offered no pull towards cover at all. The bot's answer was to
-  // stand mid-arena flicking prayer until it ran dry, which is exactly the wedge this replaces.
+  // Safe means: something is on the board to be safe FROM, the walk is clean (whatever fires
+  // en route, the planned overheads stop all of it), nothing has the tile in range for the
+  // rest of the horizon - and the tile stays that way once the mobs have finished reacting to
+  // us standing on it, which is what `settlesSafe` extends the simulation to prove. The
+  // horizon evidence runs first because it is already paid for; the settle pass only runs for
+  // tiles that survive everything else.
   let safeSpot = 0;
-  if (arrived && !destinationExposed && damageTaken === 0) {
+  const anyAttacker = mobs.some((mob) => mob.attacks);
+  if (
+    anyAttacker &&
+    arrived &&
+    !destinationExposed &&
+    damageTaken === 0 &&
+    settlesSafe(snapshot, mobs, route)
+  ) {
     const distance = nearestMobDistance(destination, targets);
     // No mob on the board at all - nothing to be far from, so the bonus applies untaxed.
     const penalty = Number.isFinite(distance) ? NPC_DISTANCE_PENALTY * distance : 0;
@@ -776,7 +841,6 @@ export function scoreCandidates(
 
   // Advance the standoff clocks exactly once per world tick, before any score is assembled.
   updateStandStillDecay(region, player);
-  const pressure = runAwayPressure();
 
   const tiles = candidateTiles(region, player, snapshot);
   // Routes may leave the candidate box to get around a pillar, exactly as the engine's own
@@ -799,19 +863,10 @@ export function scoreCandidates(
     }
     const { score, parts } = scoreRoute(snapshot, mobs, focus, targets, reaches, route);
     // The stand-still decay bites the two remembered camps only - the current tile and the
-    // one camped before it - so an armed standoff lowers the bar for moving somewhere NEW
-    // without distorting what any other tile is worth. See the constants for the rationale,
-    // including why one slot was not enough.
-    let adjusted = score - standStillDecayAt(tile.x, tile.y);
-    // Run-away pressure: once a prayer camp trips it, distance from the nearest mob pays,
-    // and the grid as a whole tilts away from the fight. See RUN_AWAY_PER_TILE.
-    if (pressure > 0) {
-      const distance = nearestMobDistance(tile, targets);
-      if (Number.isFinite(distance)) {
-        adjusted += pressure * distance;
-      }
-    }
-    scored.push({ tile, score: adjusted, route, parts });
+    // one camped before it - so a standoff lowers the bar for moving somewhere NEW without
+    // distorting what any other tile is worth. See the constants for the rationale, including
+    // why one slot was not enough.
+    scored.push({ tile, score: score - standStillDecayAt(tile.x, tile.y), route, parts });
   }
 
   lastDurationMs = performance.now() - startedAt;

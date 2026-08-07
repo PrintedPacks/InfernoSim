@@ -32,8 +32,6 @@
  * Configuration (environment variables):
  *   INFERNO_SEED        integer seed, default 1
  *   INFERNO_WAVE        starting wave, default 1
- *   INFERNO_TILE_DECAY  experimental stand-still decay (same as the sidebar's "Stand-still
- *                       decay" checkbox). Default ON for now; set "0" to disable
  *   INFERNO_AUTO_DELAY  ticks AFTER the wave goes live before automation is switched on,
  *                       default 0 (on from boot). Use ~5-10 when replaying a captured
  *                       scenario: it reproduces "stand there, let the mobs settle into
@@ -200,9 +198,6 @@ test("seeded wave run through the real InfernoAutomation.onTick", () => {
   Settings.metronome = false;
   Settings.loadout = LOADOUT;
   InfernoSettings.waveProgression = true; // the whole point: advance wave to wave
-  // Default ON while the decay experiment is being evaluated; INFERNO_TILE_DECAY=0 opts out.
-  InfernoSettings.tileDecay =
-    process.env.INFERNO_TILE_DECAY !== "0" && process.env.INFERNO_TILE_DECAY !== "false";
   InfernoSettings.spawnIndicators = false;
   InfernoSettings.displaySetTimer = false;
 
@@ -250,13 +245,17 @@ test("seeded wave run through the real InfernoAutomation.onTick", () => {
   const aliveMobs = () => region.mobs.filter((mob) => mob.dying === -1).length;
   const hp = () => `hp ${player.currentStats.hitpoint}/${player.stats.hitpoint}`;
   const prayer = () => `prayer ${player.currentStats.prayer}/${player.stats.prayer}`;
+  // Run energy is 0-10000 in the engine; shown as percent. The engine sets `running` to false
+  // the moment energy hits 0 and nothing turns it back on, so the flag is the interesting bit.
+  const run = () =>
+    `run ${Math.round(((player.currentStats as { run?: number }).run ?? 0) / 100)}% ` +
+    `${(player as unknown as { running?: boolean }).running ? "ON" : "OFF"}`;
 
   out("");
   out(
     `inferno harness | seed ${SEED} | loadout ${LOADOUT} | starting wave ${region.wave} | ` +
       `wave tick limit ${WAVE_TICK_LIMIT}` +
       (AUTO_DELAY_TICKS > 0 ? ` | auto delayed ${AUTO_DELAY_TICKS} ticks past wave-live` : "") +
-      (InfernoSettings.tileDecay ? " | stand-still decay ON" : "") +
       (!isNaN(PRAYER_OVERRIDE) ? ` | prayer override ${PRAYER_OVERRIDE}` : "") +
       (EXTRA_QUERY ? ` | custom: ${EXTRA_QUERY}` : ""),
   );
@@ -330,7 +329,7 @@ test("seeded wave run through the real InfernoAutomation.onTick", () => {
         wavesCleared += region.wave - lastWave;
         out(
           `wave ${String(lastWave).padStart(2)} cleared | ` +
-            `${String(tick - waveStartTick).padStart(4)} ticks | ${hp()} | ${prayer()}`,
+            `${String(tick - waveStartTick).padStart(4)} ticks | ${hp()} | ${prayer()} | ${run()}`,
         );
         lastWave = region.wave;
         waveStartTick = tick;
@@ -343,7 +342,7 @@ test("seeded wave run through the real InfernoAutomation.onTick", () => {
           zukWaveHadMobs = true;
         } else if (zukWaveHadMobs && region.ticksUntilNextWave === -1) {
           outcome = "completed";
-          detail = `wave 69 cleared | ${String(tick - waveStartTick).padStart(4)} ticks | ${hp()} | ${prayer()}`;
+          detail = `wave 69 cleared | ${String(tick - waveStartTick).padStart(4)} ticks | ${hp()} | ${prayer()} | ${run()}`;
           wavesCleared++;
           break;
         }
@@ -353,7 +352,7 @@ test("seeded wave run through the real InfernoAutomation.onTick", () => {
         outcome = "stuck";
         detail =
           `no wave transition for ${WAVE_TICK_LIMIT} ticks on wave ${region.wave} ` +
-          `(${aliveMobs()} mobs alive, ${hp()}, ${prayer()})`;
+          `(${aliveMobs()} mobs alive, ${hp()}, ${prayer()}, ${run()})`;
         break;
       }
     }
@@ -379,7 +378,9 @@ test("seeded wave run through the real InfernoAutomation.onTick", () => {
     // is usually the whole answer - an unreachable mob, or the bot parked somewhere wrong.
     out("");
     out(`arena when the run ended (tick ${tick}, wave ${region.wave}):`);
-    out(`  player     @${player.location.x},${player.location.y} | ${hp()} | ${prayer()}`);
+    out(
+      `  player     @${player.location.x},${player.location.y} | ${hp()} | ${prayer()} | ${run()}`,
+    );
     for (const mob of region.mobs as any[]) {
       const flags = [
         mob.dying !== -1 ? "dying" : "",

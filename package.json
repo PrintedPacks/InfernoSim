@@ -8,6 +8,7 @@
     "build": "webpack --mode production",
     "test": "jest",
     "test:harness": "jest --config jest.harness.config.js",
+    "test:sweep": "node test/harness/sweep.js",
     "lint": "eslint . --ext .ts --fix",
     "prettier": "prettier --write ."
   },

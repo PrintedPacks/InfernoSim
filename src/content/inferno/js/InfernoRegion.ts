@@ -235,18 +235,6 @@ export class InfernoRegion extends Region {
     });
   }
 
-  initializeTileDecayToggle() {
-    const tileDecayCheckbox = document.getElementById("tileDecay") as HTMLInputElement;
-    if (!tileDecayCheckbox) {
-      return;
-    }
-    tileDecayCheckbox.checked = InfernoSettings.tileDecay === true;
-    tileDecayCheckbox.addEventListener("change", () => {
-      InfernoSettings.tileDecay = tileDecayCheckbox.checked;
-      InfernoSettings.persistToStorage();
-    });
-  }
-
   initializeSpawnIndicatorsToggle() {
     const spawnIndicatorsCheckbox = document.getElementById("spawnIndicators") as HTMLInputElement;
     spawnIndicatorsCheckbox.checked = InfernoSettings.spawnIndicators === true;
@@ -603,7 +591,6 @@ export class InfernoRegion extends Region {
 
     this.initializeAndGetUse3dView();
     this.initializeWaveProgressionToggle();
-    this.initializeTileDecayToggle();
     this.initializeSpawnIndicatorsToggle();
     this.initializeDisplaySetTimerToggle();
     this.wave = parseInt(BrowserUtils.getQueryVar("wave"));

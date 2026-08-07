@@ -502,13 +502,18 @@ function stepMob(
  *
  * `path` is tile-by-tile from the player's current position; the player consumes two of those
  * per tick and then stands still once it runs out.
+ *
+ * `trace` runs at the end of every tick. Returning `true` stops the simulation there, with the
+ * threats gathered so far returned as usual. That exists for callers probing a condition past
+ * the pricing horizon - the tile scorer's settle check runs under a cap of eighty ticks but
+ * almost always decides in a handful - so a probe pays for the ticks it uses, not for its cap.
  */
 export function simulateTrajectory(
   snapshot: ArenaSnapshot,
   mobs: SimMob[],
   path: Location[],
   horizon: number = HORIZON_TICKS,
-  trace?: (tick: number, mobs: readonly SimMob[], px: number, py: number) => void,
+  trace?: (tick: number, mobs: readonly SimMob[], px: number, py: number) => boolean | void,
 ): Threat[] {
   const threats: Threat[] = [];
   const sim: SimMob[] = mobs.map((mob) => ({ ...mob }));
@@ -642,7 +647,9 @@ export function simulateTrajectory(
     px = path[step].x;
     py = path[step].y;
 
-    trace?.(tick, sim, px, py);
+    if (trace?.(tick, sim, px, py) === true) {
+      break;
+    }
   }
 
   return threats;

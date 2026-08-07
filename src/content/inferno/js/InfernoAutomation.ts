@@ -1,6 +1,6 @@
 "use strict";
 
-import { Player, Region, Location, Mob, ControlPanelController, EntityNames, Random, Settings } from "osrs-sdk";
+import { Player, Region, Location, Mob, Chrome, ControlPanelController, EntityNames, MapController, Random, Settings } from "osrs-sdk";
 
 import { AutomationOverlay, ClickStep } from "./AutomationOverlay";
 import { applyPrayerPlan, incomingThreats } from "./PrayerPlanner";
@@ -132,6 +132,17 @@ export class InfernoAutomation {
 
   private static readonly LOG_LINES = 40;
 
+  /**
+   * Run energy (0-10000, so this is 10%) the orb is switched back on at - see `restoreRun`.
+   */
+  private static readonly RUN_RESTORE_THRESHOLD = 1000;
+
+  /**
+   * Centre of the run orb in the minimap's own coordinate space, from the box
+   * `MapController.leftClickDown` tests (15..67 by 122..149).
+   */
+  private static readonly RUN_ORB_CENTRE = { x: 41, y: 135 };
+
   static getLog(): string {
     return InfernoAutomation.log.join("\n");
   }
@@ -162,6 +173,34 @@ export class InfernoAutomation {
   private static walkingTo: Location | null = null;
 
   /**
+   * Whether the current `chosenTile` earned the safe-spot bonus when it was chosen.
+   *
+   * Remembered because the arrival settle needs to know what KIND of tile the walk was heading
+   * for, and on the tick it matters the fresh scoring pass is exactly the thing being held at
+   * arm's length.
+   */
+  private static chosenIsSafeSpot = false;
+
+  /**
+   * True once the arrival settle has been spent on the current chosen tile.
+   *
+   * Mobs react to where the player stands one tick AFTER the player stands there - engine
+   * order is mobs move, mobs attack, player moves - so a verdict rendered on the tick the
+   * player arrives somewhere is judged against a board that has not answered the arrival yet.
+   * Measured (wave 55, two pillar-jammed bloblets): arrive near a safespot, re-score against
+   * the unsettled mobs, get told the mirror tile across the pillar is better, walk off, and
+   * repeat forever - a stable oscillation the stuck detector ends after 3000 ticks.
+   *
+   * So the first tick standing on a chosen SAFE tile keeps the previous decision pinned:
+   * repositioning waits exactly one tick while the mobs take their reaction step, and the next
+   * re-score is judged against the settled board. Prayer and attacking are untouched - only
+   * the movement verdict waits. One settle per arrival: re-confirming the tile the bot is
+   * already camped on does not re-arm it, or a camp would only re-score every other tick.
+   */
+  private static arrivalSettled = false;
+
+
+  /**
    * The nibbler spawn tile the cursor is parked on for this wave, or null before one is picked.
    *
    * Chosen ONCE per wave and held, because a hover that re-rolled every tick would be a twitch
@@ -178,6 +217,8 @@ export class InfernoAutomation {
     InfernoAutomation.walkingTo = null;
     InfernoAutomation.chosenTile = null;
     InfernoAutomation.chosenPath = undefined;
+    InfernoAutomation.chosenIsSafeSpot = false;
+    InfernoAutomation.arrivalSettled = false;
     InfernoAutomation.scoredTiles = [];
     InfernoAutomation.hoverTile = null;
     InfernoAutomation.log = [];
@@ -389,6 +430,81 @@ export class InfernoAutomation {
   }
 
   /** Queue Ice Barrage for the next wave, if it is not already queued. */
+  /**
+   * Turn running back on once there is energy for it.
+   *
+   * `Unit.movementStep` switches running OFF the moment energy reaches zero and NOTHING in the
+   * engine ever switches it back on - energy regenerates (about 15 per tick from an empty
+   * tank) but the orb stays dark, so one depletion means walking at ONE tile per tick for the
+   * rest of the run. Measured: a wave 21 stuck ending on `run 100% OFF` - a full tank, walking.
+   *
+   * That is not just slow, it silently invalidates the whole tile score. Trajectory prices
+   * every candidate at PLAYER_TILES_PER_TICK = 2, so with the orb off every simulated walk
+   * arrives in half the ticks the real one takes, and the mobs are given a reaction step the
+   * model never charged for. Reach, safety and damage are then all judged for a walk that is
+   * not the walk being taken.
+   *
+   * A player watches the orb and clicks it back on; this is that click. The engine's own orb
+   * handler is exactly this assignment (`MapController.leftClickDown`:
+   * `Trainer.player.running = !Trainer.player.running`), so the state change is identical in
+   * the browser and headless - the minimap orb redraws from the flag either way.
+   *
+   * RUN_RESTORE_THRESHOLD, not zero, so the orb is not flicked on into an empty tank and
+   * straight back off by the engine on the next step.
+   */
+  private static restoreRun(player: Player) {
+    const runner = player as unknown as { running?: boolean };
+    if (runner.running) {
+      return;
+    }
+    const energy = (player.currentStats as unknown as { run?: number })?.run ?? 0;
+    if (energy <= InfernoAutomation.RUN_RESTORE_THRESHOLD) {
+      return;
+    }
+    runner.running = true;
+    // Show it on the cursor, like every other click the bot makes.
+    const orb = InfernoAutomation.runOrbCanvasPoint();
+    if (orb) {
+      InfernoAutomation.clickLog.push({ canvas: orb });
+    }
+  }
+
+  /**
+   * Where the run orb sits in game-canvas pixels, or null when there is no minimap to click -
+   * headless, or before the map controller exists.
+   *
+   * `MapController.leftClickDown` maps a canvas click INTO minimap space with
+   *
+   *     offset = Chrome.size().width - map.width - (menuVisible ? 232 : 0)
+   *     x = (canvasX - offset) / scale        y = canvasY / scale
+   *
+   * and treats `15 < x < 67, 122 < y < 149` as the run orb. This is that arithmetic inverted
+   * from the centre of the box, so the drawn cursor lands where a player's really would.
+   * `map.width` is already scaled (`draw` sets it to INITIAL_WIDTH * scale), so it must not be
+   * scaled again here.
+   *
+   * Wrapped because it is decoration on a decision: `decide()` is called inside a try/catch
+   * that turns any throw into a skipped tick, and a cursor position must never be able to cost
+   * the bot its movement and attack.
+   */
+  private static runOrbCanvasPoint(): { x: number; y: number } | null {
+    try {
+      const map = MapController.controller as unknown as { width?: number } | undefined;
+      if (!map || typeof map.width !== "number") {
+        return null;
+      }
+      const scale = Settings.minimapScale || 1;
+      const offset =
+        Chrome.size().width - map.width - ((Settings as { menuVisible?: boolean }).menuVisible ? 232 : 0);
+      return {
+        x: offset + InfernoAutomation.RUN_ORB_CENTRE.x * scale,
+        y: InfernoAutomation.RUN_ORB_CENTRE.y * scale,
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
   private static preloadIceBarrage(player: Player) {
     if (hasIceBarrageSelected(player)) {
       return;
@@ -530,6 +646,8 @@ ${spellLine}`);
       InfernoAutomation.scoredTiles = [];
       InfernoAutomation.chosenTile = null;
       InfernoAutomation.chosenPath = undefined;
+      InfernoAutomation.chosenIsSafeSpot = false;
+      InfernoAutomation.arrivalSettled = false;
       // Prayer-only runs in exactly the gap full automation leaves behind, which is what makes
       // "auto overrides it" fall out rather than needing to be enforced.
       if (InfernoAutomation.prayerOnly && player && !player.isDying()) {
@@ -594,12 +712,20 @@ ${spellLine}`);
   private static appendLog(region: Region, player: Player) {
     const overhead = player.prayerController?.overhead();
     const chosen = InfernoAutomation.chosenTile;
+    // Run energy is 0-10000 in the engine, shown here as percent. The engine flips `running`
+    // to false when energy reaches 0 and never turns it back on by itself, so the OFF marker
+    // is the thing to look for in a walking-speed mystery.
+    const energy = Math.round(
+      ((player.currentStats as { run?: number })?.run ?? 0) / 100,
+    );
+    const orb = (player as unknown as { running?: boolean }).running ? "ON" : "OFF";
     const line =
       `t${String(InfernoAutomation.tickCount).padStart(4)} ` +
       `@${player.location.x},${player.location.y} ` +
       `-> ${chosen ? `${chosen.x},${chosen.y}` : "home"} ` +
       `pray=${(overhead?.feature() ?? "-").padEnd(5)} ` +
       `hp=${player.currentStats?.hitpoint ?? "?"} ` +
+      `run=${energy}% ${orb} ` +
       `${InfernoAutomation.attackState}`;
 
     InfernoAutomation.log.push(line);
@@ -630,6 +756,8 @@ ${spellLine}`);
     if (InfernoAutomation.isBetweenWaves(region)) {
       InfernoAutomation.chosenTile = null;
       InfernoAutomation.chosenPath = undefined;
+      InfernoAutomation.chosenIsSafeSpot = false;
+      InfernoAutomation.arrivalSettled = false;
       InfernoAutomation.scoredTiles = [];
     } else {
       // Wave is live, so the guess made during downtime has been spent. Cleared here rather than
@@ -641,13 +769,47 @@ ${spellLine}`);
       // losing prayer costs the run.
       try {
         InfernoAutomation.scoredTiles = scoreCandidates(region, player, snapshot);
-        const move = bestMove(region, player, InfernoAutomation.scoredTiles);
-        InfernoAutomation.chosenTile = move?.tile ?? null;
-        InfernoAutomation.chosenPath = move?.route;
+
+        const chosen = InfernoAutomation.chosenTile;
+        const standingOnChosen =
+          chosen !== null &&
+          chosen.x === player.location.x &&
+          chosen.y === player.location.y;
+
+        if (
+          standingOnChosen &&
+          InfernoAutomation.chosenIsSafeSpot &&
+          !InfernoAutomation.arrivalSettled
+        ) {
+          // First tick standing on the safe tile we chose. The mobs have not reacted to us
+          // being here yet, so this tick's verdict would be judged against an unsettled board -
+          // hold the decision for one tick instead, see `arrivalSettled`. The scored grid stays
+          // fresh for the debug view; only the adoption of a new move waits.
+          InfernoAutomation.arrivalSettled = true;
+          // The walk is over, so the plan the prayer layer follows is standing still.
+          InfernoAutomation.chosenPath = [{ x: player.location.x, y: player.location.y }];
+        } else {
+          const move = bestMove(region, player, InfernoAutomation.scoredTiles);
+          const sameTile =
+            chosen !== null &&
+            move !== null &&
+            chosen.x === move.tile.x &&
+            chosen.y === move.tile.y;
+          InfernoAutomation.chosenTile = move?.tile ?? null;
+          InfernoAutomation.chosenPath = move?.route;
+          InfernoAutomation.chosenIsSafeSpot = (move?.parts?.safeSpot ?? 0) > 0;
+          if (!sameTile) {
+            // A new destination earns a fresh settle on arrival. Re-confirming the tile the
+            // bot is already standing on must NOT re-arm it - see `arrivalSettled`.
+            InfernoAutomation.arrivalSettled = false;
+          }
+        }
       } catch (e) {
         InfernoAutomation.scoredTiles = [];
         InfernoAutomation.chosenTile = null;
         InfernoAutomation.chosenPath = undefined;
+        InfernoAutomation.chosenIsSafeSpot = false;
+        InfernoAutomation.arrivalSettled = false;
         InfernoAutomation.attackState = `SCORING FAILED: ${(e as Error)?.message ?? e}`;
       }
     }
@@ -679,6 +841,9 @@ ${spellLine}`);
       clickPrayer,
       InfernoAutomation.chosenPath,
     );
+
+    // Run back on, before anything can issue a walk this tick.
+    InfernoAutomation.restoreRun(player);
 
     // Everything past here is a world action, and world actions are what the countdown gate is
     // for. The wave's mobs are spawned but tickRegion freezes them until getReadyTimer reaches
