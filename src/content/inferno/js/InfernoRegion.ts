@@ -28,7 +28,7 @@ import { InfernoAutomation } from "./InfernoAutomation";
 import { canReach } from "./KillPriority";
 import { TileGrid } from "./TileGrid";
 import { observeNibblers } from "./PillarDefence";
-import { bestTile, distanceToNearestMob, GRID_SIZE, isInsideArena, lastScoreDurationMs, scoreCandidates } from "./TileScorer";
+import { distanceToNearestMob, GRID_SIZE, isInsideArena, lastScoreDurationMs, scoreCandidates } from "./TileScorer";
 
 import SidebarContent from "../sidebar.html";
 
@@ -371,7 +371,6 @@ export class InfernoRegion extends Region {
           "barrage",
           "reach",
           "safe",
-          "forbidden",
           "damage",
           "threats",
           "routeLen",
@@ -383,7 +382,6 @@ export class InfernoRegion extends Region {
           entry.parts ? round(entry.parts.barrageReach) : null,
           entry.parts ? round(entry.parts.npcReachSoon) : null,
           entry.parts ? round(entry.parts.safeSpot) : null,
-          entry.parts ? round(entry.parts.forbiddenAdjacency) : null,
           entry.parts ? round(entry.parts.damageTaken) : null,
           entry.parts ? entry.parts.threats : null,
           entry.route.length,
@@ -1052,10 +1050,12 @@ export class InfernoRegion extends Region {
       // trajectories, so doing it twice would double the cost purely to draw it.
       const existing = InfernoAutomation.getScoredTiles();
       const scored = existing.length > 0 ? existing : scoreCandidates(this, player);
-      const chosen = InfernoAutomation.getChosenTile() ?? bestTile(this, player, scored);
-      TileGrid.update(this, player, scored, chosen);
+      // Null when the movement layer chose nothing this tick - the grid then marks no tile
+      // rather than substituting the best-scoring one, which would claim a decision that was
+      // never made. See TileGrid.shadeFor.
+      TileGrid.update(this, player, scored, InfernoAutomation.getChosenTile());
     } else {
-      TileGrid.update(this, player, [], player.location);
+      TileGrid.update(this, player, [], null);
     }
 
     const readout = document.getElementById("tile_grid_count");

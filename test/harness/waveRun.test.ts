@@ -46,7 +46,9 @@
  *                       NOTE: any custom mob param makes the region force wave 1, same as
  *                       in the browser.
  *   INFERNO_LOADOUT     loadout key from the sidebar select, default max_tbow_speed
- *   INFERNO_WAVE_TICK_LIMIT  ticks allowed within a single wave before "stuck", default 3000
+ *   INFERNO_WAVE_TICK_LIMIT  ticks allowed within a single wave before "stuck", default 500.
+ *                       Comfortably clear of a real wave - the slowest seen is ~250 ticks -
+ *                       so a wedge is caught in a fraction of the wall time it used to cost
  *   INFERNO_TICK_LIMIT  total tick budget for the run, default 200000
  *   INFERNO_TIMEOUT_MS  jest timeout (read by jest.harness.config.js), default 30 min
  */
@@ -66,7 +68,7 @@ const LOADOUT = process.env.INFERNO_LOADOUT || "max_tbow_speed";
 const EXTRA_QUERY = process.env.INFERNO_QUERY || "";
 const PRAYER_OVERRIDE = parseInt(process.env.INFERNO_PRAYER || "", 10);
 const AUTO_DELAY_TICKS = parseInt(process.env.INFERNO_AUTO_DELAY || "0", 10);
-const WAVE_TICK_LIMIT = parseInt(process.env.INFERNO_WAVE_TICK_LIMIT || "3000", 10);
+const WAVE_TICK_LIMIT = parseInt(process.env.INFERNO_WAVE_TICK_LIMIT || "500", 10);
 const TOTAL_TICK_LIMIT = parseInt(process.env.INFERNO_TICK_LIMIT || "200000", 10);
 
 // Must match the sidebar's <select id="loadouts"> options - an unknown value would set the

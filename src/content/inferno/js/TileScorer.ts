@@ -5,7 +5,7 @@ import { EntityNames, Location, Mob, Player, Region } from "osrs-sdk";
 import { ArenaSnapshot, snapshotPlayerCanSeeMob } from "./ArenaSnapshot";
 import { planOverheads } from "./OverheadPlanner";
 import { BARRAGE_RANGE, NibblerThreat, nibblerThreats } from "./PillarDefence";
-import { attackReachFor } from "./TargetPlanner";
+import { attackReachFor, attackReachForName } from "./TargetPlanner";
 import {
   mobSeesPlayer,
   PLAYER_TILES_PER_TICK,
@@ -26,9 +26,13 @@ import { visibleMobs } from "./Visibility";
  * number attached to each one. The debug grid draws the exact same list this chooses from, so
  * what you see on screen is the decision's real input rather than a reconstruction of it.
  *
- * Five terms, in hitpoints over a twelve tick horizon except where noted:
+ * Four terms, in hitpoints over a twelve tick horizon except where noted:
  *
- *     score = barrageReach + npcReachSoon + safeSpot + forbiddenAdjacency - damageTaken
+ *     score = barrageReach + npcReachSoon + safeSpot - damageTaken
+ *
+ * scored over the candidates that survive a filter: a tile is only a candidate at all if it is
+ * inside the arena, walkable, reachable, and the walk to it does not enter the coin-flip melee
+ * zone - see `routeEntersForbiddenZone`.
  *
  * `barrageReach` is 1 if a barrage thrown from this tile reaches the nibbler that matters.
  *
@@ -75,18 +79,21 @@ import { visibleMobs } from "./Visibility";
  * comes out. What is left is the damage prayer cannot stop. That is 441 simulations a tick, and
  * it is the reason the mob snapshot and the routes are built once and shared.
  *
- * `forbiddenAdjacency` is FORBIDDEN_ADJACENCY_PENALTY (-1000) if this route's destination is
- * under or melee-adjacent to a mager, ranger, blob, or Jad - the mobs whose ranged attack turns
- * into a melee coin flip at close range. Unlike every other term this is not priced, it is a
- * veto: large enough that nothing else in the sum can outweigh it, so the tile scorer simply
- * never chooses to end a move there, independent of what damageTaken says about it.
+ * The coin-flip melee zone - under or melee-adjacent to a mager, ranger, blob or Jad, the mobs
+ * whose ranged attack becomes a magic-or-stab flip up close - is not a term at all any more. It
+ * used to be a -1000 on the DESTINATION, which vetoed ending there while leaving the journey
+ * merely expensive: `damageTaken` charges a flip at the average of its two outcomes, and a
+ * route clipping the zone for one tick could be outweighed by anything else on the board. A
+ * 50/50 cannot be prayed, so pricing it at its mean is the one treatment that makes no sense.
+ * Now the whole route is judged and a walk that enters the zone removes the tile from the
+ * candidate set outright - see `routeEntersForbiddenZone`, which also covers why walking OUT of
+ * the zone has to stay allowed.
  *
- * Note the terms are not on the same scale: reach is 0 or 1, safeSpot is 0 or 0.1-0.5, damage
- * runs to tens, forbiddenAdjacency is 0 or -1000. Damage therefore decides nearly every
- * comparison and the other priced terms only break ties between equally safe tiles - the veto is
- * the one exception, and deliberately so. That is a real consequence, not a hidden one - if reach
- * should outrank safety it needs a weight, and that weight belongs here as a named number rather
- * than buried in the arithmetic.
+ * Note the remaining terms are not on the same scale: reach is 0 or 1, safeSpot is 0 or
+ * 0.1-0.8, damage runs to tens. Damage therefore decides nearly every comparison and the other
+ * terms only break ties between equally safe tiles. That is a real consequence, not a hidden
+ * one - if reach should outrank safety it needs a weight, and that weight belongs here as a
+ * named number rather than buried in the arithmetic.
  */
 
 /**
@@ -327,32 +334,72 @@ const FORBIDDEN_MELEE_MOBS: string[] = [
  * plausible `damageTaken`, so a forbidden tile can never win on points - it is a veto, not a
  * cost. Only loses to another forbidden tile, and only then by the ordinary tie-break rules.
  */
-export const FORBIDDEN_ADJACENCY_PENALTY = -1000;
-
-/**
- * The veto: 0 normally, FORBIDDEN_ADJACENCY_PENALTY if this route's destination is under or
- * melee-adjacent to a mager, ranger, blob, or Jad.
- *
- * Judged at the route's destination, same as `barrageReach` - this is about where the tile
- * scorer chooses to END UP, not every tile a route happens to cross to get there. Reuses the
- * exact same footprint geometry the trajectory simulation already uses (`playerIsUnder`,
- * `withinMeleeRange`) rather than a fresh distance check, so "under" and "melee-adjacent" mean
- * precisely what they mean everywhere else in this file.
- */
-function forbiddenAdjacency(mobs: SimMob[], route: Location[]): number {
-  const destination = route[route.length - 1];
+/** Is this tile under, or melee-adjacent to, any of the coin-flip mobs? */
+function insideForbiddenZone(mobs: SimMob[], x: number, y: number): boolean {
   for (const mob of mobs) {
     if (!FORBIDDEN_MELEE_MOBS.includes(mob.name)) {
       continue;
     }
-    if (
-      playerIsUnder(mob, destination.x, destination.y) ||
-      withinMeleeRange(mob, destination.x, destination.y)
-    ) {
-      return FORBIDDEN_ADJACENCY_PENALTY;
+    if (playerIsUnder(mob, x, y) || withinMeleeRange(mob, x, y)) {
+      return true;
     }
   }
-  return 0;
+  return false;
+}
+
+/**
+ * Whether this route is one the bot must not take at all - the walk ENTERS the coin-flip zone,
+ * or ends inside it.
+ *
+ * This replaced a -1000 score on the destination, which was a veto in the wrong place. Judging
+ * only the destination left the JOURNEY priced rather than forbidden: `damageTaken` walks the
+ * route and charges the mager's magic-or-stab flip as an AVERAGE of the two outcomes, so a
+ * path clipping the zone for a single tick was merely expensive, and any other term could
+ * outweigh it. That is exactly the risk the veto exists to refuse - a 50/50 cannot be prayed,
+ * and half-praying it is not a thing - so pricing it at its mean is the one treatment that
+ * makes no sense. A tile whose only approach runs through a mager should not be an option at
+ * all, and now it is not: the candidate is DROPPED, the same way a tile walled off behind a
+ * pillar is dropped, rather than scored badly.
+ *
+ * Judging the route is only honest because `routesFrom` is a transcription of the engine's own
+ * `Pathing.constructPaths` - same directions in the same order, same diagonal rule - so the
+ * route tested here is the route `moveTo` will really walk. Blocking the zone inside the BFS
+ * instead would have scored a detour around the mob that the engine, which paths mob-blind,
+ * would never take.
+ *
+ * EXIT IS ALLOWED, ENTRY IS NOT. A mob that walks up to the player puts the player's OWN tile
+ * in the zone, and a rule of "no zone tiles anywhere in the route" would then reject every
+ * candidate the bot has, including standing still - a freeze, which is worse than the coin
+ * flip it was avoiding. So the route may begin inside the zone and walk out of it; what it may
+ * never do is step back in once it has left, or finish inside. Holding position is never
+ * blocked for the same reason: `bestMove` needs that baseline to exist, and refusing to be
+ * where you already are is not an option anybody can take.
+ *
+ * Zone geometry comes from the mobs' tick-0 positions, like the veto it replaces. Mobs do move
+ * during a long walk, but the mobs on this list park the instant they gain line of sight,
+ * which is what makes a static reading defensible.
+ */
+function routeEntersForbiddenZone(mobs: SimMob[], route: Location[]): boolean {
+  if (route.length <= 1) {
+    return false; // holding position - see above
+  }
+
+  let hasLeftZone = false;
+  for (let i = 0; i < route.length; i++) {
+    const inside = insideForbiddenZone(mobs, route[i].x, route[i].y);
+    if (!inside) {
+      hasLeftZone = true;
+      continue;
+    }
+    // Inside the zone. Fine only while still on the way out of it.
+    if (hasLeftZone) {
+      return true; // stepped back in
+    }
+    if (i === route.length - 1) {
+      return true; // never left, and this is where the walk stops
+    }
+  }
+  return false;
 }
 
 /**
@@ -647,7 +694,6 @@ export interface ScoreParts {
   barrageReach: number;
   npcReachSoon: number;
   safeSpot: number;
-  forbiddenAdjacency: number;
   damageTaken: number;
   threats: number;
 }
@@ -788,18 +834,12 @@ function scoreRoute(
     barrageReach: barrageReach(snapshot, focus, route),
     npcReachSoon,
     safeSpot,
-    forbiddenAdjacency: forbiddenAdjacency(mobs, route),
     damageTaken,
     threats: threats.length,
   };
 
   return {
-    score:
-      parts.barrageReach +
-      parts.npcReachSoon +
-      parts.safeSpot +
-      parts.forbiddenAdjacency -
-      parts.damageTaken,
+    score: parts.barrageReach + parts.npcReachSoon + parts.safeSpot - parts.damageTaken,
     parts,
   };
 }
@@ -851,15 +891,46 @@ export function scoreCandidates(
   const focus = focusNibbler(nibblerThreats(region));
   // Frozen once and shared by all 441 simulations. Rebuilt each call rather than cached, because
   // mobs move and pillars die.
-  const mobs = snapshotMobs(region, player);
+  // Jad included: the tile score is the one consumer that has to see it hitting, or the grid
+  // flattens and the bot parks in melee range. The prayer planner deliberately does not - see
+  // snapshotMobs.
+  const mobs = snapshotMobs(region, player, true);
   const targets = reachTargets(player, visibleMobs(region));
   const reaches = reachByMobName(player, visibleMobs(region));
+
+  // Ghost bloblets count as mobs on the board for every purpose the SCORE has: they can be
+  // reached (`npcReachSoon`), and they are something to be near or far from (the safe-spot
+  // distance shading). A player watching a blob die knows three bloblets are landing on those
+  // tiles and positions to fight them - refusing to score that made the grid discontinuous, as
+  // the dying blob left `targets` empty, every safe tile tied at exactly SAFE_SPOT_BONUS with
+  // no shading at all, and the whole ranking changed the tick they became real.
+  //
+  // Being scored as reachable is NOT being targetable: the attack layer reads `visibleMobs` and
+  // has never heard of a ghost, so nothing tries to click one. The tile scorer positions for a
+  // fight that is coming; the rest of the score still decides whether that is worth it.
+  for (const ghost of mobs) {
+    if (!ghost.ghost) {
+      continue;
+    }
+    const reach = attackReachForName(player, ghost.name);
+    targets.push({ x: ghost.x, y: ghost.y, size: ghost.size, reach });
+    if (!reaches.has(ghost.name)) {
+      reaches.set(ghost.name, reach);
+    }
+  }
 
   const scored: ScoredTile[] = [];
   for (const tile of tiles) {
     const route = routes.get(routeKey(tile.x, tile.y));
     if (!route) {
       continue; // walled off from the player, so not actually a candidate
+    }
+    // Getting there means walking into a mager, ranger, blob or Jad's melee zone - so it is
+    // not somewhere the bot can go, exactly like being walled off. Dropped rather than scored
+    // badly, because the whole point is that no other term gets to outweigh it. See
+    // routeEntersForbiddenZone, including why leaving the zone stays allowed.
+    if (routeEntersForbiddenZone(mobs, route)) {
+      continue;
     }
     const { score, parts } = scoreRoute(snapshot, mobs, focus, targets, reaches, route);
     // The stand-still decay bites the two remembered camps only - the current tile and the

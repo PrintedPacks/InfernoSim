@@ -101,6 +101,14 @@ export interface SimMob {
   /** Ticks left of a dig already in progress; 0 when not digging. */
   digTicks: number;
   /**
+   * A mob that does not exist yet - a bloblet a dying blob is about to become.
+   *
+   * It fights like the real thing inside the simulation, because it will BE the real thing
+   * before the horizon is out, but it must never be treated as something to shoot at: there is
+   * nothing there to click. See `ghostBloblets`.
+   */
+  ghost: boolean;
+  /**
    * Where a dig in progress will surface.
    *
    * Locked in at startDig from the player's position AT THAT MOMENT, and endDig just assigns
@@ -132,10 +140,33 @@ const key = (x: number, y: number) => `${x},${y}`;
 /**
  * Freeze every mob that affects the outcome - which is more than just the ones shooting at us.
  *
- * A mob that cannot hurt us still shapes the fight by standing in the way. Jad blocks and
- * chases without generating threats here (its attackDelay marks an animation start, not the
- * attack that resolves three ticks later, so it is tracked separately). Healers chase Jad
+ * A mob that cannot hurt us still shapes the fight by standing in the way. Healers chase Jad
  * rather than us but still occupy tiles the others have to path around.
+ *
+ * JAD is the one mob whose participation is a caller's choice, because the two things that
+ * read this snapshot want opposite answers.
+ *
+ * The PRAYER planner must keep Jad out (`includeJad` false, the default). Its attackDelay
+ * marks an animation START, not the attack that resolves three ticks later, and its style is
+ * re-rolled every tick - so anything this file predicts about Jad is worse than what
+ * JadTracker already knows by watching the animation and reading the committed style.
+ * `plannedOverhead` folds that observation in itself, and a simulated coin flip alongside it
+ * would only hedge against a question already answered.
+ *
+ * The TILE SCORER must let Jad in. With Jad excluded, `damageTaken` was zero on every tile in
+ * the arena including the one under its fist, `safeSpot` was zero everywhere (it requires an
+ * attacker to be safe FROM), and `npcReachSoon` paid 1 on every tile within tbow range - so
+ * the whole reachable area tied at exactly 1.0, and `bestMove` needs a STRICT improvement to
+ * move. Jad would walk up to a parked bot and it would stand there, not because melee range
+ * scored well, but because nothing could beat a tie. Measured: hp 81 to 0 in one tick on wave
+ * 67. Letting Jad generate threats prices adjacency, restores cover, and breaks the tie.
+ *
+ * What Jad contributes is deliberately a BAD attack to be standing near rather than a precise
+ * schedule: its styles are left unknown, so `stylesAtFireTime` reports the range/magic coin
+ * flip (plus stab when adjacent, which is what makes standing next to it properly expensive)
+ * and `planOverheads` prices the cost of guessing. The ticks it lands on are the animation
+ * ticks rather than the landing ticks three later - the total over a horizon is what the tile
+ * score needs, and the exact tick only matters to the prayer plan, which does not use this.
  *
  * Nibblers are the exception and are dropped entirely: JalNib.consumesSpace returns null, so
  * they neither block anything nor get blocked - passing null as mobToAvoid makes the engine's
@@ -146,12 +177,127 @@ const key = (x: number, y: number) => `${x},${y}`;
  * scanned rolls RNG inside that call, so a scorer asking 441 times what a blob will throw
  * would change what it throws.
  */
-export function snapshotMobs(region: Region, player: Player): SimMob[] {
+/**
+ * The three bloblets a dying blob is about to become, modelled from the moment it starts dying.
+ *
+ * A blob's death is not the end of a threat, it is the announcement of three more - and for the
+ * four ticks it spends dying the simulation used to see clean, empty floor. `snapshotMobs`
+ * drops anything with `dying > -1`, so the corpse tiles priced as perfectly safe, could earn
+ * the full safe-spot bonus, and the bot could be standing on the spawn point when they landed.
+ * The melee bloblet spawns on the blob's OWN tile, so that is not a hypothetical.
+ *
+ * Predicting them is not cheating, which is the first thing to settle given `Visibility`'s
+ * rule. Nothing here is read from `newMobs` or from anything the renderer has not drawn: the
+ * blob is visible, its death is visible, and what follows is fixed. `JalAk.removedFromWorld`
+ * spawns exactly these three, at exactly these offsets from the blob's own location, each with
+ * `cooldown: 4`. No RNG anywhere. This is the same class of knowledge as "a mager's range is
+ * 15" - deduction from what is on screen, which is what a human player does too.
+ *
+ * TIMING, from the engine rather than guessed. `dead()` sets `dying` to the death animation
+ * length (3 for a blob, which does not override it). `Mob.attackStep` calls `detectDeath` once
+ * per tick, counting 3 -> 2 -> 1 -> 0, and at zero calls `removedFromWorld`, which pushes the
+ * bloblets into `newMobs`. The corpse is only removed from `region.mobs` at the very END of
+ * that tick - AFTER `postTick`, which is where the automation runs - and `newMobs` merges at
+ * the very START of the next one. So the automation sees the dying blob on four consecutive
+ * ticks and the real bloblets on the fifth, with no gap between the ghosts and the things they
+ * were predicting.
+ *
+ * That is also why these are DERIVED every tick from the dying blob rather than registered in
+ * a list when it dies. There is no state to keep, nothing to reset between waves, and nothing
+ * to leak into the next region - and if anything ever changes how long a blob takes to die
+ * (the death animation can resolve early through a DelayedAction), the ghosts simply follow
+ * `dying` wherever it goes instead of holding a stale prediction.
+ *
+ * The first attack lands `dying + 1 + BLOBLET_COOLDOWN` ticks out: the remaining dying ticks,
+ * one for the merge, then the cooldown they spawn with.
+ */
+const BLOBLET_COOLDOWN = 4;
+const BLOBLET_MERGE_DELAY = 1;
+const BLOBLET_MAX_HIT = 18;
+const BLOBLET_SPEED = 4;
+
+const GHOST_BLOBLETS: ReadonlyArray<{
+  name: string;
+  dx: number;
+  dy: number;
+  style: string;
+  range: number;
+}> = [
+  // Straight out of JalAk.removedFromWorld. The blob is size 3 and its footprint runs east and
+  // north from `location`, so these are its south-west corner, its centre and its north-east
+  // corner - the melee one directly on the tile the corpse is standing on.
+  { name: EntityNames.JAL_AK_REK_KET, dx: 0, dy: 0, style: "crush", range: 1 },
+  { name: EntityNames.JAL_AK_REK_XIL, dx: 1, dy: -1, style: "range", range: 15 },
+  { name: EntityNames.JAL_AK_REK_MEJ, dx: 2, dy: -2, style: "magic", range: 15 },
+];
+
+/**
+ * A blob part-way through dying, and therefore three bloblets already committed.
+ *
+ * Exported so the automation's wave-state check and this file's ghost derivation ask the same
+ * question in the same words. They must never disagree: if the wave reads as over while ghosts
+ * are being modelled the bot walks home through them, and if it reads as live with no ghosts
+ * the bot fights an empty arena.
+ */
+export function isDyingBlob(mob: Mob): boolean {
+  return mob.dying > -1 && mob.mobName() === EntityNames.JAL_AK;
+}
+
+export function hasDyingBlob(region: Region): boolean {
+  return visibleMobs(region).some((mob) => isDyingBlob(mob as Mob));
+}
+
+function ghostBloblets(blob: Mob): SimMob[] {
+  const delay = Math.max(0, blob.dying) + BLOBLET_MERGE_DELAY + BLOBLET_COOLDOWN;
+  return GHOST_BLOBLETS.map((spawn) => ({
+    x: blob.location.x + spawn.dx,
+    y: blob.location.y + spawn.dy,
+    size: 1,
+    range: spawn.range,
+    speed: BLOBLET_SPEED,
+    delay,
+    maxHit: BLOBLET_MAX_HIT,
+    // Fixed by which bloblet it is - unlike their parent, they never scan and never roll.
+    style: spawn.style,
+    name: spawn.name,
+    blocks: true,
+    chasesPlayer: true,
+    targetX: blob.location.x,
+    targetY: blob.location.y,
+    attacks: true,
+    stunned: 0,
+    frozen: 0,
+    immobile: false,
+    isBlob: false,
+    pendingScan: false,
+    lastScanTick: -1,
+    hadLOS: false,
+    // None of the three define canMeleeIfClose, so there is no coin flip to price.
+    meleeIfClose: null,
+    canDig: false,
+    digTicks: 0,
+    digX: blob.location.x,
+    digY: blob.location.y,
+    ghost: true,
+  }));
+}
+
+export function snapshotMobs(
+  region: Region,
+  player: Player,
+  includeJad = false,
+): SimMob[] {
   const snapshot: SimMob[] = [];
   // Only what the player can actually see - during the countdown this is empty, because the
   // renderer draws no mobs at all until it expires. See Visibility.
   for (const mob of visibleMobs(region) as Mob[]) {
     if (mob.dying > -1) {
+      // A dying blob is not an absence, it is three bloblets with a countdown on them.
+      if (isDyingBlob(mob)) {
+        for (const ghost of ghostBloblets(mob)) {
+          snapshot.push(ghost);
+        }
+      }
       continue;
     }
     // Mirrors Collision.collidesWithAnyMobs, which only treats a mob as an obstacle when its
@@ -171,7 +317,12 @@ export function snapshotMobs(region: Region, player: Player): SimMob[] {
       speed: mob.attackSpeed,
       delay: mob.attackDelay,
       maxHit: mob.maxHit ?? 0,
-      style: knownAttackStyle(mob),
+      // Never asked of Jad. `knownAttackStyle` falls through to attackStyleForNewAttack(),
+      // which for Jad is `Random.get() < 0.5 ? "range" : "magic"` - so asking would draw from
+      // the seeded stream on every snapshot, several times a tick, and shift every roll that
+      // follows it. Blobs are guarded inside knownAttackStyle for exactly this reason; Jad was
+      // not. Null is also the honest answer: the flip has not happened yet.
+      style: isJad(mob) ? null : knownAttackStyle(mob),
       name: mob.mobName(),
       blocks,
       chasesPlayer,
@@ -179,7 +330,7 @@ export function snapshotMobs(region: Region, player: Player): SimMob[] {
       // moves, and for Jad, which barely does.
       targetX: target?.x ?? mob.location.x,
       targetY: target?.y ?? mob.location.y,
-      attacks: chasesPlayer && !isJad(mob),
+      attacks: chasesPlayer && (includeJad || !isJad(mob)),
       stunned: Math.max(0, (mob as unknown as { stunned?: number }).stunned ?? 0),
       frozen: Math.max(0, (mob as unknown as { frozen?: number }).frozen ?? 0),
       immobile: typeof mob.canMove === "function" ? !mob.canMove() && mob.hasLOS === false : false,
@@ -192,6 +343,7 @@ export function snapshotMobs(region: Region, player: Player): SimMob[] {
         "function"
           ? (mob as unknown as { canMeleeIfClose: () => string }).canMeleeIfClose() || null
           : null,
+      ghost: false,
       canDig: mob.mobName() === EntityNames.JAL_IM_KOT,
       digTicks: Math.max(
         0,

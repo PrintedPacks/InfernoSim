@@ -5,15 +5,20 @@ called. Update this table whenever a term is added, removed, or swapped in.
 
 ## Tile scoring — `TileScorer.ts`
 
-`score = barrageReach + npcReachSoon + safeSpot + forbiddenAdjacency − damageTaken`
+`score = barrageReach + npcReachSoon + safeSpot − damageTaken`
+
+Scored only over candidates that survive the filter: inside the arena, walkable, reachable, and
+**the walk does not enter the coin-flip melee zone** (see `routeEntersForbiddenZone` below).
 
 | Term | Status | What it does |
 |---|---|---|
 | `barrageReach` | **Live** | 1 if Ice Barrage reaches the focus nibbler from the route's **final** tile |
 | `npcReachSoon` | **Live** | 1 if the destination is reachable within `NPC_REACH_ARRIVAL_TICKS` and, within `NPC_REACH_WINDOW_TICKS` **of arrival** (post-arrival budget, so walking distance no longer eats mob patience), some mob's **projected** position is one the engine would actually fire at (`snapshotPlayerCanSeeMob`, same predicate as `isAttackable`). The projection became trustworthy 2026-08 when `stepMob` gained the engine's **"corner safespotting"** rule (`Mob.getNextMovementStep`: a step whose footprint would land on the target cancels its vertical component) — without it a corner-jammed bat was projected into view and the bot camped a reach-1 tile, firing at nothing, until prayer hit 0 |
 | `safeSpot` | **Live** | Up to `SAFE_SPOT_BONUS` (`0.8`) for a **true** safespot, three parts: clean walk (`damageTaken === 0` after planned overheads), destination out of every attacker's projected LOS+range for the whole 12-tick horizon, **and** the board *settles* — `settlesSafe` extends the simulation with the player parked (digs stripped) until mob positions reach a fixed point (two consecutive transient-free unchanged ticks), with the tile still unseen throughout; capped at `SAFE_SPOT_SETTLE_TICKS` (80), cap without settling = no bonus. Redesigned 2026-08 (second time): twelve quiet ticks handed the full bonus to tiles that were merely **far** — a mob arriving on tick 13 beat the old test. Requires ≥1 attacker on the board (nothing to be safe from = 0). Journey damage stays priced by `damageTaken`; the meleer's dig stays priced by `damageTaken` and deliberately does not void a safespot. Shaded down by `NPC_DISTANCE_PENALTY` (`0.01`/tile, Chebyshev) from the **nearest live mob**, floored at `SAFE_SPOT_MIN` (0.1) |
-| `forbiddenAdjacency` | **Live** | `FORBIDDEN_ADJACENCY_PENALTY` (**-1000**, a hard veto, not a priced cost) if the route's destination is under or melee-adjacent to a **mager, ranger, blob, or Jad** — the mobs with `canMeleeIfClose`. Judged at the destination only (same as `barrageReach`), reuses `Trajectory.playerIsUnder`/`withinMeleeRange` directly. Meleer is deliberately excluded — adjacency isn't a special state for it, it's the whole fight |
+| `routeEntersForbiddenZone` | **Live** (candidate filter, not a term — 2026-08) | The tile is **dropped**, exactly like one walled off behind a pillar, if the walk to it enters or ends in the melee zone of a **mager, ranger, blob, or Jad** (`canMeleeIfClose`; meleer excluded — adjacency isn't a special state for it, it's the whole fight). **Exit is allowed, entry is not**: a route may start inside the zone and walk out, but may never step back in or finish inside — otherwise a mob walking up to the player puts the player's *own* tile in the zone and every candidate including holding position is rejected, which freezes the bot. Holding position (route length 1) is never blocked, since `bestMove` needs that baseline. Zone geometry from tick-0 mob positions; these mobs park on line of sight, which is what makes a static reading defensible. Honest only because `routesFrom` transcribes the engine's `Pathing.constructPaths`, so the route judged is the route `moveTo` walks |
+| ~~`forbiddenAdjacency`~~ | Replaced 2026-08 | `-1000` on the **destination** only. Vetoed ending in the zone but left the journey merely *priced*: `damageTaken` charges the magic-or-stab flip at the **average** of its two outcomes, so a route clipping the zone for one tick was cheap enough for other terms to outweigh. A 50/50 can't be prayed, so pricing it at its mean is the one treatment that makes no sense — replaced by the whole-route filter above |
 | `damageTaken` | **Live** | Full 12-tick (`HORIZON_TICKS`) simulation of the walk + best possible prayer plan against it; what's left over |
+| `ghostBloblets` | **Live** (sim input, not a term — 2026-08) | A dying blob is modelled as the three bloblets it is about to become (`Trajectory.ghostBloblets`), instead of as empty floor. Offsets, styles, ranges and cooldown are fixed in `JalAk.removedFromWorld` — melee on the blob's own tile, ranged at +(1,−1), magic at +(2,−2), all 18 max hit, speed 4, `attackDelay 4` — so this is deduction from a visible death, not reading `newMobs`. First attack scheduled at `dying + 1 + 4` ticks. **Derived fresh each tick** from `dying > -1`, so there is no state to reset and the prediction follows `dying` if the death animation resolves early. Verified timing: the corpse leaves `region.mobs` only *after* `postTick` and `newMobs` merge at the *start* of the next tick, so ghosts cover exactly 4 automation ticks with no gap. Ghosts count for `damageTaken`, `safeSpot` (exposure + settle), **`npcReachSoon` and the distance shading** — a player knows they are landing and positions to fight them — but are **never targetable**: the attack layer reads `visibleMobs` and cannot see them |
 | `standStillDecay` | **Live** (promoted from experiment 2026-08; toggle removed) | Score-only (never in `ScoreParts`): while the board is **settled** (no live mob moved since last tick — clocks pause, never reset, while mobs are still reacting) with mobs alive and the player **not firing**, the camped tile — and the previously camped tile; two slots so the A-B shuffle pays nothing, returning resumes the old clock — loses `TILE_DECAY_PER_STEP` (0.01) per `TILE_DECAY_INTERVAL_TICKS` (5). Incoming fire does not reset the clocks — that exception was exactly what the prayer camp exploited, and covering it is how this absorbed run-away pressure's job. One rule: only fighting back forgives a camp |
 | ~~`npcReach`~~ | Removed | Old version judged reach at route destination instead of 1 tick ahead — replaced by `npcReachSoon` |
 | ~~`runAwayPressure`~~ | Removed 2026-08 | Grid-wide tilt away from the mobs after 15 parked ticks without firing. Replaced by the revised `standStillDecay` clock above — one mechanism covering both the quiet standoff and the prayer camp |
@@ -98,3 +103,22 @@ attacks it.
 # STUCK TEST
 
 http://localhost:8000/?wave=1&akrekxil=[[18,10],[18,8]]&akrekket=[[18,11]]&akrekmej=[[18,9]]&nibblers=false&x=29&y=18
+
+http://localhost:8000/?wave=1&akrekxil=[[11,18],[11,20]]&akrekket=[[11,19]]&akrekmej=[[11,17]]&nibblers=false&x=22&y=38
+
+MAGER + RANGER west pillar safee - No off tick chancee
+
+http://localhost:8000/?wave=1&akrekxil=[[12,20],[12,18]]&akrekmej=[[12,19],[12,14]]&blob=[[12,17]]&nibblers=false&x=23&y=38
+
+http://localhost:8000/?wave=1&akrekxil=[[17,10],[17,8]]&akrekket=[[17,11]]&akrekmej=[[17,9]]&nibblers=false&x=28&y=18
+
+http://localhost:8000/?wave=1&mager=[[0,16]]&ranger=[[0,12]]&blob=[[15,17]]&nibblers=false&x=11&y=14
+
+Safe tile should not get score if its UNDER npc 
+
+Jad tile wrong
+
+Pillars dispear after wave 66
+
+
+

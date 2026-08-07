@@ -367,6 +367,18 @@ export function attackReachFor(player: Player, mob: Mob): number {
   return weapon?.attackRange ?? 1;
 }
 
+/**
+ * The same answer for a mob we only have the NAME of - a ghost bloblet, which has no Mob in the
+ * region to point at yet.
+ *
+ * A name really is all this needs: the reach comes from `requiredSetFor`, and that reads nothing
+ * but `mobName()`. Deliberately routed through `attackReachFor` rather than reimplemented, so
+ * the two can never drift into disagreeing about the same mob.
+ */
+export function attackReachForName(player: Player, mobName: string): number {
+  return attackReachFor(player, { mobName: () => mobName } as unknown as Mob);
+}
+
 export interface ScoredTarget {
   mob: Mob;
   value: number;

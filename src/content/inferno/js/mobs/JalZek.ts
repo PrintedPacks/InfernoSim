@@ -212,7 +212,27 @@ export class JalZek extends Mob {
             mobToResurrect.aggro = Trainer.player;
 
             mobToResurrect.perceivedLocation = mobToResurrect.location;
-            this.region.addMob(mobToResurrect);
+            // Only add it back if it really left. A mob is pushed to the death store the tick
+            // its hitpoints hit zero, but the engine does not drop it from region.mobs until
+            // the end of the tick where dying reaches 0 - three or four ticks later. Resurrect
+            // one inside that window and it is still in the list, cancelDeath() above has just
+            // set dying back to -1 so the end-of-tick sweep will never remove it, and adding it
+            // again puts the SAME object in region.mobs twice.
+            //
+            // That is not a cosmetic duplicate. tickRegion does mobs.forEach(movementStep) and
+            // mobs.forEach(attackStep), so a doubled entry is stepped twice per tick: it moves
+            // at double speed and its attackDelay counts down twice, which makes a speed 4
+            // mager attack every 2 ticks. Measured on wave 66 (a wave whose table is
+            // [3,0,0,0,0,2] - three nibblers and exactly TWO magers, every attack magic): the
+            // arena listed three Jal-Zeks, two of them on the same tile with the same
+            // hitpoints, and the bot died flicking Protect from Magic on a four tick rhythm
+            // while the doubled mager fired on the ticks in between.
+            if (
+              !this.region.mobs.includes(mobToResurrect) &&
+              !this.region.newMobs.includes(mobToResurrect)
+            ) {
+              this.region.addMob(mobToResurrect);
+            }
             // (15, 10) to  (21 , 22
             this.attackDelay = 8;
             this.playAnimation(3);

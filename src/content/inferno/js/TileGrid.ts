@@ -142,7 +142,12 @@ export class TileGrid {
    * hundreds of three.js models every single tick. Any marker left over past the end of the
    * candidate list is parked as a non-candidate and therefore not drawn.
    */
-  static update(region: Region, player: Player, scored: ScoredTile[], chosen: Location) {
+  static update(
+    region: Region,
+    player: Player,
+    scored: ScoredTile[],
+    chosen: Location | null,
+  ) {
     if (!TileGrid.shown || !player) {
       TileGrid.teardown();
       return;
@@ -194,6 +199,12 @@ export class TileGrid {
    *
    * The ramp is normalised per tick rather than against fixed bounds: scores have no natural
    * scale, and relative ordering is what is being checked by eye.
+   *
+   * `chosen` is null when the movement layer picked nothing this tick - between waves, or with
+   * automation off. NOTHING is painted yellow then, deliberately. Substituting the best-scoring
+   * tile made yellow mean two different things: "the tile the bot is walking to" most of the
+   * time, and "the tile the bot is ignoring" the rest. Watching the bot walk to a 0.8 tile
+   * while the marker sat on a 1 is exactly that, and it looked like a movement bug.
    */
   private static shadeFor(
     tile: Location,
@@ -201,12 +212,12 @@ export class TileGrid {
     low: number,
     range: number,
     player: Player,
-    chosen: Location,
+    chosen: Location | null,
   ): string {
     if (tile.x === player.location.x && tile.y === player.location.y) {
       return COLOUR_PLAYER;
     }
-    if (tile.x === chosen.x && tile.y === chosen.y) {
+    if (chosen && tile.x === chosen.x && tile.y === chosen.y) {
       return COLOUR_CHOSEN;
     }
     if (range <= 0) {

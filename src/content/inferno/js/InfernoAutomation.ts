@@ -9,6 +9,7 @@ import { equipSet, GearSetName, isWearing, requiredSetFor } from "./GearSets";
 import { hasIceBarrageSelected, selectedSpell, selectIceBarrage } from "./SpellCaster";
 import { isAttackable } from "./AttackPlanner";
 import { bestMove, ScoredTile, scoreCandidates } from "./TileScorer";
+import { hasDyingBlob } from "./Trajectory";
 import { ArenaSnapshot } from "./ArenaSnapshot";
 import { chooseByPriority } from "./KillPriority";
 import { observeNibblers } from "./PillarDefence";
@@ -542,7 +543,8 @@ export class InfernoAutomation {
       isBetweenWaves?: boolean;
       ticksUntilNextWave?: number;
     };
-    const between = inferno.isBetweenWaves === true;
+    // The automation's own reading, not the raw getter - a dying blob is not downtime.
+    const between = InfernoAutomation.isBetweenWaves(region);
     const countdown = inferno.ticksUntilNextWave ?? -1;
     // Spell state, so the barrage sequence can be read off the screen rather than guessed at.
     const nibblers = visibleMobs(region).filter((m) => m.mobName() === EntityNames.JAL_NIB);
@@ -632,9 +634,24 @@ ${spellLine}`);
     return InfernoAutomation.chosenTile ?? player.location;
   }
 
-  /** InfernoRegion exposes this; other regions do not, so treat absence as "wave live". */
+  /**
+   * InfernoRegion exposes this; other regions do not, so treat absence as "wave live".
+   *
+   * Overruled by a dying blob. The region's getter is `mobs.every(mob => mob.dying !== -1)`, so
+   * a blob part-way through its death animation reads as downtime - and downtime sends the bot
+   * home, ignoring tile scoring entirely. Measured: the bot walked to HOME_TILE across the
+   * spawn point while three bloblets were landing on it, and the debug grid showed a chosen
+   * tile the movement layer was not using, because `chosenTile` is null between waves.
+   *
+   * `JalAk.removedFromWorld` spawns its three bloblets unconditionally, so a dying blob always
+   * means more mobs - there is no case where calling it downtime is right. The same predicate
+   * drives the ghost bloblets, so the threat model and the wave state cannot disagree.
+   */
   private static isBetweenWaves(region: Region): boolean {
-    return (region as unknown as { isBetweenWaves?: boolean }).isBetweenWaves === true;
+    if ((region as unknown as { isBetweenWaves?: boolean }).isBetweenWaves !== true) {
+      return false;
+    }
+    return !hasDyingBlob(region);
   }
 
   static onTick(region: Region, player: Player) {
