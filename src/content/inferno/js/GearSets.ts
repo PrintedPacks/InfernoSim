@@ -98,6 +98,7 @@ export function requiredSetFor(mob: Mob): GearSetName {
     case EntityNames.JAL_AK_REK_KET: // melee bloblet
     case EntityNames.JAL_AK_REK_MEJ: // magic bloblet
     case EntityNames.JAL_AK_REK_XIL: // ranged bloblet
+    case EntityNames.YT_HUR_KOT: // Jad healer - tagged with the blowpipe, one hit each
       return "blowpipe";
     default:
       // Rangers, magers, Jad, Zuk - anything worth the Twisted Bow's accuracy.

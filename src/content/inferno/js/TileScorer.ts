@@ -26,9 +26,14 @@ import { visibleMobs } from "./Visibility";
  * number attached to each one. The debug grid draws the exact same list this chooses from, so
  * what you see on screen is the decision's real input rather than a reconstruction of it.
  *
- * Four terms, in hitpoints over a twelve tick horizon except where noted:
+ * The terms, in hitpoints over a twelve tick horizon except where noted:
  *
- *     score = barrageReach + npcReachSoon + safeSpot - damageTaken
+ *     score = barrageReach + healerReach + npcReachSoon + losBonus + safeSpot + homePull - damageTaken
+ *
+ * `healerReach` is 1 if the nearest still-healing Jad healer can be tagged from this tile -
+ * the Jad-wave analogue of `barrageReach`, pulling the bot around Jad to where a blowpipe
+ * reaches the healers. `losBonus` divides a point by how many attackers get to shoot back
+ * from here, so of two tiles offering the same fight the quieter one wins.
  *
  * scored over the candidates that survive a filter: a tile is only a candidate at all if it is
  * inside the arena, walkable, reachable, and the walk to it does not enter the coin-flip melee
@@ -252,6 +257,41 @@ interface ReachTarget {
   reach: number;
 }
 
+/**
+ * The Jad healer worth repositioning for: the nearest one still healing (aggro not yet on the
+ * player). The Jad-wave analogue of `focusNibbler` - healers cluster on Jad's far side, and
+ * the whole tag-and-turn depends on standing somewhere a blowpipe can actually reach them, so
+ * the tile score needs a pull towards such tiles just as `barrageReach` pulls towards the
+ * nibblers. Tagged healers need nothing: they come to us.
+ */
+function focusHealer(region: Region, player: Player): ReachTarget | null {
+  let best: Mob | null = null;
+  let bestDistance = Infinity;
+  for (const mob of visibleMobs(region)) {
+    if (
+      mob.dying > -1 ||
+      mob.mobName() !== EntityNames.YT_HUR_KOT ||
+      mob.aggro === player
+    ) {
+      continue;
+    }
+    const distance = chebyshevDistance(player.location, mob.location);
+    if (distance < bestDistance) {
+      best = mob;
+      bestDistance = distance;
+    }
+  }
+  if (!best) {
+    return null;
+  }
+  return {
+    x: best.location.x,
+    y: best.location.y,
+    size: best.size,
+    reach: attackReachForName(player, EntityNames.YT_HUR_KOT),
+  };
+}
+
 function reachTargets(player: Player, mobs: Mob[]): ReachTarget[] {
   const targets: ReachTarget[] = [];
   for (const mob of mobs) {
@@ -435,6 +475,32 @@ export const NPC_DISTANCE_PENALTY = 0.01;
  * on purpose - it should not need defending from its own penalty term.
  */
 export const SAFE_SPOT_MIN = 0.1;
+
+/**
+ * The anchor tile for the waves that have one, or null for every wave that does not.
+ *
+ * 67 and 68 are fought in an open arena with no pillars, so nothing in the score anchors the
+ * bot anywhere - equal tiles everywhere means drift, and drift on a Jad wave ends at a wall
+ * with healers on both sides. These are the same tiles the spawn places the player on, and
+ * the same map the between-waves station uses (via this function, so the two cannot disagree).
+ */
+export function waveHomeTile(wave: number): Location | null {
+  if (wave === 67) {
+    return { x: 18, y: 25 };
+  }
+  if (wave === 68) {
+    return { x: 25, y: 27 };
+  }
+  return null;
+}
+
+/**
+ * Cost per tile of Chebyshev distance from the wave's home tile - a nudge, deliberately on
+ * the same tiny scale as NPC_DISTANCE_PENALTY: it breaks ties between otherwise-equal tiles
+ * towards the centre of the arena and loses every argument with a real term. At 0.01/tile
+ * the whole grid spans about 0.2, less than a third of one safe-spot bonus.
+ */
+export const HOME_PULL_PER_TILE = 0.01;
 
 /**
  * Paid on tiles a shot can be taken from, divided by how many attackers can shoot BACK.
@@ -711,10 +777,14 @@ export function distanceToNearestMob(region: Region, player: Player): number | n
  */
 export interface ScoreParts {
   barrageReach: number;
+  /** 1 if the nearest still-healing Jad healer can be tagged from here - see `focusHealer`. */
+  healerReach: number;
   npcReachSoon: number;
   /** `LOS_BONUS` shared between everything that can shoot this tile; 0 without reach. */
   losBonus: number;
   safeSpot: number;
+  /** Zero, or negative HOME_PULL_PER_TILE per tile from the wave's home tile (67/68 only). */
+  homePull: number;
   damageTaken: number;
   threats: number;
 }
@@ -729,6 +799,8 @@ function scoreRoute(
   snapshot: ArenaSnapshot,
   mobs: SimMob[],
   focus: NibblerThreat | null,
+  healer: ReachTarget | null,
+  home: Location | null,
   targets: ReachTarget[],
   reaches: Map<string, number>,
   route: Location[],
@@ -906,9 +978,27 @@ function scoreRoute(
 
   const parts: ScoreParts = {
     barrageReach: barrageReach(snapshot, focus, route),
+    // The Jad-wave pull: 1 if the focus healer - nearest one still healing - can be tagged
+    // from this destination. Same shape as barrageReach, same under-mob refusal as reach.
+    healerReach:
+      healer && !destinationUnderMob
+        ? snapshotPlayerCanSeeMob(
+            snapshot,
+            destination.x,
+            destination.y,
+            healer.x,
+            healer.y,
+            healer.size,
+            healer.reach,
+          )
+          ? 1
+          : 0
+        : 0,
     npcReachSoon,
     losBonus,
     safeSpot,
+    // Negative or zero: the drift anchor for the open-arena waves - see HOME_PULL_PER_TILE.
+    homePull: home ? -HOME_PULL_PER_TILE * chebyshevDistance(destination, home) : 0,
     damageTaken,
     threats: threats.length,
   };
@@ -916,9 +1006,11 @@ function scoreRoute(
   return {
     score:
       parts.barrageReach +
+      parts.healerReach +
       parts.npcReachSoon +
       parts.losBonus +
-      parts.safeSpot -
+      parts.safeSpot +
+      parts.homePull -
       parts.damageTaken,
     parts,
   };
@@ -969,6 +1061,11 @@ export function scoreCandidates(
     isInsideArena(x, y) && snapshot.canStandAt(x, y),
   );
   const focus = focusNibbler(nibblerThreats(region));
+  // The Jad-wave analogue of the focus nibbler: null on every other wave, so this costs
+  // nothing outside 67+.
+  const healer = focusHealer(region, player);
+  // The drift anchor for the open-arena waves; null everywhere else.
+  const home = waveHomeTile((region as unknown as { wave?: number }).wave ?? 0);
   // Frozen once and shared by all 441 simulations. Rebuilt each call rather than cached, because
   // mobs move and pillars die.
   // Jad included: the tile score is the one consumer that has to see it hitting, or the grid
@@ -1012,7 +1109,16 @@ export function scoreCandidates(
     if (routeEntersForbiddenZone(mobs, route)) {
       continue;
     }
-    const { score, parts } = scoreRoute(snapshot, mobs, focus, targets, reaches, route);
+    const { score, parts } = scoreRoute(
+      snapshot,
+      mobs,
+      focus,
+      healer,
+      home,
+      targets,
+      reaches,
+      route,
+    );
     // The stand-still decay bites the two remembered camps only - the current tile and the
     // one camped before it - so a standoff lowers the bar for moving somewhere NEW without
     // distorting what any other tile is worth. See the constants for the rationale, including

@@ -8,10 +8,10 @@ import { applyAttackPlan } from "./AttackPlanner";
 import { equipSet, GearSetName, isWearing, requiredSetFor } from "./GearSets";
 import { hasIceBarrageSelected, selectedSpell, selectIceBarrage } from "./SpellCaster";
 import { isAttackable } from "./AttackPlanner";
-import { bestMove, ScoredTile, scoreCandidates } from "./TileScorer";
+import { bestMove, ScoredTile, scoreCandidates, waveHomeTile } from "./TileScorer";
 import { hasDyingBlob } from "./Trajectory";
 import { ArenaSnapshot } from "./ArenaSnapshot";
-import { chooseByPriority, killPriority } from "./KillPriority";
+import { chooseByPriority, chooseJadWaveTarget, killPriority } from "./KillPriority";
 import { observeNibblers } from "./PillarDefence";
 import { attackOptionFor, chooseTarget } from "./TargetPlanner";
 import { visibleMobs } from "./Visibility";
@@ -732,16 +732,12 @@ ${spellLine}`);
     if (InfernoAutomation.isBetweenWaves(region)) {
       const entering =
         ((region as unknown as { wave?: number }).wave ?? 0) + 1;
-      if (entering === 67) {
-        return { x: 18, y: 25 };
-      }
-      if (entering === 68) {
-        return { x: 25, y: 27 };
-      }
       if (entering >= 69) {
         return { x: player.location.x, y: player.location.y };
       }
-      return HOME_TILE;
+      // The same map the tile scorer's homePull anchors to, so the tile waited on between
+      // waves and the tile pulled towards during them can never disagree.
+      return waveHomeTile(entering) ?? HOME_TILE;
     }
     return InfernoAutomation.chosenTile ?? player.location;
   }
@@ -1185,7 +1181,16 @@ ${spellLine}`);
       // within a band. `TargetPlanner.chooseTarget(region, player, snapshot, route, target)` is
       // the real one, which prices a target by simulating the fight without it and already
       // accounts for the pillar damage a nibbler would do.
-      const intended = chooseByPriority(region, player, InfernoAutomation.target);
+      // Jad waves use the tag-and-turn instead of the priority table: blowpipe each healer
+      // still healing (aggro not yet on us), then Jad once all are pulled - and never the
+      // tagged ones. No fallback to the table while a Jad lives, or tagged healers would
+      // come straight back as its top-ranked targets.
+      const jadWave = visibleMobs(region).some(
+        (mob) => mob.dying === -1 && mob.mobName() === EntityNames.JAL_TOK_JAD,
+      );
+      const intended = jadWave
+        ? chooseJadWaveTarget(region, player)
+        : chooseByPriority(region, player, InfernoAutomation.target);
 
       if (!intended) {
         InfernoAutomation.attackState = "no target";

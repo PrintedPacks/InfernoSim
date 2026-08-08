@@ -73,6 +73,59 @@ export function canReach(region: Region, player: Player, mob: Mob): boolean {
 }
 
 /**
+ * Jad-wave targeting: the tag-and-turn every player does, replacing the priority table while
+ * a Jad is alive.
+ *
+ * Healers spawn healing Jad (`aggro` = their Jad, weapon style "heal") and flip aggro to
+ * whoever hits them first - so "still healing" is precisely `aggro !== player`, and one
+ * blowpipe hit each is the whole job. The order is: nearest reachable UNTAGGED healer until
+ * none remain, then Jad - and never the tagged ones, which the priority table would otherwise
+ * rank above Jad (healer 2 > Jad 1) and grind down one by one while fresh healers spawned and
+ * healed everything back.
+ *
+ * Null when nothing useful is reachable - the tile scorer's healer-reach term and the
+ * force-attack backstop own getting us somewhere better, exactly as everywhere else. The
+ * caller must NOT fall back to the priority table on a Jad wave, or the tagged healers come
+ * straight back as targets.
+ */
+export function chooseJadWaveTarget(region: Region, player: Player): Mob | null {
+  const alive = visibleMobs(region).filter((mob) => mob.dying <= -1);
+
+  let bestHealer: Mob | null = null;
+  let bestDistance = Infinity;
+  for (const mob of alive) {
+    if (mob.mobName() !== EntityNames.YT_HUR_KOT || mob.aggro === player) {
+      continue;
+    }
+    if (!canReach(region, player, mob)) {
+      continue;
+    }
+    const distance = distanceTo(player, mob);
+    if (distance < bestDistance) {
+      bestHealer = mob;
+      bestDistance = distance;
+    }
+  }
+  if (bestHealer) {
+    return bestHealer;
+  }
+
+  let bestJad: Mob | null = null;
+  bestDistance = Infinity;
+  for (const mob of alive) {
+    if (mob.mobName() !== EntityNames.JAL_TOK_JAD || !canReach(region, player, mob)) {
+      continue;
+    }
+    const distance = distanceTo(player, mob);
+    if (distance < bestDistance) {
+      bestJad = mob;
+      bestDistance = distance;
+    }
+  }
+  return bestJad;
+}
+
+/**
  * Highest priority band we can actually reach, nearest first within the band.
  *
  * Sticky: the current target is kept whenever it is still reachable and still in the top band on
