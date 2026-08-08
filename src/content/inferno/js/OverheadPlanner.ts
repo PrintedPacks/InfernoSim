@@ -1,5 +1,7 @@
 "use strict";
 
+import { EntityNames } from "osrs-sdk";
+
 import { Threat } from "./Trajectory";
 
 /**
@@ -75,7 +77,7 @@ export interface OverheadPlan {
 /**
  * Choose the overhead for every tick in the horizon, and report what still gets through.
  *
- * Two different kinds of uncertainty are handled differently, which is the whole subtlety:
+ * Three different kinds of uncertainty are handled differently, which is the whole subtlety:
  *
  *   - a BLOB is a decision. Its style is whatever our plan forces, so it is MINIMISED over -
  *     steer it to match the biggest thing landing on its fire tick and one overhead covers
@@ -84,6 +86,28 @@ export interface OverheadPlan {
  *   - an adjacent mager or ranger is a coin flip. Mob.attack() rolls Random.get() to decide
  *     whether to switch to its melee style, and nothing we choose changes that, so it is
  *     averaged over instead. Praying one of its two styles blocks half its max hit.
+ *   - JAD IS NOT A GUESS, and pricing it as one was wrong. This simulation deliberately never
+ *     predicts Jad's roll (see Trajectory.snapshotMobs - resolving it would draw from the
+ *     seeded stream on every one of 441 tile-scores a tick), so a Jad threat still arrives
+ *     here as the ambiguous ["magic","range"] pair, same shape as an unscanned blob's. But
+ *     LIVE PLAY is never actually guessing: JadTracker watches the animation and reads the
+ *     REAL committed style three ticks before it lands, so the prayer that goes up is always
+ *     the right one - unless something else needs the slot on that exact tick. Charging half
+ *     of every landing's max hit as an unavoidable cost, on every tile in the arena (Jad's
+ *     range is 50, it reaches everywhere), turned Jad into a flat, position-independent floor
+ *     that swamped the one thing tile scoring actually exists to weigh - see
+ *     TileScorer.focusHealer and the wave 68 dump that motivated this: every candidate priced
+ *     within a few points of -226 regardless of position, so healer-dodge distance became the
+ *     ONLY visible signal and the bot ran real distance to buy single-digit tie-breaks.
+ *     So: a plan that shows Magic or Range - either one, since the true style is discovered
+ *     before it lands, not gambled on - is charged NOTHING for Jad. A plan that spends the
+ *     slot on something else instead pays Jad's FULL hit, not half, because on the tick that
+ *     really happens nothing was guessed - the slot simply went elsewhere and Jad's
+ *     known-but-unprayed hit lands whole. Scoped to the plain two-style case only: adjacency
+ *     adds a real stab coin flip Jad's own weapon rolls at fire time (Mob.attack's
+ *     canMeleeIfClose check), which this simulation can resolve no better than a mager's -
+ *     though it never reaches a scored candidate anyway, since routeEntersForbiddenZone
+ *     already refuses to stand next to Jad.
  */
 export function planOverheads(threats: Threat[]): OverheadPlan {
   const plan = new Map<number, string | null>();
@@ -128,6 +152,18 @@ export function planOverheads(threats: Threat[]): OverheadPlan {
           ...threat.styles.filter((style) => prayerForAttackStyle(style) === MELEE_PRAYER),
         ];
       }
+      // Jad: 0 if the plan shows a category that covers it (Magic or Range - see the module
+      // header), its FULL hit otherwise. Never the blob's null-style shape misread as Jad -
+      // gated on the name, not just the ambiguous style pair - and never the adjacency case,
+      // which keeps the ordinary averaged treatment below.
+      if (threat.name === EntityNames.JAL_TOK_JAD && styles.length === 2) {
+        const covered = styles.some(
+          (style) => prayer !== null && prayerForAttackStyle(style) === prayer,
+        );
+        sum += covered ? 0 : threat.maxHit;
+        continue;
+      }
+
       const blocked = styles.filter(
         (style) => prayer !== null && prayerForAttackStyle(style) === prayer,
       ).length;

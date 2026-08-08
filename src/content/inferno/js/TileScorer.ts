@@ -943,7 +943,31 @@ function scoreRoute(
   // Exposure is now just "did anything ever have it": one gathering pass, so the safe-spot
   // test and the watcher count can never disagree about who can see this tile.
   const destinationExposed = watchers.size > 0;
-  const damageTaken = planOverheads(threats).damage;
+
+  /**
+   * A healer's hit only prices if it lands on the very NEXT tick - discarded past that, no
+   * matter how far into the horizon the projection sees one catching up.
+   *
+   * Everything else in `damageTaken` keeps the full 12 ticks; this is deliberately narrower,
+   * because a healer is not like the rest of the board. Jad hits everywhere (range 50), a
+   * mager or ranger parks once it acquires and stays a fixed threat - but a HEALER is a
+   * chaser whose position twelve ticks out is the projection's guess, not a fact, and pricing
+   * that guess as a real cost on every candidate tile is what sent the bot sprinting real
+   * distance to dodge a hit still eight ticks away. Measured (wave 68, dump): every tile
+   * within reach of a chasing healer's eventual catch-up scored worse than one seven tiles
+   * further out, by exactly the avoided hit's max hit - the bot was buying a temporary
+   * reprieve at the cost of DPS uptime against Jad, re-buying the same reprieve every tick,
+   * forever.
+   *
+   * Scoring re-runs from scratch next tick with a real position instead of a projection, so a
+   * catch-up eight ticks out will be priced honestly when it is actually one or two ticks out
+   * - nothing is lost by not reacting to it now. Scoped to healers by name; every other
+   * chaser's full-horizon price is untouched.
+   */
+  const priced = threats.filter(
+    (threat) => threat.name !== EntityNames.YT_HUR_KOT || threat.tick <= 2,
+  );
+  const damageTaken = planOverheads(priced).damage;
 
   // Safe means: something is on the board to be safe FROM, the walk is clean (whatever fires
   // en route, the planned overheads stop all of it), nothing has the tile in range for the
@@ -1000,7 +1024,10 @@ function scoreRoute(
     // Negative or zero: the drift anchor for the open-arena waves - see HOME_PULL_PER_TILE.
     homePull: home ? -HOME_PULL_PER_TILE * chebyshevDistance(destination, home) : 0,
     damageTaken,
-    threats: threats.length,
+    // priced.length, not threats.length - the dump's threat count should match what was
+    // actually charged, or a healer-chase-eight-ticks-out would read as a threat that costs
+    // nothing, which is confusing to debug against.
+    threats: priced.length,
   };
 
   return {
