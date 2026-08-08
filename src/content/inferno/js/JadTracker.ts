@@ -50,10 +50,45 @@ export function isJad(mob: Mob): boolean {
 }
 
 /**
+ * A committed Jad attack, remembered INDEPENDENTLY of the Jad it came from.
+ *
+ * The ghost hit: JadMagicWeapon/JadRangeWeapon register a DelayedAction that runs the real
+ * `super.attack()` - damage roll AND protection check - three ticks after the animation
+ * starts, with no check on the attacker still being alive. Kill Jad inside that window and
+ * the fireball still lands. Meanwhile everything about the LIVE mob that announced the attack
+ * is destroyed by `dead()`: `dying` goes positive, `aggro` is nulled, and the death animation
+ * replaces `currentAnimation` - so a tracker that reads the mob deregisters the prayer at the
+ * exact moment it is still needed, and a 113 max hit arrives unprayed. Measured by the user
+ * as the "ghost hit".
+ *
+ * So a commit, once seen, lives here as a schedule with a landing tick, and the report below
+ * reads THIS ledger rather than the mob. Records expire on their own within four ticks, so
+ * there is no cross-wave state to reset.
+ */
+interface PendingJadAttack {
+  mob: Mob;
+  style: string;
+  maxHit: number;
+  /** Global tick the DelayedAction resolves on - the tick the prayer must already be up. */
+  landsAtTick: number;
+}
+
+let pending: PendingJadAttack[] = [];
+
+function tickOf(unit: { region?: { world?: { globalTickCounter?: number } } }): number | null {
+  return unit.region?.world?.globalTickCounter ?? null;
+}
+
+/**
  * Record the committed style for any Jad that has just begun an attack animation.
  *
  * Must run every tick, before planning, or the commit tick is missed and that attack becomes
  * unblockable.
+ *
+ * Known edge this cannot cover: a Jad killed on the SAME tick its animation starts has the
+ * death animation in place of the attack animation by the time this runs, so the commit is
+ * unobservable - the attack was still registered and will still land. Every later kill inside
+ * the window is covered, because the commit was recorded a tick or more before the death.
  */
 export function observeJads(mobs: Mob[]): void {
   for (const mob of mobs) {
@@ -63,6 +98,17 @@ export function observeJads(mobs: Mob[]): void {
     const jad = mob as JadLike;
     if (jad.currentAnimation && jad.currentAnimationTick === ANIM_TICK_COMMIT) {
       jad[COMMITTED_STYLE] = jad.attackStyle;
+
+      const now = tickOf(jad);
+      if (now === null || !jad.attackStyle) {
+        continue;
+      }
+      const landsAtTick = now + (ANIM_TICK_LAND - ANIM_TICK_COMMIT);
+      // The debug grid can trigger a second observation in the same tick - one commit, one
+      // record.
+      if (!pending.some((p) => p.mob === mob && p.landsAtTick === landsAtTick)) {
+        pending.push({ mob, style: jad.attackStyle, maxHit: mob.maxHit ?? 0, landsAtTick });
+      }
     }
   }
 }
@@ -83,25 +129,25 @@ export function ticksUntilJadLands(mob: Mob): number | null {
 }
 
 /**
- * Jads whose deferred attack resolves on the next tick, so the prayer must go up now.
+ * Committed Jad attacks that resolve on the next tick, so the prayer must go up now.
  *
- * Uses the remembered style rather than the live `attackStyle` field, which by this point has
- * been re-rolled several times.
+ * Read from the pending-attack ledger, NOT from the mobs - deliberately. The old version
+ * filtered on `dying`, `aggro` and the live animation, and all three deregister the moment a
+ * Jad dies, while its DelayedAction attack still lands regardless: the ghost hit. A committed
+ * attack is a fact about the future, not a property of the mob that announced it. The mobs
+ * parameter is kept so callers need not change; `player` guards against a record from a Jad
+ * that was never fighting us at commit time (they always are, in this sim, but free to check).
  */
 export function jadThreatsLandingNextTick(
   mobs: Mob[],
   player: Player,
 ): { mob: Mob; style: string; maxHit: number }[] {
-  const threats: { mob: Mob; style: string; maxHit: number }[] = [];
-  for (const mob of mobs) {
-    if (!isJad(mob) || mob.aggro !== player || mob.dying > -1) {
-      continue;
-    }
-    const style = committedStyle(mob);
-    if (!style || ticksUntilJadLands(mob) !== 1) {
-      continue;
-    }
-    threats.push({ mob, style, maxHit: mob.maxHit ?? 0 });
+  const now = tickOf(player);
+  if (now === null) {
+    return [];
   }
-  return threats;
+  pending = pending.filter((p) => p.landsAtTick > now);
+  return pending
+    .filter((p) => p.landsAtTick === now + 1)
+    .map((p) => ({ mob: p.mob, style: p.style, maxHit: p.maxHit }));
 }

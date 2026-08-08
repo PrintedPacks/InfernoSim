@@ -97,6 +97,49 @@ before priority is consulted (a 0 would still win when it is the only thing in r
 about the mobs changed: the shield still blocks, and whatever the engine points at it still
 attacks it.
 
+## Bloblet stacks (2026-08)
+
+A "stack" is ≥2 live bloblets inside one 3×3 (`blobletsCovered`). The full flow, in order:
+
+1. **Ghost window prep** — when a blob starts dying and the pending bloblets (priority 7)
+   outrank everything alive and reachable, the 4-tick window is spent switching to mage and
+   selecting Ice Barrage (`stack prep:` states). Aggro is cleared so the Kodai doesn't
+   autocast at the old target; movement pauses only once there's a selection to protect
+   (`moveTo` nulls it); prayer always runs first and never waits. Bounded by the window itself.
+2. **Ice on the landing** — the trio lands on a fixed diagonal whose middle the blast covers
+   entirely (`bestBarrageBloblet`, most-covered then nearest): one cast, `stack barrage x3`,
+   15 hp each, survivors frozen *in* the stack. Hold capped at `STACK_HOLD_TICKS` (6) — unlike
+   the nibbler hold this runs mid-wave under fire, so if the cast hasn't happened the stack has
+   broken: stop waiting, the next walk clears the selection.
+3. **Blood on surviving stacks** — a stacked bloblet target flips the gear choice to mage;
+   the Kodai **autocasts Blood Barrage**, so it's purely a gear decision — no manual cast, no
+   hold, nothing blocked. Damages and heals off every stacked bloblet (measured: hp 53→64
+   while clearing a trio). 
+4. **Blowpipe on singles** — coverage < 2 falls through to the normal path.
+
+**Heal mode (2026-08):** when **≤2 monsters** are alive and **hp is not full**, the gear choice
+flips to mage and the Kodai blood-autocasts the priority target until hp is full (`blood-heal
+attacking …` in the tick log; measured hp 73→90 in one cast). Same non-blocking mechanism as
+the stack blood — kill speed on a wave's tail is worth less than entering the next wave full.
+
+Nibblers keep absolute precedence: the nibbler barrage branch runs first, and prep never fires
+while a reachable nibbler outranks the pending bloblets.
+
+## Force attack + reach fallback (2026-08)
+
+- **Reach fallback** (`attackOptionFor`): a mob's required set first; if its weapon can't
+  reach, the "tbow" set's weapon *as the loadout actually carries it*. **Never for pures**
+  (`Settings.loadout === "pure"`). Set and range decided together — candidacy (`canReach`),
+  the gear switch, and the attack click all read the one answer, so the switch-then-drop
+  deadlock can't reopen.
+- **Force attack** (instrumented backstop): 50 live-wave ticks without a shot fired
+  (`FORCE_ATTACK_IDLE_TICKS`) → click the highest-priority mob regardless of reach and let the
+  engine chase (`determineDestination` paths towards aggro without LOS — the behaviour
+  `applyAttackPlan` normally suppresses, used deliberately). Chase stands down on kill, shot
+  fired, or 100 ticks. Every engagement is counted: `FORCED: chasing …` in the tick log,
+  `| FORCED xN` per wave line, total in the run summary — a rising count in sweeps is a
+  regression signal, never a silent mask.
+
 **Known gaps**
 
 - Nothing prices remaining hp, ticks-to-kill, gear-switch cost, or what a mob is about to do.
@@ -104,23 +147,33 @@ attacks it.
 
 # STUCK TEST
 
-http://localhost:8000/?wave=1&akrekxil=[[18,10],[18,8]]&akrekket=[[18,11]]&akrekmej=[[18,9]]&nibblers=false&x=29&y=18
-
-http://localhost:8000/?wave=1&akrekxil=[[11,18],[11,20]]&akrekket=[[11,19]]&akrekmej=[[11,17]]&nibblers=false&x=22&y=38
-
-MAGER + RANGER west pillar safee - No off tick chancee
-
-http://localhost:8000/?wave=1&akrekxil=[[12,20],[12,18]]&akrekmej=[[12,19],[12,14]]&blob=[[12,17]]&nibblers=false&x=23&y=38
-
-http://localhost:8000/?wave=1&akrekxil=[[17,10],[17,8]]&akrekket=[[17,11]]&akrekmej=[[17,9]]&nibblers=false&x=28&y=18
-
 http://localhost:8000/?wave=1&mager=[[0,16]]&ranger=[[0,12]]&blob=[[15,17]]&nibblers=false&x=11&y=14
 
-Safe tile should not get score if its UNDER npc 
 
-Jad tile wrong
+1. Pillars dispear after wave 66 - Remove pillars after wave 66 - Wave 67 hometile 18, 25, wave 68 25, 27, wave 69 no home tile, - 3000 tick time out for these waves
 
-Pillars dispear after wave 66
+2. Blood Barrrage - When HP is not max, we should switch to blood barrage. To do so is just switch to magic gear and staff and autocast does blood. 
+I'm not sure how to handle when is correct time to do it, Last npc, last 2 npcs? 
+I just dont want it be barraging healing when it should be doing DPS.
+
+
+3. Barrage Nibblers - We should try and barrrage the bloblet stack similar to nibblers.
+It should be non blocking, ideally it should cast ice barrage but normal mage and autocast blood barrage is fine for now.
+If there isn't a stack available and or killing them individually we should use blowpipe.
+I see we are not registering the ghost bloblets as potential targets, on wave 7 with double blob we are switching to the other blob and not waiting for ghost to spawn and be our higher priority target.
+
+4. Force Attack - After N ticks, try using a longer ranger weapon if available 
+Longer range weapon - Blowpipe monster normally but can i reach with tbow, runecbow, bowfa, barrage? We can use that
+If we still can't reach add like N ticks to force an attack to land on the highest priority monster. 
+
+
+More Bugs: - 
+
+Nibbler tile choice
+Pure Mage's book
+Closet to player tile vs first scored tile
+
+
 
 
 

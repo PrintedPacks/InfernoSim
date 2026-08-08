@@ -738,6 +738,7 @@ export class InfernoRegion extends Region {
     } else if (this.wave === 67) {
       // Clear death store when starting special waves
       InfernoMobDeathStore.clearDeadMobs();
+      this.removePillars();
 
       player.location = { x: 18, y: 25 };
       const jad = new JalTokJad(
@@ -749,6 +750,7 @@ export class InfernoRegion extends Region {
     } else if (this.wave === 68) {
       // Clear death store when starting special waves
       InfernoMobDeathStore.clearDeadMobs();
+      this.removePillars();
 
       player.location = { x: 25, y: 27 };
 
@@ -777,6 +779,7 @@ export class InfernoRegion extends Region {
     } else if (this.wave === 69) {
       // Clear death store when starting special waves
       InfernoMobDeathStore.clearDeadMobs();
+      this.removePillars();
 
       player.location = { x: 25, y: 15 };
 
@@ -1177,6 +1180,24 @@ export class InfernoRegion extends Region {
     this.lastMobCount = currentMobCount;
   }
 
+  /**
+   * The pillars collapse going into wave 67, as in the real Inferno - Jad, the triple Jads
+   * and Zuk are fought in an open arena. Routed through each pillar's own `dead()` so the
+   * teardown (death animation, delayed removeEntity, 3D model) is the same one a nibbler
+   * kill triggers, rather than a second removal path that could drift from it.
+   *
+   * Called from every wave 67+ spawn site - the progression path and the boot-at-wave path -
+   * so starting a run directly at 67, 68 or 69 gets the same open arena as arriving there.
+   * Harmless when the pillars are already gone: the filter simply finds nothing.
+   */
+  private removePillars() {
+    for (const entity of this.entities.filter(
+      (candidate) => candidate.entityName() === EntityNames.PILLAR,
+    )) {
+      (entity as unknown as { dead: () => void }).dead();
+    }
+  }
+
   private spawnRegularWave(player: any, randomPillar: any, customSpawns?: Location[]) {
     // Common logic for spawning regular waves (1-66)
     const spawns = customSpawns || InfernoWaves.getRandomSpawns();
@@ -1235,6 +1256,7 @@ export class InfernoRegion extends Region {
 
       // Clear death store for special waves
       InfernoMobDeathStore.clearDeadMobs();
+      this.removePillars();
 
       player.location = { x: 18, y: 25 };
       const jad = new JalTokJad(
@@ -1249,6 +1271,7 @@ export class InfernoRegion extends Region {
 
       // Clear death store for special waves
       InfernoMobDeathStore.clearDeadMobs();
+      this.removePillars();
 
       player.location = { x: 25, y: 27 };
 
@@ -1279,8 +1302,9 @@ export class InfernoRegion extends Region {
 
       player.location = { x: 25, y: 15 };
 
-      // Remove pillars for Zuk wave
-      this.entities = this.entities.filter(entity => entity.entityName() !== EntityNames.PILLAR);
+      // Should already be gone since 67, but a run started at 68/69 arrives here directly.
+      // Through dead() rather than a silent filter, so the teardown is the real one.
+      this.removePillars();
 
       // Spawn zuk
       const shieldDirection = this.initializeAndGetShieldDirection();

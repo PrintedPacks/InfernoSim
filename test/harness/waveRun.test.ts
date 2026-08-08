@@ -252,6 +252,15 @@ test("seeded wave run through the real InfernoAutomation.onTick", () => {
   const run = () =>
     `run ${Math.round(((player.currentStats as { run?: number }).run ?? 0) / 100)}% ` +
     `${(player as unknown as { running?: boolean }).running ? "ON" : "OFF"}`;
+  // Force-attack instrumentation: a wave that only cleared because the backstop shoved the
+  // bot must SAY so, or the backstop becomes a way of hiding stucks instead of measuring them.
+  let forcedSeen = 0;
+  const forced = () => {
+    const total = InfernoAutomation.getForcedAttackCount?.() ?? 0;
+    const delta = total - forcedSeen;
+    forcedSeen = total;
+    return delta > 0 ? ` | FORCED x${delta}` : "";
+  };
 
   out("");
   out(
@@ -331,7 +340,7 @@ test("seeded wave run through the real InfernoAutomation.onTick", () => {
         wavesCleared += region.wave - lastWave;
         out(
           `wave ${String(lastWave).padStart(2)} cleared | ` +
-            `${String(tick - waveStartTick).padStart(4)} ticks | ${hp()} | ${prayer()} | ${run()}`,
+            `${String(tick - waveStartTick).padStart(4)} ticks | ${hp()} | ${prayer()} | ${run()}${forced()}`,
         );
         lastWave = region.wave;
         waveStartTick = tick;
@@ -350,10 +359,13 @@ test("seeded wave run through the real InfernoAutomation.onTick", () => {
         }
       }
 
-      if (tick - waveStartTick > WAVE_TICK_LIMIT) {
+      // Jad, triple Jad and Zuk are legitimately long fights in an open arena - they get the
+      // old 3000-tick allowance instead of the regular-wave 500.
+      const waveLimit = region.wave >= 67 ? Math.max(WAVE_TICK_LIMIT, 3000) : WAVE_TICK_LIMIT;
+      if (tick - waveStartTick > waveLimit) {
         outcome = "stuck";
         detail =
-          `no wave transition for ${WAVE_TICK_LIMIT} ticks on wave ${region.wave} ` +
+          `no wave transition for ${waveLimit} ticks on wave ${region.wave} ` +
           `(${aliveMobs()} mobs alive, ${hp()}, ${prayer()}, ${run()})`;
         break;
       }
@@ -440,8 +452,10 @@ test("seeded wave run through the real InfernoAutomation.onTick", () => {
   const wall = formatDuration(Date.now() - startedAt);
   out("----------------------------------------------------------------");
   out(`RESULT: ${outcome}${outcome === "completed" ? "" : ` - ${detail}`}`);
+  const forcedTotal = InfernoAutomation.getForcedAttackCount?.() ?? 0;
   out(
-    `reached wave ${region.wave} (started at ${START_WAVE}), cleared ${wavesCleared} wave${wavesCleared === 1 ? "" : "s"}`,
+    `reached wave ${region.wave} (started at ${START_WAVE}), cleared ${wavesCleared} wave${wavesCleared === 1 ? "" : "s"}` +
+      (forcedTotal > 0 ? ` | force-attack engaged ${forcedTotal}x this run` : ""),
   );
   out(`${tick} ticks (~${inGame} in-game) | wall time ${wall} | seed ${SEED}`);
   out("");

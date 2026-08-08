@@ -11,9 +11,9 @@ import { isAttackable } from "./AttackPlanner";
 import { bestMove, ScoredTile, scoreCandidates } from "./TileScorer";
 import { hasDyingBlob } from "./Trajectory";
 import { ArenaSnapshot } from "./ArenaSnapshot";
-import { chooseByPriority } from "./KillPriority";
+import { chooseByPriority, killPriority } from "./KillPriority";
 import { observeNibblers } from "./PillarDefence";
-import { chooseTarget } from "./TargetPlanner";
+import { attackOptionFor, chooseTarget } from "./TargetPlanner";
 import { visibleMobs } from "./Visibility";
 
 /**
@@ -200,6 +200,48 @@ export class InfernoAutomation {
    */
   private static arrivalSettled = false;
 
+  /**
+   * Live-wave ticks in a row without a shot fired - the standoff detector for the
+   * force-attack backstop. Reset by firing (attackDelay above zero) or an empty board.
+   */
+  private static idleTicks = 0;
+
+  /** The mob being force-chased, or null when the backstop is not engaged. */
+  private static forceTarget: Mob | null = null;
+  private static forceTicks = 0;
+
+  /**
+   * Every time the backstop has engaged this run - the instrumentation that keeps a forced
+   * attack a measurement instead of a mask. The harness prints the per-wave delta, so a wave
+   * that only cleared because the bot was shoved reads as exactly that in every sweep.
+   */
+  private static forcedAttacks = 0;
+
+  static getForcedAttackCount(): number {
+    return InfernoAutomation.forcedAttacks;
+  }
+
+  /** Idle ticks before the backstop engages - "a simple 50 tick idle", as specified. */
+  private static readonly FORCE_ATTACK_IDLE_TICKS = 50;
+
+  /** Ticks a single forced chase may run before standing down and re-evaluating. */
+  private static readonly FORCE_ATTACK_CHASE_TICKS = 100;
+
+  /** The three things a blob becomes. Shared by the stack tests below. */
+  private static readonly BLOBLET_NAMES: string[] = [
+    EntityNames.JAL_AK_REK_KET,
+    EntityNames.JAL_AK_REK_MEJ,
+    EntityNames.JAL_AK_REK_XIL,
+  ];
+
+  /**
+   * Ticks the landing-stack ice barrage has been held waiting for its cast. Kept tight -
+   * STACK_HOLD_TICKS and no more - because unlike the nibbler hold, this one runs mid-wave
+   * with other mobs shooting: a barrage attempt must never become a standoff of its own.
+   */
+  private static stackHoldTicks = 0;
+  private static readonly STACK_HOLD_TICKS = 6;
+
 
   /**
    * The nibbler spawn tile the cursor is parked on for this wave, or null before one is picked.
@@ -220,6 +262,10 @@ export class InfernoAutomation {
     InfernoAutomation.chosenPath = undefined;
     InfernoAutomation.chosenIsSafeSpot = false;
     InfernoAutomation.arrivalSettled = false;
+    InfernoAutomation.idleTicks = 0;
+    InfernoAutomation.forceTarget = null;
+    InfernoAutomation.forceTicks = 0;
+    InfernoAutomation.stackHoldTicks = 0;
     InfernoAutomation.scoredTiles = [];
     InfernoAutomation.hoverTile = null;
     InfernoAutomation.log = [];
@@ -399,6 +445,56 @@ export class InfernoAutomation {
       }
     }
     return best;
+  }
+
+  private static isBloblet(mob: Mob): boolean {
+    return InfernoAutomation.BLOBLET_NAMES.includes(mob.mobName());
+  }
+
+  /**
+   * Live bloblets a 3x3 blast centred on this mob would catch, the mob itself included.
+   * Two or more is a "stack" - the threshold every stack decision below shares.
+   */
+  private static blobletsCovered(region: Region, centre: Mob): number {
+    return visibleMobs(region).filter(
+      (mob) =>
+        mob.dying <= -1 &&
+        InfernoAutomation.isBloblet(mob) &&
+        Math.max(
+          Math.abs(mob.location.x - centre.location.x),
+          Math.abs(mob.location.y - centre.location.y),
+        ) <= 1,
+    ).length;
+  }
+
+  /**
+   * The bloblet whose 3x3 catches the most bloblets - the landing stack's centre in the case
+   * that matters, since the three spawn on a diagonal the middle one covers entirely. Nearest
+   * breaks ties, same as the nibbler version. Null when no bloblet is alive.
+   */
+  private static bestBarrageBloblet(
+    region: Region,
+    player: Player,
+  ): { mob: Mob; covered: number } | null {
+    const bloblets = visibleMobs(region).filter(
+      (mob) => mob.dying <= -1 && InfernoAutomation.isBloblet(mob),
+    );
+    let best: Mob | null = null;
+    let bestCovered = 0;
+    let bestDistance = Infinity;
+    for (const centre of bloblets) {
+      const covered = InfernoAutomation.blobletsCovered(region, centre);
+      const distance = Math.max(
+        Math.abs(centre.location.x - player.location.x),
+        Math.abs(centre.location.y - player.location.y),
+      );
+      if (covered > bestCovered || (covered === bestCovered && distance < bestDistance)) {
+        best = centre;
+        bestCovered = covered;
+        bestDistance = distance;
+      }
+    }
+    return best ? { mob: best, covered: bestCovered } : null;
   }
 
   /**
@@ -622,13 +718,29 @@ ${spellLine}`);
   /**
    * The tile the bot should be standing on right now.
    *
-   * Between waves it returns to the safe spot. While a wave is live the tile scorer decides.
-   * Null means scoring had nothing to say - it was skipped, or it threw - and the answer is
-   * then "where the player already is", which is a decision to hold rather than an absence of
-   * one, and keeps the movement layer from walking somewhere nothing chose.
+   * Between waves it returns to the home tile for the wave being ENTERED - `region.wave` still
+   * holds the cleared wave during the downtime, since `spawnNextWave` increments at spawn.
+   * Jad is waited for at 18,25 and the triple Jads at 25,27, matching where those spawns place
+   * the player; going into Zuk there is no home at all, so the bot holds wherever it stands.
+   * While a wave is live the tile scorer decides.
+   *
+   * Null chosenTile means scoring had nothing to say - it was skipped, or it threw - and the
+   * answer is then "where the player already is", which is a decision to hold rather than an
+   * absence of one, and keeps the movement layer from walking somewhere nothing chose.
    */
   private static stationTile(region: Region, player: Player): Location {
     if (InfernoAutomation.isBetweenWaves(region)) {
+      const entering =
+        ((region as unknown as { wave?: number }).wave ?? 0) + 1;
+      if (entering === 67) {
+        return { x: 18, y: 25 };
+      }
+      if (entering === 68) {
+        return { x: 25, y: 27 };
+      }
+      if (entering >= 69) {
+        return { x: player.location.x, y: player.location.y };
+      }
       return HOME_TILE;
     }
     return InfernoAutomation.chosenTile ?? player.location;
@@ -894,6 +1006,32 @@ ${spellLine}`);
         InfernoAutomation.reportThreats(region, player);
         return; // hold until Player.attack() consumes the selection
       }
+
+      // Bloblet landing stack - strictly after nibblers, whose pillar damage is permanent.
+      // One ice barrage into the fresh trio: the three land on a diagonal whose middle the
+      // blast covers entirely, at 15 hitpoints each, and whatever survives is frozen IN the
+      // stack for the blood autocast below. The hold is capped at STACK_HOLD_TICKS, unlike
+      // the nibbler hold above: this one runs mid-wave under fire, and if the cast has not
+      // happened by then the stack has broken - stop waiting, and the next walk clears the
+      // selection on its own.
+      const stack = InfernoAutomation.bestBarrageBloblet(region, player);
+      if (stack && stack.covered >= 2) {
+        InfernoAutomation.stackHoldTicks++;
+        if (InfernoAutomation.stackHoldTicks <= InfernoAutomation.STACK_HOLD_TICKS) {
+          if (player.aggro !== stack.mob) {
+            player.setAggro(stack.mob);
+            InfernoAutomation.clickLog.push({
+              tile: { x: stack.mob.location.x, y: stack.mob.location.y },
+            });
+          }
+          InfernoAutomation.target = stack.mob;
+          InfernoAutomation.attackState = `stack barrage x${stack.covered}`;
+          InfernoAutomation.reportThreats(region, player);
+          return;
+        }
+      }
+    } else {
+      InfernoAutomation.stackHoldTicks = 0;
     }
 
     // Between waves: get into the mage set, load the barrage, and park the cursor on the tile
@@ -909,6 +1047,124 @@ ${spellLine}`);
         InfernoAutomation.preloadIceBarrage(player);
       }
       InfernoAutomation.hoverNibblerSpawn();
+    }
+
+    // The force-attack backstop - the last resort for a standoff neither the scorer nor the
+    // reach fallback resolves, and INSTRUMENTED so it can never quietly hide one: every
+    // engagement is counted, named in the tick log, and surfaced per wave by the harness.
+    //
+    // The idle clock counts consecutive live-wave ticks without a shot fired. At
+    // FORCE_ATTACK_IDLE_TICKS the bot does what a stuck player eventually does: clicks the
+    // highest-priority mob on the board REGARDLESS of reach and lets the engine chase.
+    // `Player.determineDestination()` paths towards aggro whenever line of sight is missing -
+    // the exact behaviour `applyAttackPlan` exists to suppress becomes the tool, on purpose,
+    // because closing distance until the shot exists is the one move that always ends a
+    // mutual stalemate. While forcing, the tile scorer's movement is skipped (a moveTo would
+    // cancel the chase); prayer has already run, and scoring still fills the debug grid.
+    const mobsAlive = visibleMobs(region).some((mob) => mob.dying === -1);
+    if (!mobsAlive) {
+      InfernoAutomation.idleTicks = 0;
+      InfernoAutomation.forceTarget = null;
+      InfernoAutomation.forceTicks = 0;
+    } else if ((player.attackDelay ?? 0) > 0) {
+      // A shot within the weapon's cooldown window - the fight is live, nothing is stuck.
+      InfernoAutomation.idleTicks = 0;
+      InfernoAutomation.forceTarget = null;
+      InfernoAutomation.forceTicks = 0;
+    } else {
+      InfernoAutomation.idleTicks++;
+    }
+
+    if (InfernoAutomation.forceTarget) {
+      const target = InfernoAutomation.forceTarget;
+      InfernoAutomation.forceTicks++;
+      if (
+        target.dying > -1 ||
+        !visibleMobs(region).includes(target) ||
+        InfernoAutomation.forceTicks > InfernoAutomation.FORCE_ATTACK_CHASE_TICKS
+      ) {
+        // Dead, gone, or the chase itself has gone on implausibly long - stand down and let
+        // the ordinary layers try again; the idle clock will re-trigger if nothing changes.
+        InfernoAutomation.forceTarget = null;
+        InfernoAutomation.forceTicks = 0;
+        InfernoAutomation.idleTicks = 0;
+      } else {
+        const set = requiredSetFor(target);
+        if (!isWearing(player, set)) {
+          InfernoAutomation.equipAndShow(player, set);
+        }
+        if (player.aggro !== target) {
+          player.setAggro(target);
+          InfernoAutomation.clickLog.push({
+            tile: { x: target.location.x, y: target.location.y },
+          });
+        }
+        InfernoAutomation.target = target;
+        InfernoAutomation.attackState = `FORCED: chasing ${target.mobName()}`;
+        InfernoAutomation.reportThreats(region, player);
+        return;
+      }
+    } else if (
+      mobsAlive &&
+      InfernoAutomation.idleTicks >= InfernoAutomation.FORCE_ATTACK_IDLE_TICKS
+    ) {
+      let pick: Mob | null = null;
+      for (const mob of visibleMobs(region)) {
+        if (mob.dying > -1) {
+          continue;
+        }
+        if (!pick || killPriority(mob) > killPriority(pick)) {
+          pick = mob;
+        }
+      }
+      if (pick) {
+        InfernoAutomation.forceTarget = pick;
+        InfernoAutomation.forceTicks = 0;
+        InfernoAutomation.forcedAttacks++;
+      }
+    }
+
+    // GHOST-STACK PREP. Between a blob starting to die and its bloblets landing there are
+    // four ticks - exactly a gear switch plus a spell select. If the pending bloblets
+    // (priority 7) outrank everything alive and reachable, the window is spent getting the
+    // ice barrage ready instead of committing to a lesser target: previously the bot spent
+    // it attacking the OTHER blob, arriving at the landing tick in the wrong gear and
+    // pushing a second trio towards spawning on top of the first (measured, wave 7).
+    //
+    // Prayer has already run - it sits above everything and never waits on this. The hold is
+    // bounded by the window itself: a dying blob exists for at most four ticks, so this can
+    // never become a standoff. Movement pauses only once there is a selection to protect
+    // (moveTo nulls manualSpellCastSelection), and aggro is cleared so the Kodai does not
+    // autocast at whatever the previous target was while we wait.
+    if (hasDyingBlob(region)) {
+      const bestLive = chooseByPriority(region, player, InfernoAutomation.target);
+      const blobletPriority = killPriority({
+        mobName: () => EntityNames.JAL_AK_REK_XIL,
+      } as unknown as Mob);
+      if (!bestLive || killPriority(bestLive) < blobletPriority) {
+        if (player.aggro) {
+          player.setAggro(null);
+          player.destinationLocation = player.location;
+        }
+        InfernoAutomation.target = null;
+        if (!isWearing(player, "mage")) {
+          InfernoAutomation.attackState = "stack prep: mage";
+          InfernoAutomation.equipAndShow(player, "mage");
+          InfernoAutomation.reportThreats(region, player);
+          return;
+        }
+        if (!hasIceBarrageSelected(player)) {
+          if (!InfernoAutomation.isMoving(player)) {
+            InfernoAutomation.preloadIceBarrage(player);
+          }
+          InfernoAutomation.attackState = "stack prep: barrage";
+          InfernoAutomation.reportThreats(region, player);
+          return;
+        }
+        InfernoAutomation.attackState = "stack prep: ready";
+        InfernoAutomation.reportThreats(region, player);
+        return;
+      }
     }
 
     // Movement and attacking are NOT independent, and the engine enforces it both ways:
@@ -934,7 +1190,28 @@ ${spellLine}`);
       if (!intended) {
         InfernoAutomation.attackState = "no target";
       } else {
-        const set = requiredSetFor(intended);
+        // Surviving bloblet stacks are blood-barraged: the mage set's Kodai autocasts Blood
+        // Barrage, so a stacked target is purely a GEAR choice - no manual cast, no hold,
+        // nothing blocked - and the 3x3 both damages and heals off every stacked bloblet.
+        // Singles fall through to the blowpipe as always.
+        const stacked =
+          InfernoAutomation.isBloblet(intended) &&
+          InfernoAutomation.blobletsCovered(region, intended) >= 2;
+        // HEAL MODE: when only the last two monsters of the wave are left and hitpoints are
+        // not full, blood barrage until they are. Same mechanism as the stack - the Kodai
+        // autocasts blood, so sustain is purely a gear choice. Kill speed on the tail of a
+        // wave is worth less than walking into the next one at full health.
+        const healing =
+          (player.currentStats?.hitpoint ?? 0) < (player.stats?.hitpoint ?? 0) &&
+          visibleMobs(region).filter((mob) => mob.dying === -1).length <= 2;
+        // Otherwise: the SAME decision canReach made - preferred set, or the long-bow
+        // fallback that made this mob a candidate at all. Reading requiredSetFor here instead
+        // re-opened the switch-then-drop deadlock the moment the fallback picked a target the
+        // preferred set cannot reach.
+        const set =
+          stacked || healing
+            ? "mage"
+            : attackOptionFor(region, player, intended)?.set ?? requiredSetFor(intended);
         if (!isWearing(player, set)) {
           InfernoAutomation.attackState = `switching to ${set} for ${intended.mobName()}`;
           InfernoAutomation.equipAndShow(player, set);
@@ -946,7 +1223,7 @@ ${spellLine}`);
           InfernoAutomation.reportThreats(region, player);
           return;
         }
-        InfernoAutomation.attackState = `attacking ${intended.mobName()}`;
+        InfernoAutomation.attackState = `${healing ? "blood-heal " : ""}attacking ${intended.mobName()}`;
       }
 
       InfernoAutomation.target = applyAttackPlan(

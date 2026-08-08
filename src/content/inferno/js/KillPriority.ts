@@ -2,8 +2,7 @@
 
 import { EntityNames, Mob, Player, Region } from "osrs-sdk";
 
-import { isAttackable } from "./AttackPlanner";
-import { attackReachFor } from "./TargetPlanner";
+import { attackOptionFor } from "./TargetPlanner";
 import { visibleMobs } from "./Visibility";
 
 /**
@@ -61,19 +60,16 @@ function distanceTo(player: Player, mob: Mob): number {
 }
 
 /**
- * Can we hit this mob from where we stand, with the weapon we would actually use on it?
+ * Can we hit this mob from where we stand, with some set we are permitted to use on it?
  *
- * Reach comes from the mob's OWN gear set rather than from whatever is in hand, so the answer
- * does not change when the gear does. Judging by the current weapon deadlocks - holding a
- * blowpipe nothing past 5 tiles is a candidate, so nothing is ever intended, so the gear layer is
- * never told to switch to the bow that would have reached it.
- *
- * It also has to agree with `applyAttackPlan`, which re-tests before setting aggro. When those
- * two used different ranges the bot picked a target, spent a tick switching gear for it, then
- * dropped it as unreachable - forever.
+ * Delegated wholesale to `attackOptionFor` - the mob's own set first, the long bow as a
+ * fallback when it cannot reach (never for pures) - so candidacy, the gear switch and the
+ * attack click all read the one answer. When those layers used different ranges the bot
+ * picked a target, spent a tick switching gear for it, then dropped it as unreachable -
+ * forever.
  */
 export function canReach(region: Region, player: Player, mob: Mob): boolean {
-  return isAttackable(region, player, mob, attackReachFor(player, mob));
+  return attackOptionFor(region, player, mob) !== null;
 }
 
 /**

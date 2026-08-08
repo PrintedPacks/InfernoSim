@@ -1,11 +1,11 @@
 "use strict";
 
-import { AttackStyle, EntityNames, ItemName, Location, Mob, Player, Region } from "osrs-sdk";
+import { AttackStyle, EntityNames, ItemName, Location, Mob, Player, Region, Settings } from "osrs-sdk";
 
 import { ArenaSnapshot } from "./ArenaSnapshot";
 import { isAttackable } from "./AttackPlanner";
 import { planOverheads } from "./OverheadPlanner";
-import { requiredSetFor, weaponForSet } from "./GearSets";
+import { GearSetName, requiredSetFor, weaponForSet } from "./GearSets";
 import { expectedPillarDamage, NibblerThreat, nibblerThreats } from "./PillarDefence";
 import { HORIZON_TICKS, SimMob, simulateTrajectory, snapshotMobs } from "./Trajectory";
 import { visibleMobs } from "./Visibility";
@@ -377,6 +377,48 @@ export function attackReachFor(player: Player, mob: Mob): number {
  */
 export function attackReachForName(player: Player, mobName: string): number {
   return attackReachFor(player, { mobName: () => mobName } as unknown as Mob);
+}
+
+/**
+ * The gear to attack this mob with FROM WHERE THE PLAYER STANDS, or null when nothing
+ * permitted reaches it.
+ *
+ * Normally the mob's own required set. The fallback: when that set's weapon cannot reach - a
+ * bloblet at 8 tiles wants the blowpipe's 5 - a longer bow that CAN reach is better than
+ * standing there doing nothing, which is what the bot measurably did (the recurring
+ * "no target" standoffs, blowpipe mobs parked just outside blowpipe range).
+ *
+ * The set and its range are decided TOGETHER and callers must use both halves. History:
+ * candidacy judged at one range while `applyAttackPlan` re-tested at another was a hard
+ * stall - target picked at 10, a tick spent switching, dropped at 5, forever. Everything
+ * downstream of this function (canReach, the gear switch in decide()) reads the same answer,
+ * so that split cannot reopen.
+ *
+ * PURES NEVER FALL BACK, by design: on the pure loadout the answer is the required set or
+ * nothing. The fallback also only ever reaches for the "tbow" set's weapon as the loadout
+ * actually carries it (`weaponForSet`), so a loadout without a big bow simply has no fallback
+ * rather than a pretend one.
+ */
+export function attackOptionFor(
+  region: Region,
+  player: Player,
+  mob: Mob,
+): { set: GearSetName; range: number } | null {
+  const preferredRange = attackReachFor(player, mob);
+  if (isAttackable(region, player, mob, preferredRange)) {
+    return { set: requiredSetFor(mob), range: preferredRange };
+  }
+
+  if (Settings.loadout === "pure") {
+    return null;
+  }
+
+  const bow = weaponForSet(player, "tbow") as { attackRange?: number } | null;
+  const bowRange = bow?.attackRange ?? 0;
+  if (bowRange > preferredRange && isAttackable(region, player, mob, bowRange)) {
+    return { set: "tbow", range: bowRange };
+  }
+  return null;
 }
 
 export interface ScoredTarget {
