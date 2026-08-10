@@ -126,20 +126,21 @@ export function chooseJadWaveTarget(region: Region, player: Player): Mob | null 
 }
 
 /**
- * Highest priority band we can actually reach, nearest first within the band.
+ * Highest-ranked reachable mob under whatever priority function is handed in, nearest breaking
+ * ties, sticky on the incumbent - the shared shape behind both `chooseByPriority` and
+ * `chooseZukWaveTarget`, so the two rankings can never drift apart in HOW they are applied,
+ * only in the numbers themselves.
  *
- * Sticky: the current target is kept whenever it is still reachable and still in the top band on
- * offer. Re-picking every tick would re-click and, worse, could ping-pong between two mobs of
- * equal priority as they move.
+ * Sticky: the current target is kept whenever it is still reachable and still top-ranked.
+ * Re-picking every tick would re-click and, worse, could ping-pong between two mobs of equal
+ * priority as they move.
  */
-export function chooseByPriority(
-  region: Region,
+function pickByPriority(
+  reachable: Mob[],
+  priorityOf: (mob: Mob) => number,
   player: Player,
   current: Mob | null,
 ): Mob | null {
-  const reachable = visibleMobs(region).filter(
-    (mob) => mob.dying <= -1 && canReach(region, player, mob),
-  );
   if (reachable.length === 0) {
     return null;
   }
@@ -149,7 +150,7 @@ export function chooseByPriority(
   let bestDistance = Infinity;
 
   for (const mob of reachable) {
-    const priority = killPriority(mob);
+    const priority = priorityOf(mob);
     const distance = distanceTo(player, mob);
     if (
       priority > bestPriority ||
@@ -163,8 +164,63 @@ export function chooseByPriority(
 
   // Hold the current target while nothing outranks it. Equal priority is not a reason to switch,
   // so a target already being attacked is not dropped for one that happens to be a tile nearer.
-  if (current && reachable.indexOf(current) >= 0 && killPriority(current) >= bestPriority) {
+  if (current && reachable.indexOf(current) >= 0 && priorityOf(current) >= bestPriority) {
     return current;
   }
   return best;
+}
+
+export function chooseByPriority(
+  region: Region,
+  player: Player,
+  current: Mob | null,
+): Mob | null {
+  const reachable = visibleMobs(region).filter(
+    (mob) => mob.dying <= -1 && canReach(region, player, mob),
+  );
+  return pickByPriority(reachable, killPriority, player, current);
+}
+
+/**
+ * Zuk-wave targeting: healers before the roaming ranger and mager before Jad before Zuk
+ * itself - the user's explicit order for wave 69, replacing the general table entirely rather
+ * than feeding into it, because the two waves rank the same mobs differently (Jad is 1 in
+ * `PRIORITY`, 4 here; Zuk is 1 there, 2 here; a healer is 2 there, 10 here) and one flat map
+ * cannot hold both answers for the same mob at once.
+ *
+ * Both healer types rank equally - Yt-HurKot spawns with the Zuk-phase Jad (`healers: 3` in
+ * its spawn options) exactly as on a normal Jad wave, and Jal-MejJak spawns from Zuk's own
+ * enrage phase. Neither gets the dedicated tag-and-turn `chooseJadWaveTarget` runs on a normal
+ * Jad wave - this is a flat ranking, not that mechanic re-applied here.
+ */
+const ZUK_WAVE_PRIORITY: Record<string, number> = {
+  [EntityNames.YT_HUR_KOT]: 10, // Jad's healers, if the Zuk-phase Jad is up
+  [EntityNames.JAL_MEJ_JAK]: 10, // Zuk's own healers, enrage phase
+  [EntityNames.JAL_XIL]: 8, // ranger
+  [EntityNames.JAL_ZEK]: 6, // mager
+  [EntityNames.JAL_TOK_JAD]: 4,
+  [EntityNames.TZ_KAL_ZUK]: 2,
+};
+
+function zukWavePriority(mob: Mob): number {
+  return ZUK_WAVE_PRIORITY[mob.mobName()] ?? 0;
+}
+
+/**
+ * `exclude` is the boss-sequence layer's escape hatch: mager while Zuk is still >= 600 hp, and
+ * Jad once it has been tagged, are BOTH still alive, reachable and would otherwise win this
+ * flat ranking outright (mager is priority 6, well above Zuk's 2) - the sequence deliberately
+ * wants Zuk instead in both cases, and excluding them here is what stops this fallback from
+ * quietly overriding that choice the moment it is consulted.
+ */
+export function chooseZukWaveTarget(
+  region: Region,
+  player: Player,
+  current: Mob | null,
+  exclude: ReadonlyArray<Mob> = [],
+): Mob | null {
+  const reachable = visibleMobs(region).filter(
+    (mob) => mob.dying <= -1 && !exclude.includes(mob) && canReach(region, player, mob),
+  );
+  return pickByPriority(reachable, zukWavePriority, player, current);
 }

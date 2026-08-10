@@ -23,6 +23,7 @@ Scored only over candidates that survive the filter: inside the arena, walkable,
 | `destinationUnderMob` | **Live** (gate, 2026-08) | A destination inside any mob's footprint earns **no `npcReachSoon`, no `losBonus` and no `safeSpot`** — judged at tick 0 against real positions. The engine refuses the shot in both directions there (`closestPointTo` returns your own tile, and `hasLineOfSight` from a tile to itself trips its `collisionMath` guard), so it is the one place neither side can act. Reach claimed it anyway because the test runs *inside* the sim, and `stepMob` shuffles the mob off you **before** the trace callback — so reach was banked on a shuffle whose direction is a coin flip. Safety claimed it because nothing fires and nothing watches while you are underneath. Measured on a size-4 meleer: its entire footprint scored 2–2.79 (reach 1, los 1, safe 0.78), the best tiles on the grid, from a position where the bot can neither hit nor be hit |
 | `ghostBloblets` | **Live** (sim input, not a term — 2026-08) | A dying blob is modelled as the three bloblets it is about to become (`Trajectory.ghostBloblets`), instead of as empty floor. Offsets, styles, ranges and cooldown are fixed in `JalAk.removedFromWorld` — melee on the blob's own tile, ranged at +(1,−1), magic at +(2,−2), all 18 max hit, speed 4, `attackDelay 4` — so this is deduction from a visible death, not reading `newMobs`. First attack scheduled at `dying + 1 + 4` ticks. **Derived fresh each tick** from `dying > -1`, so there is no state to reset and the prediction follows `dying` if the death animation resolves early. Verified timing: the corpse leaves `region.mobs` only *after* `postTick` and `newMobs` merge at the *start* of the next tick, so ghosts cover exactly 4 automation ticks with no gap. Ghosts count for `damageTaken`, `safeSpot` (exposure + settle), **`npcReachSoon` and the distance shading** — a player knows they are landing and positions to fight them — but are **never targetable**: the attack layer reads `visibleMobs` and cannot see them |
 | `homePull` | **Live** (2026-08, waves 67/68 only) | `−HOME_PULL_PER_TILE` (0.01) per Chebyshev tile from the wave's home tile (`waveHomeTile`: 67 → 18,25; 68 → 25,27; null elsewhere, so zero cost on other waves). The open-arena drift anchor: with no pillars, equal tiles everywhere means drift, and drift on a Jad wave ends at a wall with healers on both sides. Deliberately tie-breaker scale — the whole grid spans ~0.2, under a third of one safe-spot bonus, so it loses every argument with a real term. Same map the between-waves station reads, via the same function |
+| `healerAoePenalty` | **Live** (2026-08, wave 69 only) | `ZUK_HEALER_AOE_PENALTY` (`−0.5`) on any candidate within Chebyshev 1 of a live tagged-`Jal-MejJak` AOE landing tile. Read straight off `region.projectiles` (`healerAoeLandings`), not predicted — `Jal-MejJak` only fires its ground-targeted `AoeWeapon` once tagged, and that cast registers three location-targeted ghost projectiles as public state the instant it happens; two of the three targets are drawn from `Random.get()` at cast time, so there is nothing to predict *before* the cast, only real landing tiles to read *after* it. A soft nudge deliberately scaled far below `ZUK_SHIELD_UNCOVERED_PENALTY` (`−1000`) — it competes for which safe-ish tile to prefer, it never argues the bot out from under the shield to dodge a healer tick |
 | `standStillDecay` | **Live** (promoted from experiment 2026-08; toggle removed) | Score-only (never in `ScoreParts`): while the board is **settled** (no live mob moved since last tick — clocks pause, never reset, while mobs are still reacting) with mobs alive and the player **not firing**, the camped tile — and the previously camped tile; two slots so the A-B shuffle pays nothing, returning resumes the old clock — loses `TILE_DECAY_PER_STEP` (0.01) per `TILE_DECAY_INTERVAL_TICKS` (5). Incoming fire does not reset the clocks — that exception was exactly what the prayer camp exploited, and covering it is how this absorbed run-away pressure's job. One rule: only fighting back forgives a camp |
 | ~~`npcReach`~~ | Removed | Old version judged reach at route destination instead of 1 tick ahead — replaced by `npcReachSoon` |
 | ~~`runAwayPressure`~~ | Removed 2026-08 | Grid-wide tilt away from the mobs after 15 parked ticks without firing. Replaced by the revised `standStillDecay` clock above — one mechanism covering both the quiet standoff and the prayer camp |
@@ -40,6 +41,7 @@ Scored only over candidates that survive the filter: inside the arena, walkable,
 | `chooseByPriority` | `KillPriority.ts` | **Live** (waves 1–66) | Per-mob priority map; nearest within a priority; sticky |
 | `chooseJadWaveTarget` | `KillPriority.ts` | **Live** (any wave with a live Jad, 2026-08) | The player's tag-and-turn: nearest reachable **untagged** healer (`aggro !== player` = still healing; one blowpipe hit flips it) until none remain, then Jad — **never** the tagged healers, which the priority table would rank above Jad and grind one by one while fresh healers healed everything back. No table fallback while a Jad lives |
 | `chooseTarget` | `TargetPlanner.ts` | Built, not wired | Prices each mob by simulated damage-prevented + progress; not called from `InfernoAutomation` |
+| `decideZukTarget` | `InfernoAutomation.ts` | **Live** (wave 69, 2026-08) | Replaces `chooseZukWaveTarget`'s flat ranking while `TzKal-Zuk` is alive: tag the closest untagged mager/ranger (any live instance of either, not one fixed pair), commit fully to the nearest **tagged** ranger, defer every tagged mager (untouched after its one tag hit) until Zuk < 600 hp, tag Jad once, then fall back to the flat table with every mager (while Zuk ≥ 600) and every untagged shield-attacker excluded. Generalized 2026-08 from single `mager`/`ranger` references to arrays — a slow kill lets `TzKalZuk`'s spawn timer reset and drop a **second** mager+ranger pair mid-fight, which the singular-reference version couldn't see, so it fell through to the flat fallback and killed the second mager outright instead of deferring it. `collidesIfTaggedNow` (the flinch-mechanic phase-sync guard, same-attack-speed mobs tagged 4 ticks apart fire identically forever) checks a candidate against every currently-tagged shield-attacker, not just one designated partner. Verified via a forced-second-spawn harness run: the second mager took exactly one tag hit then sat at fixed hp while Zuk stayed ≥ 600, same as the first |
 
 ## Prayer
 
@@ -124,6 +126,10 @@ A "stack" is ≥2 live bloblets inside one 3×3 (`blobletsCovered`). The full fl
 flips to mage and the Kodai blood-autocasts the priority target until hp is full (`blood-heal
 attacking …` in the tick log; measured hp 73→90 in one cast). Same non-blocking mechanism as
 the stack blood — kill speed on a wave's tail is worth less than entering the next wave full.
+**Disabled on waves 67/68/69** — Jad's own healers trip "≤2 alive" for the wrong reason, the
+shield-plus-Zuk pair does the same on 69 for most of the fight, and both waves already have
+dedicated positioning logic (tag-and-turn, shield tracking) a mage-set switch would only
+compete with. Kill speed against a boss outweighs topping up.
 
 Nibblers keep absolute precedence: the nibbler barrage branch runs first, and prep never fires
 while a reachable nibbler outranks the pending bloblets.
@@ -175,6 +181,14 @@ More Bugs: -
 Nibbler tile choice
 Pure Mage's book
 Closet to player tile vs first scored tile
+
+ZUK:
+
+Only tag when the hit will land off tick from other
+Only attack when on attack cooldown
+Blowpipe Ranger when in distance
+Timer
+Keep mage alive till under 600
 
 
 

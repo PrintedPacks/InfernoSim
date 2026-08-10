@@ -28,7 +28,8 @@ import { visibleMobs } from "./Visibility";
  *
  * The terms, in hitpoints over a twelve tick horizon except where noted:
  *
- *     score = barrageReach + healerReach + npcReachSoon + losBonus + safeSpot + homePull - damageTaken
+ *     score = barrageReach + healerReach + npcReachSoon + losBonus + safeSpot + homePull
+ *             + healerAoePenalty - damageTaken
  *
  * `healerReach` is 1 if the nearest still-healing Jad healer can be tagged from this tile -
  * the Jad-wave analogue of `barrageReach`, pulling the bot around Jad to where a blowpipe
@@ -290,6 +291,173 @@ function focusHealer(region: Region, player: Player): ReachTarget | null {
     size: best.size,
     reach: attackReachForName(player, EntityNames.YT_HUR_KOT),
   };
+}
+
+/**
+ * Zuk's shield, and why standing behind it is not optional.
+ *
+ * TzKalZuk.attack() is unambiguous: it fires at the SHIELD - zero damage - only while the
+ * target's x falls inside the shield's 5-tile footprint (`shield.x` to `shield.x + 4`) AND
+ * y <= 16. Step outside either bound and the next shot targets the player directly for
+ * `magicMaxHit()` (251) - not a graze, a near-certain kill. There is no partial credit and no
+ * randomness left to model: the shield's only roll is its initial east/west choice, already
+ * resolved by the time it exists on the board.
+ *
+ * The shield is invisible to `damageTaken` today - `attackRange` is 0, so the general
+ * threat-generation loop's line-of-sight-and-range test never fires for it - so without this,
+ * the tile scorer has no idea the 251 exists at all, on any tile.
+ */
+const ZUK_SHIELD_MIN_X = 11;
+const ZUK_SHIELD_MAX_X = 35;
+const ZUK_SHIELD_WIDTH = 5;
+const ZUK_SHIELD_BOUNCE_FREEZE = 5;
+const ZUK_SHIELD_COVER_MAX_Y = 16;
+
+interface ShieldState {
+  x: number;
+  direction: boolean;
+  frozen: number;
+}
+
+function findShield(region: Region): ShieldState | null {
+  const shield = visibleMobs(region).find(
+    (mob) => mob.dying <= -1 && mob.mobName() === EntityNames.INFERNO_SHIELD,
+  );
+  if (!shield) {
+    return null;
+  }
+  const live = shield as unknown as { movementDirection?: boolean; frozen?: number };
+  return {
+    x: shield.location.x,
+    direction: live.movementDirection ?? true,
+    frozen: Math.max(0, live.frozen ?? 0),
+  };
+}
+
+/**
+ * Where the shield's x will be `ticks` from now - a straight replay of `ZukShield.movementStep`,
+ * in the same order the engine runs it: movementStep decides whether to move (and freezes +
+ * flips on a bounce) BEFORE attackStep's unconditional `this.frozen--` runs later that same
+ * tick, so the check has to happen against the pre-decrement value and the decrement has to
+ * happen after - reversing that order shifts every bounce by a tick.
+ */
+function projectShieldX(shield: ShieldState, ticks: number): number {
+  let x = shield.x;
+  let direction = shield.direction;
+  let frozen = shield.frozen;
+  for (let i = 0; i < ticks; i++) {
+    if (frozen <= 0) {
+      x += direction ? 1 : -1;
+      if (x < ZUK_SHIELD_MIN_X || x > ZUK_SHIELD_MAX_X) {
+        frozen = ZUK_SHIELD_BOUNCE_FREEZE;
+        direction = !direction;
+      }
+    }
+    frozen--;
+  }
+  return x;
+}
+
+/** TzKalZuk.attack()'s own coverage test, unchanged. */
+function isCoveredByShield(px: number, py: number, shieldX: number): boolean {
+  return px >= shieldX && px < shieldX + ZUK_SHIELD_WIDTH && py <= ZUK_SHIELD_COVER_MAX_Y;
+}
+
+/**
+ * Whether this route ends somewhere the shield will not be covering - a SCORE PENALTY, not a
+ * candidate filter, and the difference is the whole fix.
+ *
+ * The first version of this dropped a failing tile from the candidate list outright, exactly
+ * like the melee-zone veto, WITH the same "route length 1 is always exempt" escape hatch. That
+ * was wrong for this specific case, and it is what actually killed the bot: the shield is a
+ * MOVING target, so standing still is never durably safe the way it is near a static melee
+ * zone - a tile covered when it was chosen can be abandoned by the shield a few ticks later
+ * with the player never having moved. Exempting hold-position from the check meant nothing
+ * was ever telling the bot "the shield left you behind, walk back" - it just sat there,
+ * uncovered, until Zuk's next attack landed. Measured: parked at 11,14 while the shield's
+ * frozen bounce ended and it resumed east, uncovering that tile by roughly five more ticks of
+ * drift, dead at the next attack.
+ *
+ * The fix is not "stop exempting hold position" on its own - `bestMove` requires the player's
+ * own tile to appear in `scored` or it returns null and the ENTIRE 441-tile search is skipped,
+ * so simply excluding a failing hold-position candidate would make the bot give up looking for
+ * a way back rather than find one. So every route, hold included, is scored normally and this
+ * failure is priced as ZUK_SHIELD_UNCOVERED_PENALTY instead of removed - large enough that a
+ * covered alternative always wins the comparison outright, small enough (unlike an exclusion)
+ * that the comparison still happens at all. Holding an uncovered tile now loses to walking back
+ * into cover on points, the same way every other veto-scale risk in this file is priced.
+ *
+ * Judged at the ARRIVAL tick (route length in TILES converted to ticks at
+ * PLAYER_TILES_PER_TICK - zero for a length-1 hold route, i.e. checked from right now), not
+ * tick 0 relative to the CURRENT position for a longer walk: a three-tick walk has to be
+ * checked against where the shield will have slid to in three ticks, not where it is right
+ * now - that mismatch is the "not looking far enough ahead" gap this was built to close.
+ *
+ * ARRIVAL ALONE IS STILL NOT ENOUGH: a tile covered for the single tick it is judged is one
+ * tile from the TRAILING edge of the band, or dead centre with the shield about to slide past
+ * - it falls back out of cover the moment the shield takes its next step. So this demands the
+ * destination stay covered through ZUK_SHIELD_COVER_BUFFER_TICKS ticks past arrival too,
+ * assuming the player then holds - which is the real scenario, since holding is exactly what
+ * happens whenever nothing scores better. Only a tile nearer the LEADING edge of the band, the
+ * side the shield is currently sliding towards, survives the whole window - "stay ahead of the
+ * shield, not merely inline with it" falls out of that as a consequence, not a rule written
+ * separately. No directional logic needed: `projectShieldX` already knows which way it is
+ * moving, and a trailing-edge tile simply cannot survive the extra ticks.
+ */
+const ZUK_SHIELD_COVER_BUFFER_TICKS = 3;
+export const ZUK_SHIELD_UNCOVERED_PENALTY = -1000;
+
+function routeLeavesShieldCover(shield: ShieldState | null, route: Location[]): boolean {
+  if (!shield) {
+    return false;
+  }
+  const arrivalTicks = Math.ceil((route.length - 1) / PLAYER_TILES_PER_TICK);
+  const destination = route[route.length - 1];
+  for (let extra = 0; extra <= ZUK_SHIELD_COVER_BUFFER_TICKS; extra++) {
+    const shieldXAtTick = projectShieldX(shield, arrivalTicks + extra);
+    if (!isCoveredByShield(destination.x, destination.y, shieldXAtTick)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Where a tagged Zuk healer's AOE is about to land - a soft steer, not a veto, so it never
+ * outweighs `shieldPenalty` and never pulls the bot out from under the shield to dodge it.
+ *
+ * `Jal-MejJak` only fires `AoeWeapon` once tagged (`attackStyleForNewAttack`: "aoe" iff
+ * `aggro.type === UnitTypes.PLAYER`), and that attack registers three GROUND-TARGETED ghost
+ * projectiles straight onto `region.projectiles` (`AoeWeapon.attack`, via
+ * `region.addProjectile` with a fixed `{x,y,z}` `to`, not a unit) at the moment it casts - one
+ * pinned to wherever the player was standing right then, two random within its box. Two of the
+ * three are genuinely unpredictable before the cast (`Random.get()`), so this does not predict
+ * a healer's next cast - it reads the exact landing tiles straight off public state the instant
+ * they exist, the same way a player reacts to seeing the spark. They stay in `region.projectiles`
+ * for `totalDelay` (4) ticks after casting (`Projectile.shouldDestroy`), comfortably covering
+ * the actual hit check at cast+3 (`InfernoHealerSpark`'s own `DelayedAction` + one more tick).
+ */
+const ZUK_HEALER_AOE_PENALTY = -0.5;
+/** Chebyshev radius matching `InfernoHealerSpark`'s own hit check - a 3x3 box on the spark. */
+const ZUK_HEALER_AOE_RADIUS = 1;
+
+function healerAoeLandings(region: Region): Location[] {
+  const landings: Location[] = [];
+  for (const projectile of region.projectiles) {
+    if (projectile.from?.mobName?.() !== EntityNames.JAL_MEJ_JAK) {
+      continue;
+    }
+    const to = projectile.to as unknown as { x?: number; y?: number };
+    if (to.x === undefined || to.y === undefined) {
+      continue; // the healer's non-AOE heal-Zuk cast, or anything else keyed to a unit
+    }
+    landings.push({ x: to.x, y: to.y });
+  }
+  return landings;
+}
+
+function nearHealerAoeLanding(landings: Location[], destination: Location): boolean {
+  return landings.some((landing) => chebyshevDistance(destination, landing) <= ZUK_HEALER_AOE_RADIUS);
 }
 
 function reachTargets(player: Player, mobs: Mob[]): ReachTarget[] {
@@ -785,6 +953,10 @@ export interface ScoreParts {
   safeSpot: number;
   /** Zero, or negative HOME_PULL_PER_TILE per tile from the wave's home tile (67/68 only). */
   homePull: number;
+  /** ZUK_SHIELD_UNCOVERED_PENALTY if this route ends uncovered; 0 on every wave but 69. */
+  shieldPenalty: number;
+  /** ZUK_HEALER_AOE_PENALTY if this destination is near a live tagged-healer AOE landing. */
+  healerAoePenalty: number;
   damageTaken: number;
   threats: number;
 }
@@ -801,6 +973,8 @@ function scoreRoute(
   focus: NibblerThreat | null,
   healer: ReachTarget | null,
   home: Location | null,
+  shield: ShieldState | null,
+  healerAoe: Location[],
   targets: ReachTarget[],
   reaches: Map<string, number>,
   route: Location[],
@@ -1023,6 +1197,14 @@ function scoreRoute(
     safeSpot,
     // Negative or zero: the drift anchor for the open-arena waves - see HOME_PULL_PER_TILE.
     homePull: home ? -HOME_PULL_PER_TILE * chebyshevDistance(destination, home) : 0,
+    // ZUK_SHIELD_UNCOVERED_PENALTY if this route - hold position included - will not be
+    // covered through the buffer window; 0 (and null shield) on every wave but 69. Priced,
+    // not filtered - see routeLeavesShieldCover for why holding must stay a real candidate.
+    shieldPenalty: routeLeavesShieldCover(shield, route) ? ZUK_SHIELD_UNCOVERED_PENALTY : 0,
+    // ZUK_HEALER_AOE_PENALTY if a live tagged-healer AOE is already going to land here or
+    // next to it - a nudge, not a veto, so it never outbids shieldPenalty and never pulls the
+    // bot out from under the shield to dodge it. 0 (and empty healerAoe) on every wave but 69.
+    healerAoePenalty: nearHealerAoeLanding(healerAoe, destination) ? ZUK_HEALER_AOE_PENALTY : 0,
     damageTaken,
     // priced.length, not threats.length - the dump's threat count should match what was
     // actually charged, or a healer-chase-eight-ticks-out would read as a threat that costs
@@ -1037,7 +1219,9 @@ function scoreRoute(
       parts.npcReachSoon +
       parts.losBonus +
       parts.safeSpot +
-      parts.homePull -
+      parts.homePull +
+      parts.shieldPenalty +
+      parts.healerAoePenalty -
       parts.damageTaken,
     parts,
   };
@@ -1093,6 +1277,11 @@ export function scoreCandidates(
   const healer = focusHealer(region, player);
   // The drift anchor for the open-arena waves; null everywhere else.
   const home = waveHomeTile((region as unknown as { wave?: number }).wave ?? 0);
+  // Null on every wave but 69, so this costs nothing elsewhere.
+  const shield = findShield(region);
+  // Empty on every wave but 69 - region.projectiles only ever holds these while a tagged
+  // Jal-MejJak's AoeWeapon has a live ghost projectile in flight.
+  const healerAoe = healerAoeLandings(region);
   // Frozen once and shared by all 441 simulations. Rebuilt each call rather than cached, because
   // mobs move and pillars die.
   // Jad included: the tile score is the one consumer that has to see it hitting, or the grid
@@ -1142,6 +1331,8 @@ export function scoreCandidates(
       focus,
       healer,
       home,
+      shield,
+      healerAoe,
       targets,
       reaches,
       route,

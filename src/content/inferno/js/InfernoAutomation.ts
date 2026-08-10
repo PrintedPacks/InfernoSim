@@ -5,13 +5,13 @@ import { Player, Region, Location, Mob, Chrome, ControlPanelController, EntityNa
 import { AutomationOverlay, ClickStep } from "./AutomationOverlay";
 import { applyPrayerPlan, incomingThreats } from "./PrayerPlanner";
 import { applyAttackPlan } from "./AttackPlanner";
-import { equipSet, GearSetName, isWearing, requiredSetFor } from "./GearSets";
+import { equipSet, GearSetName, isWearing, requiredSetFor, weaponForSet } from "./GearSets";
 import { hasIceBarrageSelected, selectedSpell, selectIceBarrage } from "./SpellCaster";
 import { isAttackable } from "./AttackPlanner";
 import { bestMove, ScoredTile, scoreCandidates, waveHomeTile } from "./TileScorer";
 import { hasDyingBlob } from "./Trajectory";
 import { ArenaSnapshot } from "./ArenaSnapshot";
-import { chooseByPriority, chooseJadWaveTarget, killPriority } from "./KillPriority";
+import { chooseByPriority, chooseJadWaveTarget, chooseZukWaveTarget, killPriority } from "./KillPriority";
 import { observeNibblers } from "./PillarDefence";
 import { attackOptionFor, chooseTarget } from "./TargetPlanner";
 import { visibleMobs } from "./Visibility";
@@ -211,6 +211,13 @@ export class InfernoAutomation {
   private static forceTicks = 0;
 
   /**
+   * The Zuk-wave mager/ranger tag pairing: the OTHER one, once exactly one of the pair has
+   * been tagged, forced ahead of normal priority until it too is tagged. See the comment at
+   * the call site in `decide()` for the flinch-delay mechanic this exists to avoid.
+   */
+  private static zukPairForceTarget: Mob | null = null;
+
+  /**
    * Every time the backstop has engaged this run - the instrumentation that keeps a forced
    * attack a measurement instead of a mask. The harness prints the per-wave delta, so a wave
    * that only cleared because the bot was shoved reads as exactly that in every sweep.
@@ -265,6 +272,7 @@ export class InfernoAutomation {
     InfernoAutomation.idleTicks = 0;
     InfernoAutomation.forceTarget = null;
     InfernoAutomation.forceTicks = 0;
+    InfernoAutomation.zukPairForceTarget = null;
     InfernoAutomation.stackHoldTicks = 0;
     InfernoAutomation.scoredTiles = [];
     InfernoAutomation.hoverTile = null;
@@ -495,6 +503,176 @@ export class InfernoAutomation {
       }
     }
     return best ? { mob: best, covered: bestCovered } : null;
+  }
+
+  /**
+   * The Zuk fight's target, as a boss-specific SEQUENCE rather than a flat ranking - `Jal-Xil`
+   * (8) and `Jal-Zek` (6) already outrank Zuk (2) in `ZUK_WAVE_PRIORITY`, but a flat table
+   * cannot express "attack Zuk instead of the mager you could otherwise reach", which is most
+   * of what this fight actually asks for. Every rule below reads off CURRENT observable state
+   * (Zuk's live hp, which mobs exist, whether each has been tagged) rather than remembered
+   * phase - so it self-corrects if automation is toggled off mid-fight instead of resuming
+   * from a stale memory of where the fight was.
+   *
+   * The sequence, and why each step is there:
+   *
+   *  1. MAGER/RANGER TAG PAIRING. Both spawn aggroed to the shield and switch to us the
+   *     instant we hit either one - the engine's own flinch rule then floors their
+   *     attackDelay at floor(attackSpeed/2)+1 (verified in the SDK: `Unit.
+   *     processIncomingAttacks`), which for their shared 4-tick attackSpeed is exactly 3. So
+   *     the TICK we land the tagging hit sets the phase of that mob's whole subsequent cycle
+   *     against us - tag both on the same tick (or any tick 4 apart) and their identical
+   *     4-tick cycles fire together FOREVER, magic and range on one tick neither overhead can
+   *     cover. Tag them a tick apart and that never happens, permanently, since two
+   *     same-period cycles that start offset stay offset by exactly that much every cycle
+   *     after. The FIRST tag goes to whichever is physically closer (fastest off the shield);
+   *     the instant that lands, the fix is not "wait before attacking the second one" -
+   *     ordinary stickiness would happily keep hammering whichever got tagged first, since it
+   *     is now the top-ranked reachable thing - it is the opposite: force an IMMEDIATE switch
+   *     to the other one. Only one attack lands per tick, so switching as fast as possible IS
+   *     a one-tick offset; there is no faster way to tag it, so this can never accidentally
+   *     land both on the same tick.
+   *  2. RANGER, fully committed, the instant tagging is settled: kill it before anything else
+   *     while it lives - already the emergent result of 8 > 6, stated explicitly here so nothing
+   *     else in this sequence can pull focus off it.
+   *  3. MAGER is deliberately left alive-but-tagged until Zuk's hp drops under 600 - the exact
+   *     threshold that permanently pauses `TzKalZuk`'s spawn timer in the real fight, so racing
+   *     Zuk down first is racing to shut off any FURTHER mager/ranger pairs, which matters far
+   *     more than finishing the one already on the board. Once Zuk is under 600, mager becomes
+   *     the priority again and gets killed.
+   *  4. JAD, once it spawns (Zuk < 480, also aggroed to the shield): tagged once, the same way
+   *     mager and ranger were, then never engaged again. `TzKalZuk.damageTaken()` kills every
+   *     other mob in the region the instant Zuk's hp hits zero, so a second hit on Jad is pure
+   *     wasted DPS - Zuk's own death clears it for free.
+   *  5. Otherwise, the flat table decides - which by this point in the fight is just Zuk
+   *     against the enrage-phase healers (priority 10, correctly above Zuk's 2 with nothing
+   *     to override it), with mager and Jad explicitly excluded so this fallback can never
+   *     re-select what step 3 or step 4 already decided to leave alone.
+   *
+   * MULTIPLE PAIRS. `TzKalZuk`'s spawn timer resets to 350 and fires again every time it
+   * expires, so a slow kill - one that takes longer than that to get Zuk under 600 - spawns a
+   * SECOND mager+ranger pair while the first mager is still alive, tagged and deliberately
+   * deferred. Tracking "the mager" and "the ranger" as single references was blind to this:
+   * the second mager was invisible to steps 1 and 3, never tagged, never excluded from step
+   * 5, and the flat fallback picked it up as an ordinary priority-6 target and killed it
+   * outright - measured. So every step below operates on the full, filtered LIST of each type
+   * currently alive, not a single `.find()`. Tag pairing (step 1) always processes the closest
+   * UNTAGGED instance of EITHER type, and the collision check compares it against every
+   * ALREADY-tagged instance of either type, not just one partner - a third simultaneous
+   * attacker is exactly as much a collision risk as a second one.
+   */
+  private static decideZukTarget(region: Region, player: Player, zuk: Mob): Mob | null {
+    const magers = visibleMobs(region).filter(
+      (mob) => mob.dying === -1 && mob.mobName() === EntityNames.JAL_ZEK,
+    );
+    const rangers = visibleMobs(region).filter(
+      (mob) => mob.dying === -1 && mob.mobName() === EntityNames.JAL_XIL,
+    );
+    const jad =
+      visibleMobs(region).find(
+        (mob) => mob.dying === -1 && mob.mobName() === EntityNames.JAL_TOK_JAD,
+      ) ?? null;
+
+    const isTagged = (mob: Mob) => mob.aggro === player;
+    const shieldAttackers = [...magers, ...rangers];
+    const dist = (mob: Mob) =>
+      Math.max(
+        Math.abs(mob.location.x - player.location.x),
+        Math.abs(mob.location.y - player.location.y),
+      );
+    const nearest = (mobs: Mob[]) =>
+      mobs.length === 0
+        ? null
+        : mobs.reduce((best, mob) => (dist(mob) < dist(best) ? mob : best));
+
+    /**
+     * Would attacking `candidate` RIGHT NOW sync its attack cycle with an ALREADY-tagged
+     * shield attacker's, forever?
+     *
+     * The engine's flinch rule sets `attackDelay = max(current, flinchDelay+1)` the instant a
+     * hit changes a mob's aggro (`Unit.processIncomingAttacks`), and flinchDelay =
+     * floor(attackSpeed/2) = 2 for mager and ranger alike, so the floor is 3. Two period-4
+     * cycles collide FOREVER exactly when the difference between their delays is a multiple
+     * of 4 - and a hit on an ALREADY-tagged mob does not re-trigger the floor, so a collision,
+     * once landed, cannot be corrected afterward. Checked against EVERY already-tagged
+     * attacker, not just one designated partner: with two pairs overlapping, a fresh tag can
+     * collide with either pair's already-established mob, not only its own pair-mate.
+     */
+    const collidesIfTaggedNow = (candidate: Mob): boolean => {
+      const candidateDelay = (candidate as unknown as { attackDelay?: number }).attackDelay ?? 0;
+      const wouldBeDelay = Math.max(candidateDelay, 3);
+      for (const other of shieldAttackers) {
+        if (other === candidate || !isTagged(other)) {
+          continue;
+        }
+        const establishedDelay = (other as unknown as { attackDelay?: number }).attackDelay ?? 0;
+        if ((((wouldBeDelay - establishedDelay) % 4) + 4) % 4 === 0) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    // --- 1. Tag pairing: the closest UNTAGGED shield attacker, across every mager/ranger
+    // currently alive, not just one fixed pair. ---
+    if (
+      InfernoAutomation.zukPairForceTarget &&
+      (InfernoAutomation.zukPairForceTarget.dying > -1 ||
+        isTagged(InfernoAutomation.zukPairForceTarget))
+    ) {
+      InfernoAutomation.zukPairForceTarget = null;
+    }
+    if (!InfernoAutomation.zukPairForceTarget) {
+      InfernoAutomation.zukPairForceTarget = nearest(shieldAttackers.filter((mob) => !isTagged(mob)));
+    }
+    const forced = InfernoAutomation.zukPairForceTarget;
+    if (forced) {
+      if (!collidesIfTaggedNow(forced) && attackOptionFor(region, player, forced) !== null) {
+        return forced;
+      }
+      // Either the collision guard held this tick, or it is not reachable yet - either way,
+      // fall through rather than idle: a safe attack on whatever else applies is better than
+      // nothing, and re-arming next tick re-evaluates with fresh delay values.
+    }
+
+    // --- 2. Rangers, fully committed once tagged - nearest tagged one. ---
+    const taggedRanger = nearest(rangers.filter(isTagged));
+    if (taggedRanger) {
+      return taggedRanger;
+    }
+
+    // --- 3. Magers, deferred until Zuk < 600 - nearest tagged one, once safe to commit. ---
+    const zukHp = zuk.currentStats?.hitpoint ?? 0;
+    if (zukHp < 600) {
+      const taggedMager = nearest(magers.filter(isTagged));
+      if (taggedMager) {
+        return taggedMager;
+      }
+    }
+
+    // --- 4. Jad, tag once (no pairing partner, no collision risk) ---
+    if (jad && jad.aggro !== player) {
+      return jad;
+    }
+
+    // --- 5. Fallback: flat priority. Every mager is excluded while Zuk is still >= 600
+    // (steps 3 owns them once it drops), every UNTAGGED shield attacker is excluded
+    // unconditionally (step 1 owns tagging - this fallback has no collision guard of its
+    // own, so it must never be handed one that is not yet safely tagged), and a tagged Jad
+    // is excluded (step 4 already spent its one hit). ---
+    const exclude: Mob[] = [];
+    if (zukHp >= 600) {
+      exclude.push(...magers);
+    }
+    for (const mob of shieldAttackers) {
+      if (!isTagged(mob)) {
+        exclude.push(mob);
+      }
+    }
+    if (jad) {
+      exclude.push(jad);
+    }
+    return chooseZukWaveTarget(region, player, InfernoAutomation.target, exclude);
   }
 
   /**
@@ -1169,7 +1347,40 @@ ${spellLine}`);
     // They are both left-clicks on the world and in OSRS the later one wins, so only one can
     // happen per tick. Movement takes precedence: repositioning decides which mobs can hit us
     // and on which ticks, and a delayed attack only costs a little damage output.
-    const repositioning = InfernoAutomation.stepMovement(player, region);
+    //
+    // ZUK ONLY, this is inverted. The fight is long, every tbow hit against 1200 hp matters,
+    // and the shield-coverage penalty already carries its own multi-tick buffer (see
+    // ZUK_SHIELD_COVER_BUFFER_TICKS) specifically so a reposition can wait a tick without
+    // losing cover. A "delayed attack" is not free the way it is everywhere else: on any tick
+    // the weapon is ALREADY on cooldown, a move costs nothing (no swing was happening this
+    // tick regardless), but on a tick the swing is actually ready, walking instead of firing
+    // throws a real hit away for a reposition that had slack to wait for it. So on wave 69, if
+    // Zuk is up, reachable RIGHT NOW and the weapon is off cooldown, take the swing and let
+    // the reposition happen next tick instead - it is not being skipped, only sequenced after
+    // the attack it would otherwise have pre-empted for nothing.
+    //
+    // Gated on ACTUALLY STILL COVERED, read straight off this tick's own score for the tile
+    // we are standing on - not inferred from "the scorer wants to move" (buffered repositions
+    // fire well before cover is lost, which is most of why chosenTile differs from here). The
+    // one case that must never take the swing is the tile already carrying
+    // ZUK_SHIELD_UNCOVERED_PENALTY: there, standing still to fire costs a 251 hit to save one
+    // tbow swing, and no amount of DPS is worth that trade.
+    const zuk = visibleMobs(region).find(
+      (mob) => mob.dying === -1 && mob.mobName() === EntityNames.TZ_KAL_ZUK,
+    );
+    const stillCovered = !InfernoAutomation.scoredTiles.some(
+      (scored) =>
+        scored.tile.x === player.location.x &&
+        scored.tile.y === player.location.y &&
+        (scored.parts?.shieldPenalty ?? 0) !== 0,
+    );
+    const zukSwingReady =
+      !!zuk &&
+      stillCovered &&
+      (player.attackDelay ?? 0) <= 0 &&
+      attackOptionFor(region, player, zuk) !== null;
+
+    const repositioning = zukSwingReady ? false : InfernoAutomation.stepMovement(player, region);
     InfernoAutomation.attackState = repositioning ? "moving" : "-";
 
     if (repositioning) {
@@ -1181,16 +1392,25 @@ ${spellLine}`);
       // within a band. `TargetPlanner.chooseTarget(region, player, snapshot, route, target)` is
       // the real one, which prices a target by simulating the fight without it and already
       // accounts for the pillar damage a nibbler would do.
-      // Jad waves use the tag-and-turn instead of the priority table: blowpipe each healer
-      // still healing (aggro not yet on us), then Jad once all are pulled - and never the
-      // tagged ones. No fallback to the table while a Jad lives, or tagged healers would
-      // come straight back as its top-ranked targets.
-      const jadWave = visibleMobs(region).some(
-        (mob) => mob.dying === -1 && mob.mobName() === EntityNames.JAL_TOK_JAD,
-      );
-      const intended = jadWave
-        ? chooseJadWaveTarget(region, player)
-        : chooseByPriority(region, player, InfernoAutomation.target);
+      // Zuk wave gets its own flat ranking, checked AHEAD of the Jad-wave case below: the
+      // Zuk-phase Jad spawns with its own healers too, and without this precedence a live Jad
+      // on wave 69 would incorrectly pull in the tag-and-turn mechanic built for a standalone
+      // Jad wave, rather than being treated as one more entry (priority 4) in Zuk's own order.
+      let intended: Mob | null;
+      if (zuk) {
+        intended = InfernoAutomation.decideZukTarget(region, player, zuk);
+      } else {
+        // Jad waves use the tag-and-turn instead of the priority table: blowpipe each healer
+        // still healing (aggro not yet on us), then Jad once all are pulled - and never the
+        // tagged ones. No fallback to the table while a Jad lives, or tagged healers would
+        // come straight back as its top-ranked targets.
+        const jadWave = visibleMobs(region).some(
+          (mob) => mob.dying === -1 && mob.mobName() === EntityNames.JAL_TOK_JAD,
+        );
+        intended = jadWave
+          ? chooseJadWaveTarget(region, player)
+          : chooseByPriority(region, player, InfernoAutomation.target);
+      }
 
       if (!intended) {
         InfernoAutomation.attackState = "no target";
@@ -1206,17 +1426,42 @@ ${spellLine}`);
         // not full, blood barrage until they are. Same mechanism as the stack - the Kodai
         // autocasts blood, so sustain is purely a gear choice. Kill speed on the tail of a
         // wave is worth less than walking into the next one at full health.
+        //
+        // NOT on 67/68/69. Those waves already have dedicated positioning logic (the healer
+        // tag-and-turn, the shield tracker) that a mage-set switch has no business competing
+        // with, and "alive <= 2" trips constantly there for the wrong reason - Jad's own
+        // healers count towards it, and on 69 the shield (which never dies) plus Zuk alone
+        // already satisfies it for most of the fight. Kill speed against a boss is worth more
+        // than topping up, unlike the tail of a regular wave.
+        const wave = (region as unknown as { wave?: number }).wave ?? 0;
         const healing =
+          wave < 67 &&
           (player.currentStats?.hitpoint ?? 0) < (player.stats?.hitpoint ?? 0) &&
           visibleMobs(region).filter((mob) => mob.dying === -1).length <= 2;
-        // Otherwise: the SAME decision canReach made - preferred set, or the long-bow
-        // fallback that made this mob a candidate at all. Reading requiredSetFor here instead
-        // re-opened the switch-then-drop deadlock the moment the fallback picked a target the
-        // preferred set cannot reach.
-        const set =
-          stacked || healing
-            ? "mage"
-            : attackOptionFor(region, player, intended)?.set ?? requiredSetFor(intended);
+        // ZUK WAVE gear, the user's explicit call: blowpipe the ranger and Zuk's own healer
+        // (Jal-MejJak, enrage phase) when in blowpipe range, tbow everything else - Jad's
+        // healers, mager, Jad and Zuk alike. Overrides the general reach-fallback chain below
+        // entirely for this wave; it does not feed into it.
+        let set: GearSetName;
+        if (stacked || healing) {
+          set = "mage";
+        } else if (zuk) {
+          const blowpipe = weaponForSet(player, "blowpipe") as { attackRange?: number } | null;
+          const blowpipeRange = blowpipe?.attackRange ?? 5;
+          const blowpipeMob =
+            intended.mobName() === EntityNames.JAL_XIL ||
+            intended.mobName() === EntityNames.JAL_MEJ_JAK;
+          set =
+            blowpipeMob && isAttackable(region, player, intended, blowpipeRange)
+              ? "blowpipe"
+              : "tbow";
+        } else {
+          // Otherwise: the SAME decision canReach made - preferred set, or the long-bow
+          // fallback that made this mob a candidate at all. Reading requiredSetFor here
+          // instead re-opened the switch-then-drop deadlock the moment the fallback picked a
+          // target the preferred set cannot reach.
+          set = attackOptionFor(region, player, intended)?.set ?? requiredSetFor(intended);
+        }
         if (!isWearing(player, set)) {
           InfernoAutomation.attackState = `switching to ${set} for ${intended.mobName()}`;
           InfernoAutomation.equipAndShow(player, set);

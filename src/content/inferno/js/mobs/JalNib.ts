@@ -116,7 +116,16 @@ export class JalNib extends Mob {
   attackIfPossible() {
     this.attackStyle = this.attackStyleForNewAttack();
 
-    if (this.dying === -1 && this.aggro.dying > -1) {
+    // `!this.aggro` covers a nibbler spawned after every pillar is already gone - the wave
+    // spawner hands out `aggro` from whatever pillars still exist (`region.entities.filter`),
+    // and if none do by then, that is undefined/null, not a dying pillar. A pillar going
+    // through its own dead() never nulls a nibbler's reference to it (it only marks `dying`
+    // and removes itself from `entities` two ticks later), so the ORIGINAL check already
+    // handled that case fine - `pillar.dying > -1` reads true off a live-but-dying object.
+    // This only fires for the case that object never existed at all. Measured: engine crash,
+    // "Cannot read properties of null (reading 'dying')", two separate seeds, both deep into a
+    // run (tick 6334 and 7055) - long enough for all three pillars to plausibly be lost.
+    if (this.dying === -1 && (!this.aggro || this.aggro.dying > -1)) {
       this.dead(); // cheat way for now. pillar should AOE
     }
     if (this.canAttack() === false) {
