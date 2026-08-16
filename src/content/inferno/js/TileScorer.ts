@@ -28,8 +28,13 @@ import { visibleMobs } from "./Visibility";
  *
  * The terms, in hitpoints over a twelve tick horizon except where noted:
  *
- *     score = barrageReach + healerReach + npcReachSoon + losBonus + safeSpot + homePull
- *             + healerAoePenalty - damageTaken
+ *     score = barrageReach + blobletReach + healerReach + npcReachSoon + quietTicks + losBonus
+ *             + safeSpot + homePull + healerAoePenalty - damageTaken
+ *
+ * `quietTicks` applies ONLY to tiles `safeSpot` has already accepted, and is zero everywhere
+ * else - the loud version of that bonus. On a safespot it is QUIET_TICK_BONUS per tick of the
+ * count in `quietTicksFor`, which since nothing can see such a tile comes down to how much of
+ * the twelve tick window the walk there leaves behind.
  *
  * `healerReach` is 1 if the nearest still-healing Jad healer can be tagged from this tile -
  * the Jad-wave analogue of `barrageReach`, pulling the bot around Jad to where a blowpipe
@@ -42,8 +47,16 @@ import { visibleMobs } from "./Visibility";
  *
  * `barrageReach` is 1 if a barrage thrown from this tile reaches the nibbler that matters.
  *
- * `npcReachSoon` is 1 if a fight is actually available: the tile is close enough to be standing on
- * within NPC_REACH_ARRIVAL_TICKS, and standing there the engine would let a shot off at some mob
+ * `blobletReach` is BLOBLET_REACH_BONUS if a barrage from this tile reaches ANY bloblet - the
+ * same shape as `barrageReach` with the focus pick dropped, since the three land together and
+ * one blast is meant for all of them. Note it deliberately overlaps `npcReachSoon`, which
+ * already scores a bloblet as something reachable: the point of the term is not to discover
+ * the bloblets but to rank a tile facing them ABOVE a tile facing anything else.
+ *
+ * `npcReachSoon` prices the fight this tile makes available: NPC_REACH_BONUS for a mob worth
+ * shooting, BLOB_REACH_BONUS when a blob is the only thing in reach - the best of what is
+ * reachable, not the first found. A fight is available when the tile is close enough to be
+ * standing on within NPC_REACH_ARRIVAL_TICKS, and standing there the engine would let a shot off at some mob
  * WHERE IT REALLY STANDS - `snapshotPlayerCanSeeMob` at the mobs' tick-0 positions, the same test
  * `isAttackable` makes, at the range of the weapon that mob's own gear set carries.
  *
@@ -218,7 +231,8 @@ export function focusNibbler(threats: NibblerThreat[]): NibblerThreat | null {
 }
 
 /**
- * One if a barrage from the end of this route reaches the focus nibbler, zero otherwise.
+ * BARRAGE_REACH_BONUS if a barrage from the end of this route reaches the focus nibbler, zero
+ * otherwise.
  *
  * Judged from where the route ENDS. Reach is the same test the engine uses for a player clicking
  * a mob - `snapshotPlayerCanSeeMob` - at the barrage's range of 10.
@@ -241,9 +255,18 @@ function barrageReach(
     focus.size,
     BARRAGE_RANGE,
   )
-    ? 1
+    ? BARRAGE_REACH_BONUS
     : 0;
 }
+
+/**
+ * What reaching the focus nibbler is worth.
+ *
+ * Thirteen, so the pull towards a nibbler outweighs a tick of quiet rather than being lost
+ * inside one. Pillar damage is permanent - see PillarDefence - and the tile score is the only
+ * place that gets to trade a tick of safety for stopping it.
+ */
+export const BARRAGE_REACH_BONUS = 13;
 
 /**
  * A mob as the reach test needs it: where it is, and how close we must be to hit it.
@@ -256,6 +279,70 @@ interface ReachTarget {
   y: number;
   size: number;
   reach: number;
+}
+
+/**
+ * What a tile is worth for having a bloblet in barrage range.
+ *
+ * One point, the same as `barrageReach`, so the two pulls cannot outbid each other - and like
+ * every other reach term it is a tie-breaker rather than a rival to `damageTaken`, which runs
+ * to tens. Named so the whole term can be switched off by setting it to zero, without the
+ * arithmetic or the dump changing shape.
+ */
+export const BLOBLET_REACH_BONUS = 1;
+
+/** The three a dying blob leaves behind. Ghosts carry these names too - see `ghostBloblets`. */
+const BLOBLET_NAMES: string[] = [
+  EntityNames.JAL_AK_REK_KET, // melee
+  EntityNames.JAL_AK_REK_MEJ, // magic
+  EntityNames.JAL_AK_REK_XIL, // ranged
+];
+
+/**
+ * Every bloblet on the board, as the reach test needs it, at barrage range.
+ *
+ * Read off the shared mob snapshot, so GHOST bloblets are included on exactly the terms the
+ * rest of the score already includes them on: a blob is dying, three bloblets are landing on
+ * known tiles, and a player watching that positions for the landing rather than for the
+ * corpse. Built once and handed to all 441 scores, like `targets` and `reaches`.
+ */
+function blobletTargets(mobs: SimMob[]): ReachTarget[] {
+  const bloblets: ReachTarget[] = [];
+  for (const mob of mobs) {
+    if (BLOBLET_NAMES.includes(mob.name)) {
+      bloblets.push({ x: mob.x, y: mob.y, size: mob.size, reach: BARRAGE_RANGE });
+    }
+  }
+  return bloblets;
+}
+
+/**
+ * BLOBLET_REACH_BONUS if a barrage from the end of this route reaches any bloblet, else zero.
+ *
+ * Any, not the best stack: the attack layer already picks the centre that catches the most
+ * (`bestBarrageBloblet`), and the tile score's job is only to be standing somewhere that cast
+ * is legal from. Judged from where the route ENDS, at tick-0 positions, with the same
+ * `snapshotPlayerCanSeeMob` test as `barrageReach` - and, like `barrageReach`, without the
+ * under-mob refusal that `healerReach` carries, so the two nibbler-shaped pulls stay identical.
+ */
+function blobletReach(
+  snapshot: ArenaSnapshot,
+  bloblets: ReachTarget[],
+  route: Location[],
+): number {
+  const destination = route[route.length - 1];
+  const reached = bloblets.some((bloblet) =>
+    snapshotPlayerCanSeeMob(
+      snapshot,
+      destination.x,
+      destination.y,
+      bloblet.x,
+      bloblet.y,
+      bloblet.size,
+      bloblet.reach,
+    ),
+  );
+  return reached ? BLOBLET_REACH_BONUS : 0;
 }
 
 /**
@@ -503,6 +590,50 @@ export const NPC_REACH_ARRIVAL_TICKS = 4;
 export const NPC_REACH_WINDOW_TICKS = 4;
 
 /**
+ * What a reachable mob is worth, and why a blob is worth less than one.
+ *
+ * `npcReachSoon` used to be a flat 1 for anything at all, which said a tile facing a blob was
+ * as good a place to fight from as a tile facing a bat. It is not: killing a blob is not even
+ * pure gain, since it lands three bloblets in exchange (see KillPriority, where JAL_AK is 1).
+ *
+ * So the term is the BEST thing this tile can reach rather than the first thing it happens to
+ * find - a tile that reaches a blob AND something else is a full point, because the blob is not
+ * what we would be shooting from there. Only a tile whose ONLY available fight is a blob is
+ * shaded down.
+ *
+ * Half a point is deliberately a nudge and not a repulsion. What actually keeps the bot off
+ * blobs is `damageTaken` pricing their hits and `routeEntersForbiddenZone` deleting their melee
+ * zone outright; this only breaks ties those two leave equal. Set BLOB_REACH_BONUS to
+ * NPC_REACH_BONUS to turn the distinction off without changing the arithmetic.
+ */
+export const NPC_REACH_BONUS = 1;
+export const BLOB_REACH_BONUS = 0.5;
+
+/**
+ * How far a mob standing over the player can move next tick, in tiles.
+ *
+ * One, and it is not a heuristic - it is the engine's own outcome set. `getNextMovementStep`
+ * replaces the chase with a coin flip whenever the player is inside the footprint:
+ *
+ *     if (Random.get() < 0.5) { dy = y; dx = x + (Random.get() < 0.5 ? 1 : -1); }
+ *     else                    { dx = x; dy = y + (Random.get() < 0.5 ? 1 : -1); }
+ *
+ * Four outcomes at a quarter each - x+1, x-1, y+1, y-1 - drawn from a generator this scorer
+ * cannot read without desyncing the run. So the direction is not merely hard to predict, it is
+ * unknowable, and `stepMob` picking one of the four is right a quarter of the time. Measured:
+ * at tick 18 the projection put him south, the engine rolled west, the escape tile it had
+ * scored reach 1 was covered on arrival, and the bot walked back underneath. That is the
+ * dance, and no sharper prediction can fix it because there is nothing there to predict.
+ *
+ * What IS knowable is the union: after one shuffle his footprint is somewhere inside itself
+ * dilated by one tile. A destination outside that ring escapes every roll. So while standing
+ * under a mob, reach is refused inside the dilation - see `withinShuffleReach`.
+ *
+ * Set to 0 to remove the rule.
+ */
+export const UNDER_MOB_SHUFFLE_TILES = 1;
+
+/**
  * How far we could hit each KIND of mob, keyed by name.
  *
  * Reach comes from `requiredSetFor`, which depends only on what the mob IS, so every mob sharing
@@ -621,6 +752,30 @@ function routeEntersForbiddenZone(mobs: SimMob[], route: Location[]): boolean {
 export const SAFE_SPOT_BONUS = 0.8;
 
 /**
+ * What one counted tick is worth on a safespot: one point, from `quietTicksFor`.
+ *
+ * A point a tick puts the term on the same scale as the reach bonuses rather than above them -
+ * a full twelve ticks is 12, just under BARRAGE_REACH_BONUS, so a safespot that cannot barrage
+ * the focus nibbler loses to one that can, and single-tick differences in the walk are worth
+ * about what one reachable mob is. Damage still runs to tens and still outweighs all of it.
+ *
+ * Set to 0 to remove the term entirely without changing the arithmetic or the dump.
+ */
+export const QUIET_TICK_BONUS = 1;
+
+/**
+ * How long the count is allowed to run before it stops asking - and so the term's ceiling, at
+ * QUIET_TICK_BONUS * QUIET_SCAN_TICKS = 12.
+ *
+ * Twelve, the horizon length. The one thing it costs: a mob further out than twelve ticks reads
+ * the same as one exactly twelve ticks out, so the count only starts moving once the approach
+ * is inside the window. Raising this is the single knob that changes that, and it raises the
+ * ceiling with it.
+ */
+export const QUIET_SCAN_TICKS = 12;
+
+
+/**
  * Cost per tile of Chebyshev distance to the nearest live mob, charged against a safe spot's
  * bonus.
  *
@@ -635,7 +790,7 @@ export const SAFE_SPOT_BONUS = 0.8;
  * contain, so every safe tile's score directly reads back as SAFE_SPOT_BONUS minus its distance
  * in hundredths - e.g. 0.47 is 3 tiles from the nearest mob.
  */
-export const NPC_DISTANCE_PENALTY = 0.01;
+export const NPC_DISTANCE_PENALTY = 0.00;
 
 /**
  * Floor under the distance penalty, so a safe tile far from every mob still keeps a meaningful
@@ -768,6 +923,69 @@ function settlesSafe(snapshot: ArenaSnapshot, mobs: SimMob[], route: Location[])
   );
 
   return settled && !exposed;
+}
+
+/**
+ * Walk there, stand there, and count the ticks until an NPC has line of sight and range on the
+ * tile. That is the whole rule.
+ *
+ * The count ends on LOS, or on the nearest attacker stopping getting closer:
+ *
+ *  - SEEN. Something that attacks has the tile in line of sight and range - `mobSeesPlayer`,
+ *    the same test every other exposure question in this file asks.
+ *  - NOT CLOSING. The nearest attacker is no nearer than it was last tick. Whether a mob MOVED
+ *    is the wrong question and was scoring noise: one shuffling sideways, or pathing around a
+ *    pillar at a constant distance, banked ticks for an approach that was not happening.
+ *
+ * The arrival tick sets the baseline distance and scores nothing, so a tile nothing is closing
+ * on counts zero rather than a free tick.
+ *
+ * Counted from arrival, so it is the ticks the tile buys us once we are standing on it rather
+ * than ticks the walk passed through.
+ */
+function quietTicksFor(
+  snapshot: ArenaSnapshot,
+  mobs: SimMob[],
+  route: Location[],
+): number {
+  const destination = route[route.length - 1];
+
+  let ticks = 0;
+  let previousDistance: number | null = null;
+
+  simulateTrajectory(
+    snapshot,
+    mobs,
+    route,
+    QUIET_SCAN_TICKS,
+    (_tick, simMobs, px, py) => {
+      if (px !== destination.x || py !== destination.y) {
+        return; // still walking - the count is about standing there
+      }
+
+      let nearest = Infinity;
+      for (const mob of simMobs) {
+        if (!mob.attacks) {
+          continue;
+        }
+        if (mobSeesPlayer(snapshot, mob, px, py)) {
+          return true; // seen - the count ends here
+        }
+        nearest = Math.min(nearest, chebyshevDistance({ x: mob.x, y: mob.y }, { x: px, y: py }));
+      }
+
+      if (previousDistance === null) {
+        previousDistance = nearest; // the baseline, not a tick of approach
+        return;
+      }
+      if (nearest >= previousDistance) {
+        return true; // nothing is getting closer, so there is nothing to count down
+      }
+      previousDistance = nearest;
+      ticks++;
+    },
+  );
+  return ticks;
 }
 
 /**
@@ -945,9 +1163,13 @@ export function distanceToNearestMob(region: Region, player: Player): number | n
  */
 export interface ScoreParts {
   barrageReach: number;
+  /** BLOBLET_REACH_BONUS if any bloblet is in barrage range of here - see `blobletReach`. */
+  blobletReach: number;
   /** 1 if the nearest still-healing Jad healer can be tagged from here - see `focusHealer`. */
   healerReach: number;
   npcReachSoon: number;
+  /** QUIET_TICK_BONUS per counted tick, on safespot tiles only - zero everywhere else. */
+  quietTicks: number;
   /** `LOS_BONUS` shared between everything that can shoot this tile; 0 without reach. */
   losBonus: number;
   safeSpot: number;
@@ -971,6 +1193,7 @@ function scoreRoute(
   snapshot: ArenaSnapshot,
   mobs: SimMob[],
   focus: NibblerThreat | null,
+  bloblets: ReachTarget[],
   healer: ReachTarget | null,
   home: Location | null,
   shield: ShieldState | null,
@@ -1016,6 +1239,36 @@ function scoreRoute(
     playerIsUnder(mob, destination.x, destination.y),
   );
 
+  /**
+   * The mobs we are standing inside RIGHT NOW - the ones that will shuffle blindly this tick.
+   *
+   * Read off route[0], the tile the player is on, so it is the same answer for all 441
+   * candidates: it describes the situation being escaped from, not the tile being scored.
+   * Empty on every tick that is not an escape, which is what keeps the rule below off the
+   * rest of the board.
+   */
+  const shufflers = mobs.filter((mob) => playerIsUnder(mob, route[0].x, route[0].y));
+
+  /**
+   * Somewhere a shuffling mob could be standing next tick: its footprint dilated by
+   * UNDER_MOB_SHUFFLE_TILES on every side, which is the union of the engine's four equally
+   * likely outcomes. Claiming a shot from inside this ring is claiming one roll out of four.
+   */
+  const withinShuffleReach = (mob: SimMob, x: number, y: number) =>
+    x >= mob.x - UNDER_MOB_SHUFFLE_TILES &&
+    x <= mob.x + mob.size - 1 + UNDER_MOB_SHUFFLE_TILES &&
+    y <= mob.y + UNDER_MOB_SHUFFLE_TILES &&
+    y >= mob.y - mob.size + 1 - UNDER_MOB_SHUFFLE_TILES;
+
+  /**
+   * Escaping, and this destination is somewhere the shuffle can still reach - so it is not an
+   * escape. Judged on tick-0 positions and pure geometry: unlike everything else that has been
+   * tried here it asks nothing of the projection, which is precisely the part that was lying.
+   */
+  const insideShuffleRange = shufflers.some((mob) =>
+    withinShuffleReach(mob, destination.x, destination.y),
+  );
+
   // Reach means: standing on this tile, the engine would actually let a shot off at a mob -
   // either where it stands right now, or where the simulation walks it within
   // NPC_REACH_WINDOW_TICKS of our arrival. `snapshotPlayerCanSeeMob` is the same test
@@ -1035,6 +1288,31 @@ function scoreRoute(
   // reached cannot be called safe.
   let arrived = false;
   let arrivalTick = 0;
+  /**
+   * Did the player end up inside a footprint at any point on this move?
+   *
+   * Two questions in one flag, because they turn out to be the same question asked on
+   * different ticks:
+   *
+   *  - THE WALK. The shuffle is not a property of where we start, it is a property of the
+   *    player being inside a footprint when the mob takes its step - and `stepMob` asks that
+   *    every tick, so a route clipping a footprint on its way past rolls the dice mid-walk.
+   *    From that tick on, every projected position is one of four outcomes rather than a
+   *    prediction, and a reach claim resting on them describes a board with a one-in-four
+   *    chance of existing.
+   *  - ARRIVAL. Away from the player a mob's step has no RNG in it at all -
+   *    `getNextMovementStep` is `sign(player - mob)` per axis with the corner rule - so the
+   *    projection genuinely knows where a chaser ends up. A meleer closes a tile a tick while
+   *    we cover two, which puts the tiles just outside his footprint exactly where he will be
+   *    standing when we get there. Scored on tick-0 geometry they look like a shot and deliver
+   *    us back underneath him.
+   *
+   * Tested before the walking ticks are discarded and before `arrived` is set, so the arrival
+   * tick is included - which is why the separate arrival flag this replaced was redundant.
+   *
+   * Cheaper than it looks: it rides the trajectory that was going to run anyway.
+   */
+  let walkedUnderMob = false;
 
   /**
    * Every attacker that has this destination in sight and range at ANY tick from arrival to
@@ -1053,7 +1331,8 @@ function scoreRoute(
    * the mobs once and steps the same objects every tick.
    */
   const watchers = new Set<SimMob>();
-  // Everything that could possibly join the set, so the scan can stop once they all have.
+  // Everything that could possibly join the set - the losBonus divisor's ceiling, and the
+  // "is there anything to be safe from at all" test both safeSpot and quietTicks gate on.
   const attackerCount = mobs.reduce((total, mob) => (mob.attacks ? total + 1 : total), 0);
 
   // Play the walk forward twelve ticks once, then plan the best overhead sequence against
@@ -1066,6 +1345,19 @@ function scoreRoute(
     route,
     undefined,
     (tick, simMobs, px, py) => {
+      // Asked before the walking ticks are discarded, because this one IS about them - and
+      // before `arrived` is set, which is what makes the arrival tick fall out of the same
+      // line rather than needing a flag of its own.
+      //
+      // Deliberately unguarded, so it keeps firing after arrival too: a mob that walks onto
+      // us while we stand there has put the projection back on a coin flip, and a shot
+      // claimed from a later tick of the window is exactly the claim this rule exists to
+      // refuse. It can only ever withhold an upgrade, never retract a point - `npcReachSoon`
+      // is a running max that nothing recomputes.
+      if (simMobs.some((mob) => playerIsUnder(mob, px, py))) {
+        walkedUnderMob = true;
+      }
+
       // Judged standing on the destination; ticks spent walking say nothing about the tile.
       if (px !== destination.x || py !== destination.y) {
         return;
@@ -1079,10 +1371,27 @@ function scoreRoute(
       // the engine would let us shoot them. Counted FROM ARRIVAL rather than from the start
       // of the simulation, so the player's walking budget and the mobs' approach budget are
       // independent knobs - a far tile no longer spends its mob patience on its own walk.
+      //
+      // The scan runs until a FULL point is found rather than until any point is found - see
+      // NPC_REACH_BONUS. Stopping at the first reachable mob would let a blob standing between
+      // us and a bat decide the tile is a half-point one, when the shot we would actually take
+      // from there is the bat.
+      // Three refusals for the same fact - a tile with a mob standing on it is a tile nothing
+      // can be shot from - asked of the three moments the answer can differ:
+      //
+      //   destinationUnderMob  now, real positions          (tick 0)
+      //   walkedUnderMob       anywhere on the way, arrival included
+      //   insideShuffleRange   anywhere the coin flip can land, and only while we are under
+      //                        a mob, because that is the only time the engine rolls one
+      //
+      // The first two are cheap facts. The third is pessimism, confined to the case that
+      // earns it - see UNDER_MOB_SHUFFLE_TILES.
       if (
         arrivesInWindow &&
         !destinationUnderMob &&
-        npcReachSoon === 0 &&
+        !walkedUnderMob &&
+        !insideShuffleRange &&
+        npcReachSoon < NPC_REACH_BONUS &&
         tick - arrivalTick <= NPC_REACH_WINDOW_TICKS
       ) {
         for (const mob of simMobs) {
@@ -1091,8 +1400,15 @@ function scoreRoute(
             continue;
           }
           if (snapshotPlayerCanSeeMob(snapshot, px, py, mob.x, mob.y, mob.size, reach)) {
-            npcReachSoon = 1;
-            break;
+            // isBlob is the parent JAL_AK only - a ghost never sets it, and the three bloblets
+            // it leaves are their own mobs at the full bonus, as `blobletReach` also treats them.
+            npcReachSoon = Math.max(
+              npcReachSoon,
+              mob.isBlob ? BLOB_REACH_BONUS : NPC_REACH_BONUS,
+            );
+            if (npcReachSoon >= NPC_REACH_BONUS) {
+              break;
+            }
           }
         }
       }
@@ -1170,12 +1486,23 @@ function scoreRoute(
     safeSpot = Math.max(SAFE_SPOT_MIN, SAFE_SPOT_BONUS - penalty);
   }
 
+  // Safespots only. The count is off on every other tile - the whole `safeSpot` test is the
+  // gate, so it carries the under-a-mob refusal, the "something to be safe from" requirement,
+  // the arrival check and the settle proof with it, and this term adds no conditions of its
+  // own. On a tile that passes, what the count then measures is the walk: the scan clock runs
+  // from now, so ticks spent getting there are ticks the tile does not get to bank, and a
+  // safespot two tiles away is worth more than the same safespot eight tiles away.
+  const quietTicks = safeSpot > 0 ? QUIET_TICK_BONUS * quietTicksFor(snapshot, mobs, route) : 0;
+
   // Only where a shot is actually available - see LOS_BONUS. Divided by everything that gets
   // to shoot back across the whole post-arrival window, not by a single tick's worth.
   const losBonus = npcReachSoon > 0 ? LOS_BONUS / Math.max(1, watchers.size) : 0;
 
   const parts: ScoreParts = {
     barrageReach: barrageReach(snapshot, focus, route),
+    // The bloblet pull: the nibbler rule with the focus pick dropped, since one blast is meant
+    // for the whole landing trio. Zero whenever no blob has died, so it costs nothing elsewhere.
+    blobletReach: blobletReach(snapshot, bloblets, route),
     // The Jad-wave pull: 1 if the focus healer - nearest one still healing - can be tagged
     // from this destination. Same shape as barrageReach, same under-mob refusal as reach.
     healerReach:
@@ -1193,6 +1520,7 @@ function scoreRoute(
           : 0
         : 0,
     npcReachSoon,
+    quietTicks,
     losBonus,
     safeSpot,
     // Negative or zero: the drift anchor for the open-arena waves - see HOME_PULL_PER_TILE.
@@ -1215,8 +1543,10 @@ function scoreRoute(
   return {
     score:
       parts.barrageReach +
+      parts.blobletReach +
       parts.healerReach +
       parts.npcReachSoon +
+      parts.quietTicks +
       parts.losBonus +
       parts.safeSpot +
       parts.homePull +
@@ -1312,6 +1642,10 @@ export function scoreCandidates(
     }
   }
 
+  // Live and ghost alike, for the same reason the ghosts were added to `targets` above: the
+  // tiles worth standing on for a landing trio are worth standing on before it lands.
+  const bloblets = blobletTargets(mobs);
+
   const scored: ScoredTile[] = [];
   for (const tile of tiles) {
     const route = routes.get(routeKey(tile.x, tile.y));
@@ -1329,6 +1663,7 @@ export function scoreCandidates(
       snapshot,
       mobs,
       focus,
+      bloblets,
       healer,
       home,
       shield,

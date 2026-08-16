@@ -51,6 +51,15 @@
  *                       so a wedge is caught in a fraction of the wall time it used to cost
  *   INFERNO_TICK_LIMIT  total tick budget for the run, default 200000
  *   INFERNO_TIMEOUT_MS  jest timeout (read by jest.harness.config.js), default 30 min
+ *   INFERNO_MAX_WAVES   stop after clearing this many waves. Defaults to 1 when INFERNO_QUERY
+ *                       builds a custom scenario (that is a one-wave question), unlimited
+ *                       otherwise. Set explicitly to override either way.
+ *   INFERNO_DUMP_SCORES file to write the per-tick score grid to, as JSON Lines - the browser's
+ *                       Dump Scores button for every tick of the run. Off when unset.
+ *   INFERNO_DUMP_FROM   first tick to dump, default 1
+ *   INFERNO_DUMP_TO     last tick to dump, default no limit. A grid is ~25KB, so bound the
+ *                       range on long runs - find the ticks from a plain run, then re-run the
+ *                       same seed dumping only those.
  */
 
 import * as fs from "fs";
@@ -59,6 +68,7 @@ import * as path from "path";
 import { EntityNames, Random, Settings, Viewport, World } from "osrs-sdk";
 
 import { InfernoAutomation } from "../../src/content/inferno/js/InfernoAutomation";
+import { InfernoPillar } from "../../src/content/inferno/js/InfernoPillar";
 import { InfernoRegion } from "../../src/content/inferno/js/InfernoRegion";
 import { InfernoSettings } from "../../src/content/inferno/js/InfernoSettings";
 
@@ -70,6 +80,75 @@ const PRAYER_OVERRIDE = parseInt(process.env.INFERNO_PRAYER || "", 10);
 const AUTO_DELAY_TICKS = parseInt(process.env.INFERNO_AUTO_DELAY || "0", 10);
 const WAVE_TICK_LIMIT = parseInt(process.env.INFERNO_WAVE_TICK_LIMIT || "500", 10);
 const TOTAL_TICK_LIMIT = parseInt(process.env.INFERNO_TICK_LIMIT || "200000", 10);
+
+/**
+ * Where to write the per-tick score grid, and which ticks to write.
+ *
+ * The browser's Dump Scores button answers "why this tile, right now" for one tick you
+ * happened to be watching. This is the same answer for every tick of a headless run, which is
+ * what an oscillation needs: the interesting question is never what one grid says, it is which
+ * term changed between two consecutive ones.
+ *
+ * JSON Lines - one self-contained record per tick - rather than one big document, so a run
+ * that dies mid-way still leaves a readable file, and so a single tick can be pulled out with
+ * a line number instead of a parser.
+ *
+ * A grid is 441 rows of 15 numbers, about 25KB a tick, so a full 60-wave run would be
+ * gigabytes. INFERNO_DUMP_FROM/TO exist to bound that: find the tick range from a normal run
+ * first, then re-run the same seed dumping only the ticks that matter.
+ */
+/**
+ * The mob params that make `InfernoRegion` force wave 1 and host a hand-built scenario.
+ * Kept as the raw query keys rather than derived from URL_PARAM_BY_MOB, because the region
+ * checks the query string, and a mob with no URL param cannot appear in one anyway.
+ */
+const CUSTOM_MOB_PARAMS = [
+  "bat",
+  "blob",
+  "melee",
+  "ranger",
+  "mager",
+  "akrekmej",
+  "akrekxil",
+  "akrekket",
+];
+const IS_CUSTOM_SCENARIO = CUSTOM_MOB_PARAMS.some((param) =>
+  new RegExp(`(^|&)${param}=`).test(EXTRA_QUERY),
+);
+
+/**
+ * Waves to clear before the run stops itself, 0 for "all the way to Zuk".
+ *
+ * Defaults to 1 for a custom scenario and unlimited otherwise. A hand-built board is a
+ * question about one wave; once it is cleared the region spawns the genuine wave 2 and the
+ * run carries on measuring something nobody asked about - which is minutes of wall time per
+ * iteration, on the one workflow that wants to be fast.
+ */
+const MAX_WAVES =
+  parseInt(process.env.INFERNO_MAX_WAVES || "", 10) || (IS_CUSTOM_SCENARIO ? 1 : 0);
+
+const DUMP_PATH = process.env.INFERNO_DUMP_SCORES || "";
+const DUMP_FROM = parseInt(process.env.INFERNO_DUMP_FROM || "1", 10);
+const DUMP_TO = parseInt(process.env.INFERNO_DUMP_TO || "", 10) || Number.MAX_SAFE_INTEGER;
+
+/** Same columns, same order, as the browser's Dump Scores button - see InfernoRegion. */
+const DUMP_COLUMNS = [
+  "x",
+  "y",
+  "score",
+  "barrage",
+  "blob",
+  "healer",
+  "reach",
+  "quiet",
+  "los",
+  "safe",
+  "home",
+  "shield",
+  "damage",
+  "threats",
+  "routeLen",
+];
 
 // Must match the sidebar's <select id="loadouts"> options - an unknown value would set the
 // select to "" and InfernoLoadout.getLoadout() would return nothing.
@@ -99,6 +178,86 @@ function mulberry32(seed: number): () => number {
 /** Bypass jest's console capture so the report reads as plain lines, not log noise. */
 function out(line: string) {
   process.stdout.write(line + "\n");
+}
+
+/**
+ * One tick's worth of score grid, as a single JSON line.
+ *
+ * Read off `InfernoAutomation.getScoredTiles()` - the grid the bot ACTUALLY decided from this
+ * tick, not a fresh rescore - so what the file shows and what the bot did cannot disagree.
+ * Empty whenever automation did not score (countdown ticks, automation off), and those ticks
+ * are skipped rather than written as empty records.
+ *
+ * The mob list is carried on every record, not just once, because the whole point is to read
+ * grids against each other: a term that changed between two ticks usually changed because a
+ * mob moved, and having to cross-reference a separate timeline to find out defeats the object.
+ */
+function dumpScoreGrid(
+  stream: import("fs").WriteStream,
+  tick: number,
+  region: any,
+  player: any,
+) {
+  const scored = InfernoAutomation.getScoredTiles();
+  if (scored.length === 0) {
+    return;
+  }
+  const round = (value: number) => Math.round(value * 1000) / 1000;
+
+  stream.write(
+    JSON.stringify({
+      tick,
+      wave: region.wave,
+      player: { x: player.location.x, y: player.location.y },
+      chosenTile: InfernoAutomation.getChosenTile(),
+      hp: player.currentStats?.hitpoint,
+      prayer: player.currentStats?.prayer,
+      mobs: (region.mobs as any[]).map((mob) => ({
+        name: mob.mobName(),
+        x: mob.location.x,
+        y: mob.location.y,
+        size: mob.size,
+        hp: mob.currentStats?.hitpoint,
+        attackDelay: mob.attackDelay,
+        attackRange: mob.attackRange,
+        hasLOS: mob.hasLOS,
+        frozen: mob.frozen ?? 0,
+        dying: mob.dying,
+        aggro: mob.aggro === player ? "player" : mob.aggro ? "other" : null,
+      })),
+      // Pillars are the whole reason a tile is ever quiet, and they are destructible - a grid
+      // read without them is a grid with the geometry missing. Footprint runs east and north
+      // from `location`, size 3, exactly as ArenaSnapshot blocks them.
+      pillars: (region.entities as any[])
+        .filter((entity) => entity instanceof InfernoPillar)
+        .map((pillar) => ({
+          x: pillar.location.x,
+          y: pillar.location.y,
+          size: pillar.size,
+          hp: pillar.currentStats?.hitpoint,
+        })),
+      columns: DUMP_COLUMNS,
+      // Field by field rather than spread, so renaming a ScoreParts member breaks the build
+      // here instead of silently writing a column of nulls.
+      tiles: scored.map((entry) => [
+        entry.tile.x,
+        entry.tile.y,
+        round(entry.score),
+        entry.parts ? round(entry.parts.barrageReach) : null,
+        entry.parts ? round(entry.parts.blobletReach) : null,
+        entry.parts ? round(entry.parts.healerReach) : null,
+        entry.parts ? round(entry.parts.npcReachSoon) : null,
+        entry.parts ? round(entry.parts.quietTicks) : null,
+        entry.parts ? round(entry.parts.losBonus) : null,
+        entry.parts ? round(entry.parts.safeSpot) : null,
+        entry.parts ? round(entry.parts.homePull) : null,
+        entry.parts ? round(entry.parts.shieldPenalty) : null,
+        entry.parts ? round(entry.parts.damageTaken) : null,
+        entry.parts ? entry.parts.threats : null,
+        entry.route.length,
+      ]),
+    }) + "\n",
+  );
 }
 
 /** URL query param for each mob kind the import path supports, or undefined for the rest. */
@@ -278,12 +437,21 @@ test("seeded wave run through the real InfernoAutomation.onTick", () => {
   let outcome = "";
   let detail = "";
   let botLogAtStop = "";
+  let dumpStream: import("fs").WriteStream | null = null;
+  let dumpedTicks = 0;
   let tick = 0;
   let lastWave = region.wave;
   let waveStartTick = 0;
   let wavesCleared = 0;
   let zukWaveHadMobs = false;
   const startedAt = Date.now();
+
+  // Opened before the loop and closed in the same finally as everything else, so a run that
+  // dies, crashes or wedges still leaves every tick it managed to write.
+  if (DUMP_PATH) {
+    fs.mkdirSync(path.dirname(path.resolve(DUMP_PATH)), { recursive: true });
+    dumpStream = fs.createWriteStream(path.resolve(DUMP_PATH));
+  }
 
   try {
     let liveTicks = 0;
@@ -317,6 +485,13 @@ test("seeded wave run through the real InfernoAutomation.onTick", () => {
       // matures - see the header comment on fake timers.
       jest.advanceTimersByTime(600);
 
+      // Written BEFORE the outcome checks, so the tick the run ends on is in the file - which
+      // is the one tick anybody actually wants to look at.
+      if (dumpStream && tick >= DUMP_FROM && tick <= DUMP_TO) {
+        dumpScoreGrid(dumpStream, tick, region, player);
+        dumpedTicks++;
+      }
+
       // Death first: a dying player is removed from region.players by the engine.
       if (region.players.length === 0 || player.isDying()) {
         outcome = "died";
@@ -344,6 +519,16 @@ test("seeded wave run through the real InfernoAutomation.onTick", () => {
         );
         lastWave = region.wave;
         waveStartTick = tick;
+
+        // Stop once the run has cleared what it was asked for. A custom scenario is a
+        // one-wave question - the region forces wave 1 to host it, and whatever spawns after
+        // is the real wave 2, which has nothing to do with what was being tested - so it
+        // defaults to stopping there rather than running on into an unrelated inferno.
+        if (MAX_WAVES > 0 && wavesCleared >= MAX_WAVES) {
+          outcome = "completed";
+          detail = `cleared ${wavesCleared} wave${wavesCleared === 1 ? "" : "s"} (INFERNO_MAX_WAVES=${MAX_WAVES})`;
+          break;
+        }
       }
 
       // Wave 69 has no successor, so completion is "Zuk existed and now nothing is alive and
@@ -379,6 +564,15 @@ test("seeded wave run through the real InfernoAutomation.onTick", () => {
     botLogAtStop = InfernoAutomation.getLog();
     InfernoAutomation.setEnabled(false);
     jest.useRealTimers();
+    dumpStream?.end();
+  }
+
+  if (dumpStream) {
+    out("");
+    out(
+      `score grid: ${dumpedTicks} ticks written to ${path.relative(process.cwd(), path.resolve(DUMP_PATH))}` +
+        ` (JSON Lines, one grid per tick)`,
+    );
   }
 
   if (!outcome) {

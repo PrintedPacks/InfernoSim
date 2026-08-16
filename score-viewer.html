@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tile Score Viewer</title>
+<style>
+  :root {
+    --bg: #101317;
+    --panel: #171b21;
+    --panel-2: #1e242c;
+    --line: #2b333d;
+    --text: #dde3ea;
+    --dim: #8b97a5;
+    --accent: #59a5ff;
+    --chosen: #ffd24a;
+    --mob: #ff5c5c;
+    --good: #35c46a;
+    --bad: #e5484d;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.45 var(--mono);
+  }
+  header {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 10;
+  }
+  button, select, input[type=file] { font: inherit; color: var(--text); }
+  button, select {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px;
+    padding: 4px 9px; cursor: pointer;
+  }
+  button:hover:not(:disabled), select:hover { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  input[type=range] { width: 240px; accent-color: var(--accent); }
+  .sep { width: 1px; height: 20px; background: var(--line); }
+  .readout { color: var(--dim); }
+  .readout b { color: var(--text); font-weight: 600; }
+
+  main { display: flex; gap: 14px; padding: 14px; align-items: flex-start; flex-wrap: wrap; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+  }
+  h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); font-weight: 600; }
+
+  #gridWrap { overflow: auto; max-width: 100%; }
+  #stage { position: relative; }
+  #grid { display: grid; gap: 1px; }
+  #overlay { position: absolute; inset: 0; pointer-events: none; }
+  .cell {
+    width: 34px; height: 34px; display: flex; align-items: center; justify-content: center;
+    font-size: 10px; border-radius: 2px; cursor: pointer; position: relative;
+    background: #0b0d10; color: #0009; user-select: none;
+  }
+  /* Not a candidate at all - blocked, off-grid, or a route that never arrives. Hatched rather
+     than merely dark, because "scored zero" and "never scored" are completely different facts
+     and they used to render as the same black square. */
+  .cell.void {
+    background: repeating-linear-gradient(45deg, #0a0c0f 0 4px, #141a21 4px 8px);
+    cursor: default;
+  }
+  /* Scored, and the answer was zero. */
+  .cell.zero { background: #1b2129; color: #64707e; }
+  .cell.player { outline: 2px solid var(--accent); outline-offset: -2px; z-index: 2; }
+  .cell.chosen { outline: 2px solid var(--chosen); outline-offset: -2px; z-index: 3; }
+  .cell.sel { outline: 2px dashed #fff; outline-offset: -2px; z-index: 4; }
+
+  /* Footprint boxes drawn over the grid rather than tinting each cell, so a 4x4 meleer reads
+     as one object with one label instead of sixteen shaded squares. */
+  .fp {
+    position: absolute; border-radius: 3px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; font-size: 11px; font-weight: 600;
+    letter-spacing: .02em; text-shadow: 0 1px 2px #000a; overflow: hidden;
+  }
+  .fp small { font-size: 9px; font-weight: 400; opacity: .85; }
+  .fp.pillar {
+    background: repeating-linear-gradient(45deg, #4a545f 0 6px, #414b55 6px 12px);
+    border: 2px solid #6d7a88; color: #e8eef5;
+  }
+  .fp.pillar.dead { opacity: .28; border-style: dashed; }
+  .fp.mob { border-width: 2px; border-style: solid; }
+  .fp.mob.los { box-shadow: 0 0 0 2px #fff6 inset; }
+  .fp.mob.dying { opacity: .35; }
+
+  table { border-collapse: collapse; width: 100%; }
+  td, th { padding: 3px 8px 3px 0; text-align: left; vertical-align: top; }
+  th { color: var(--dim); font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.changed td { background: rgba(89,165,255,.13); }
+  .up { color: var(--good); } .down { color: var(--bad); }
+
+  #timeline { display: flex; gap: 2px; align-items: flex-end; height: 46px; }
+  #timeline div {
+    width: 12px; background: var(--panel-2); border-radius: 2px 2px 0 0; cursor: pointer;
+    border-bottom: 2px solid transparent;
+  }
+  #timeline div.hot { background: var(--accent); }
+  #timeline div.now { border-bottom-color: #fff; }
+
+  #drop {
+    margin: 14px; padding: 30px; border: 1px dashed var(--line); border-radius: 8px;
+    text-align: center; color: var(--dim);
+  }
+  #drop.hide { display: none; }
+  code { color: var(--accent); }
+  .legend { display: flex; gap: 10px; align-items: center; color: var(--dim); margin-top: 8px; font-size: 11px; }
+  .swatch { width: 12px; height: 12px; border-radius: 2px; display: inline-block; vertical-align: -2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <strong>Tile Score Viewer</strong>
+  <span class="sep"></span>
+  <button id="first" title="First tick">⏮</button>
+  <button id="prev" title="Previous tick (←)">◀</button>
+  <button id="play" title="Play / pause (space)">▶</button>
+  <button id="next" title="Next tick (→)">▶|</button>
+  <button id="last" title="Last tick">⏭</button>
+  <input type="range" id="slider" min="0" max="0" value="0">
+  <span class="sep"></span>
+  <span class="readout">tick <b id="rTick">–</b> · wave <b id="rWave">–</b> · hp <b id="rHp">–</b> · player <b id="rPlayer">–</b> · chosen <b id="rChosen">–</b></span>
+  <span class="sep"></span>
+  <label class="readout">colour by
+    <select id="colourBy"></select>
+  </label>
+  <span class="sep"></span>
+  <span class="readout">pillars
+    <label><input type="checkbox" id="pSouth" checked> S</label>
+    <label><input type="checkbox" id="pWest" checked> W</label>
+    <label><input type="checkbox" id="pNorth" checked> N</label>
+  </span>
+  <span class="sep"></span>
+  <input type="file" id="file" accept=".jsonl,.json,.log">
+</header>
+
+<div id="drop">
+  Loading <code>dance.jsonl</code>…
+</div>
+
+<main id="app" style="display:none">
+  <div class="card">
+    <h2>Grid <span id="gridNote" class="readout"></span></h2>
+    <div id="gridWrap"><div id="stage"><div id="grid"></div><div id="overlay"></div></div></div>
+    <div class="legend">
+      <span><span class="swatch" style="background:var(--accent)"></span> player</span>
+      <span><span class="swatch" style="background:var(--chosen)"></span> chosen</span>
+      <span><span class="swatch" style="background:#4a545f;border:1px solid #6d7a88"></span> pillar</span>
+      <span><span class="swatch" style="background:#fff"></span> selected (click a tile)</span>
+      <span><span class="swatch" style="background:#1b2129"></span> scored 0</span>
+      <span><span class="swatch" style="background:repeating-linear-gradient(45deg,#0a0c0f 0 3px,#141a21 3px 6px)"></span> blocked / not a candidate</span>
+      <span id="mobLegend" style="display:flex;gap:10px"></span>
+    </div>
+  </div>
+
+  <div style="display:flex; flex-direction:column; gap:14px; flex:1; min-width:320px">
+    <div class="card">
+      <h2>Tile <span id="selCoord" class="readout">— click a tile</span></h2>
+      <table id="parts"><tbody></tbody></table>
+    </div>
+
+    <div class="card">
+      <h2>Mobs</h2>
+      <table id="mobs"><tbody></tbody></table>
+    </div>
+
+    <div class="card">
+      <h2>Ticks with a non-zero <span id="tlTerm" class="readout"></span></h2>
+      <div id="timeline"></div>
+      <div class="legend"><span id="tlSummary"></span></div>
+    </div>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+let records = [];
+let index = 0;
+let selected = null;      // {x, y} kept across ticks so the inspector diffs the same tile
+let tileBounds = null;    // extent of the candidate tiles across the whole file
+let bounds = null;        // what the grid actually draws: tiles plus any enabled pillar
+let colourBy = "score";
+let timer = null;
+
+/**
+ * The arena's three pillars, at the coordinates InfernoPillar.addPillarsToWorld uses.
+ *
+ * Drawn from these rather than from the dump so the geometry is on screen even for a file
+ * recorded before pillars were dumped, and so each one can be switched off - which is the
+ * quickest way to ask "is this tile quiet because of THAT pillar". When the record does carry
+ * a pillar at the same spot its hitpoints are shown, since pillars are destructible.
+ */
+const DEFAULT_PILLARS = [
+  { key: "south", x: 21, y: 37 },
+  { key: "west", x: 11, y: 23 },
+  { key: "north", x: 28, y: 21 },
+];
+const PILLAR_SIZE = 3;
+const pillarOn = { south: true, west: true, north: true };
+
+const $ = (id) => document.getElementById(id);
+const COLS_EL = $("colourBy");
+
+/* ---------- loading ---------- */
+
+function parse(text) {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+/**
+ * The drawn extent: the candidate tiles, widened to include every pillar that is switched on.
+ *
+ * Without the widening a toggle could do nothing visible - the candidate box is 21x21 and
+ * slides with the player, so the west pillar at 11,23 is often entirely outside it.
+ */
+function recomputeBounds() {
+  if (!tileBounds) return;
+  let { minX, maxX, minY, maxY } = tileBounds;
+  for (const p of DEFAULT_PILLARS) {
+    if (!pillarOn[p.key]) continue;
+    minX = Math.min(minX, p.x);
+    maxX = Math.max(maxX, p.x + PILLAR_SIZE - 1);
+    minY = Math.min(minY, p.y - PILLAR_SIZE + 1);
+    maxY = Math.max(maxY, p.y);
+  }
+  bounds = { minX, maxX, minY, maxY };
+}
+
+function load(text) {
+  records = parse(text);
+  if (!records.length) {
+    $("drop").textContent = "No records in that file.";
+    return;
+  }
+  // One extent for the whole run: the candidate box slides with the player, and a grid that
+  // resized every tick would make two ticks impossible to compare by eye.
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const rec of records) {
+    for (const row of rec.tiles) {
+      if (row[0] < minX) minX = row[0];
+      if (row[0] > maxX) maxX = row[0];
+      if (row[1] < minY) minY = row[1];
+      if (row[1] > maxY) maxY = row[1];
+    }
+  }
+  tileBounds = { minX, maxX, minY, maxY };
+  recomputeBounds();
+
+  COLS_EL.innerHTML = records[0].columns
+    .filter((c) => c !== "x" && c !== "y")
+    .map((c) => `<option${c === "score" ? " selected" : ""}>${c}</option>`)
+    .join("");
+
+  $("slider").max = String(records.length - 1);
+  $("drop").classList.add("hide");
+  $("app").style.display = "flex";
+  index = 0;
+  render();
+}
+
+fetch("dance.jsonl")
+  .then((r) => (r.ok ? r.text() : Promise.reject(new Error(String(r.status)))))
+  .then(load)
+  .catch(() => {
+    $("drop").innerHTML =
+      'Could not fetch <code>dance.jsonl</code> — that only works when this page is served over http ' +
+      '(e.g. <code>npx serve .</code> in the repo root).<br><br>Drop the <code>.jsonl</code> here, or use the file picker above.';
+  });
+
+$("file").addEventListener("change", (e) => {
+  const f = e.target.files[0];
+  if (f) f.text().then(load);
+});
+document.addEventListener("dragover", (e) => e.preventDefault());
+document.addEventListener("drop", (e) => {
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if (f) f.text().then(load);
+});
+
+/* ---------- colour ---------- */
+
+// Damage runs to hundreds while every bonus is single digits, so a linear ramp would paint the
+// whole grid one colour. Signed log keeps small terms legible next to a -300 tile.
+const slog = (v) => Math.sign(v) * Math.log1p(Math.abs(v));
+
+function ramp(value, min, max) {
+  if (value === 0 || !isFinite(value)) return "";
+  const v = slog(value);
+  if (v > 0) {
+    const t = max > 0 ? Math.min(1, v / slog(max)) : 0;
+    return `rgba(53,196,106,${0.18 + 0.72 * t})`;
+  }
+  const t = min < 0 ? Math.min(1, v / slog(min)) : 0;
+  return `rgba(229,72,77,${0.18 + 0.72 * t})`;
+}
+
+/* ---------- render ---------- */
+
+function fmt(v) {
+  if (v === null || v === undefined) return "–";
+  if (typeof v !== "number") return String(v);
+  return Number.isInteger(v) ? String(v) : v.toFixed(2).replace(/\.?0+$/, "");
+}
+
+function rowsByKey(rec) {
+  const map = new Map();
+  for (const row of rec.tiles) map.set(row[0] + "," + row[1], row);
+  return map;
+}
+
+/* ---------- mob identity ---------- */
+
+// Short codes and colours per mob kind, so a four-mob board reads at a glance instead of
+// resolving four near-identical red boxes.
+const MOB_STYLE = {
+  "Jal-Zek":       { tag: "ZEK", label: "mager",   colour: "#a77bff" },
+  "Jal-Xil":       { tag: "XIL", label: "ranger",  colour: "#3fc57a" },
+  "Jal-ImKot":     { tag: "KOT", label: "meleer",  colour: "#3b82f6" },
+  "Jal-Ak":        { tag: "AK",  label: "blob",    colour: "#ff9f43" },
+  "Jal-MejRah":    { tag: "RAH", label: "bat",     colour: "#ff6fc7" },
+  "Jal-Nib":       { tag: "NIB", label: "nibbler", colour: "#8b97a5" },
+  "Jal-AkRek-Ket": { tag: "ket", label: "bloblet", colour: "#ffd24a" },
+  "Jal-AkRek-Mej": { tag: "mej", label: "bloblet", colour: "#ffd24a" },
+  "Jal-AkRek-Xil": { tag: "xil", label: "bloblet", colour: "#ffd24a" },
+  "JalTok-Jad":    { tag: "JAD", label: "jad",     colour: "#e5484d" },
+  "TzKal-Zuk":     { tag: "ZUK", label: "zuk",     colour: "#c2410c" },
+  "Yt-HurKot":     { tag: "HUR", label: "healer",  colour: "#22d3ee" },
+};
+const styleFor = (name) => MOB_STYLE[name] || { tag: name.slice(0, 3).toUpperCase(), label: name, colour: "#ff5c5c" };
+
+// The grid is fixed 34px cells with a 1px gap, so a footprint box is pure arithmetic off the
+// same bounds the cells use. Footprints run east and NORTH from `location` - the engine's
+// convention, and the reason the top edge is y - size + 1 rather than y.
+const PITCH = 35;
+function footprintBox(x, y, size) {
+  return {
+    left: (x - bounds.minX) * PITCH,
+    top: (y - size + 1 - bounds.minY) * PITCH,
+    width: size * PITCH - 1,
+    height: size * PITCH - 1,
+  };
+}
+
+function renderOverlay(rec) {
+  const boxes = [];
+
+  for (const p of DEFAULT_PILLARS) {
+    if (!pillarOn[p.key]) continue;
+    // Hitpoints only if this run actually recorded that pillar - older dumps have none, and a
+    // made-up 255 would read as "intact" on a pillar that might have been chewed to nothing.
+    const live = (rec.pillars || []).find((q) => q.x === p.x && q.y === p.y);
+    const b = footprintBox(p.x, p.y, PILLAR_SIZE);
+    const dead = live && typeof live.hp === "number" && live.hp <= 0;
+    boxes.push(
+      `<div class="fp pillar${dead ? " dead" : ""}" style="left:${b.left}px;top:${b.top}px;width:${b.width}px;height:${b.height}px">` +
+        `${p.key.toUpperCase()}<small>${live ? `${live.hp} hp` : "pillar"}</small></div>`,
+    );
+  }
+
+  for (const m of rec.mobs || []) {
+    const s = styleFor(m.name);
+    const b = footprintBox(m.x, m.y, m.size || 1);
+    const dying = m.dying > -1;
+    boxes.push(
+      `<div class="fp mob${dying ? " dying" : ""}${m.hasLOS ? " los" : ""}" ` +
+        `style="left:${b.left}px;top:${b.top}px;width:${b.width}px;height:${b.height}px;` +
+        `border-color:${s.colour};background:${s.colour}33;color:${s.colour}">` +
+        `${s.tag}<small>${m.hp ?? "?"} hp</small></div>`,
+    );
+  }
+
+  $("overlay").innerHTML = boxes.join("");
+
+  const kinds = [...new Set((rec.mobs || []).map((m) => m.name))];
+  $("mobLegend").innerHTML = kinds
+    .map((name) => {
+      const s = styleFor(name);
+      return `<span><span class="swatch" style="background:${s.colour}55;border:1px solid ${s.colour}"></span> ${s.tag} ${s.label}</span>`;
+    })
+    .join("");
+}
+
+function render() {
+  const rec = records[index];
+  const prev = index > 0 ? records[index - 1] : null;
+  const col = rec.columns.indexOf(colourBy);
+
+  $("rTick").textContent = rec.tick;
+  $("rWave").textContent = rec.wave;
+  $("rHp").textContent = rec.hp;
+  $("rPlayer").textContent = `${rec.player.x},${rec.player.y}`;
+  $("rChosen").textContent = rec.chosenTile ? `${rec.chosenTile.x},${rec.chosenTile.y}` : "none";
+  $("slider").value = String(index);
+  $("first").disabled = $("prev").disabled = index === 0;
+  $("last").disabled = $("next").disabled = index === records.length - 1;
+
+  const map = rowsByKey(rec);
+
+  let min = 0, max = 0, nonZero = 0;
+  for (const row of rec.tiles) {
+    const v = row[col];
+    if (typeof v !== "number") continue;
+    if (v < min) min = v;
+    if (v > max) max = v;
+    if (v !== 0) nonZero++;
+  }
+  const drawn = (bounds.maxX - bounds.minX + 1) * (bounds.maxY - bounds.minY + 1);
+  $("gridNote").textContent =
+    `· ${rec.tiles.length} candidates, ${drawn - rec.tiles.length} blocked · ` +
+    `${colourBy} ${fmt(min)}…${fmt(max)} · ${nonZero} non-zero, ${rec.tiles.length - nonZero} scored zero`;
+
+  const width = bounds.maxX - bounds.minX + 1;
+  const grid = $("grid");
+  grid.style.gridTemplateColumns = `repeat(${width}, 34px)`;
+
+  const cells = [];
+  for (let y = bounds.minY; y <= bounds.maxY; y++) {
+    for (let x = bounds.minX; x <= bounds.maxX; x++) {
+      const key = x + "," + y;
+      const row = map.get(key);
+      const classes = ["cell"];
+      let style = "", label = "";
+      if (!row) {
+        classes.push("void");
+      } else if (row[col] === 0) {
+        // Scored zero, and saying so. A blank cell here read as "no data" for the whole
+        // session it took to notice the difference.
+        classes.push("zero");
+        label = "0";
+      } else {
+        const v = row[col];
+        style = `background:${ramp(v, min, max)};color:${Math.abs(slog(v)) > slog(max) * 0.55 || v < 0 ? "#fff" : "#c8d2dd"}`;
+        label = fmt(v);
+      }
+      if (rec.player.x === x && rec.player.y === y) classes.push("player");
+      if (rec.chosenTile && rec.chosenTile.x === x && rec.chosenTile.y === y) classes.push("chosen");
+      if (selected && selected.x === x && selected.y === y) classes.push("sel");
+      cells.push(
+        `<div class="${classes.join(" ")}" style="${style}" data-x="${x}" data-y="${y}" title="${key}">${label}</div>`,
+      );
+    }
+  }
+  grid.innerHTML = cells.join("");
+  renderOverlay(rec);
+
+  renderParts(rec, prev);
+  renderMobs(rec, prev);
+  renderTimeline(col);
+}
+
+function renderParts(rec, prev) {
+  const body = $("parts").querySelector("tbody");
+  if (!selected) {
+    $("selCoord").textContent = "— click a tile";
+    body.innerHTML = "";
+    return;
+  }
+  $("selCoord").textContent = `${selected.x},${selected.y}`;
+  const key = selected.x + "," + selected.y;
+  const row = rowsByKey(rec).get(key);
+  const was = prev ? rowsByKey(prev).get(key) : null;
+
+  if (!row) {
+    body.innerHTML = `<tr><td colspan="4" class="readout">not a candidate on this tick</td></tr>`;
+    return;
+  }
+
+  const rows = [`<tr><th>term</th><th class="num">value</th><th class="num">Δ prev</th></tr>`];
+  rec.columns.forEach((name, i) => {
+    if (name === "x" || name === "y") return;
+    const v = row[i];
+    const p = was ? was[i] : null;
+    const delta = typeof v === "number" && typeof p === "number" ? v - p : null;
+    const changed = delta !== null && Math.abs(delta) > 1e-9;
+    const arrow = !changed ? "" : `<span class="${delta > 0 ? "up" : "down"}">${delta > 0 ? "+" : ""}${fmt(delta)}</span>`;
+    rows.push(
+      `<tr class="${changed ? "changed" : ""}"><td>${name}</td><td class="num">${fmt(v)}</td><td class="num">${arrow}</td></tr>`,
+    );
+  });
+  body.innerHTML = rows.join("");
+}
+
+function renderMobs(rec, prev) {
+  const body = $("mobs").querySelector("tbody");
+  const before = new Map((prev?.mobs || []).map((m) => [m.name + m.hp, m]));
+  const rows = [`<tr><th>mob</th><th>at</th><th class="num">hp</th><th>los</th><th class="num">delay</th></tr>`];
+  for (const m of rec.mobs || []) {
+    // Matching on name alone is enough here: the dumps that matter have one of each kind.
+    const was = (prev?.mobs || []).find((o) => o.name === m.name);
+    const moved = was && (was.x !== m.x || was.y !== m.y);
+    rows.push(
+      `<tr class="${moved ? "changed" : ""}"><td>${m.name}</td><td>${m.x},${m.y}${moved ? ` <span class="up">←${was.x},${was.y}</span>` : ""}</td>` +
+        `<td class="num">${m.hp ?? "–"}</td><td>${m.hasLOS ? "yes" : "no"}</td><td class="num">${m.attackDelay}</td></tr>`,
+    );
+  }
+  body.innerHTML = rows.join("");
+}
+
+function renderTimeline(col) {
+  $("tlTerm").textContent = colourBy;
+  const strip = $("timeline");
+  let hotTicks = 0;
+  strip.innerHTML = records
+    .map((rec, i) => {
+      const count = rec.tiles.filter((r) => typeof r[col] === "number" && r[col] !== 0).length;
+      if (count) hotTicks++;
+      const height = count ? 8 + Math.round(36 * Math.min(1, count / rec.tiles.length)) : 3;
+      return `<div class="${count ? "hot" : ""} ${i === index ? "now" : ""}" style="height:${height}px" data-i="${i}" title="t${rec.tick}: ${count} tiles"></div>`;
+    })
+    .join("");
+  $("tlSummary").textContent = hotTicks
+    ? `${hotTicks} of ${records.length} ticks have at least one non-zero ${colourBy}`
+    : `${colourBy} is zero on every tile of every tick in this file`;
+}
+
+/* ---------- interaction ---------- */
+
+$("grid").addEventListener("click", (e) => {
+  const cell = e.target.closest(".cell");
+  if (!cell || cell.classList.contains("void")) return;
+  selected = { x: +cell.dataset.x, y: +cell.dataset.y };
+  render();
+});
+
+$("timeline").addEventListener("click", (e) => {
+  const bar = e.target.closest("div[data-i]");
+  if (bar) { index = +bar.dataset.i; render(); }
+});
+
+const go = (i) => { index = Math.max(0, Math.min(records.length - 1, i)); render(); };
+$("first").onclick = () => go(0);
+$("prev").onclick = () => go(index - 1);
+$("next").onclick = () => go(index + 1);
+$("last").onclick = () => go(records.length - 1);
+$("slider").oninput = (e) => go(+e.target.value);
+
+$("play").onclick = () => {
+  if (timer) { clearInterval(timer); timer = null; $("play").textContent = "▶"; return; }
+  $("play").textContent = "❚❚";
+  timer = setInterval(() => {
+    if (index >= records.length - 1) { clearInterval(timer); timer = null; $("play").textContent = "▶"; return; }
+    go(index + 1);
+  }, 600);
+};
+
+COLS_EL.onchange = (e) => { colourBy = e.target.value; render(); };
+
+// Toggling a pillar changes the drawn extent, so the bounds have to be rebuilt before the
+// redraw or the new footprint would be positioned against the old origin.
+for (const [id, key] of [["pSouth", "south"], ["pWest", "west"], ["pNorth", "north"]]) {
+  $(id).addEventListener("change", (e) => {
+    pillarOn[key] = e.target.checked;
+    recomputeBounds();
+    if (records.length) render();
+  });
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if (e.key === "ArrowLeft") { go(index - 1); e.preventDefault(); }
+  if (e.key === "ArrowRight") { go(index + 1); e.preventDefault(); }
+  if (e.key === " ") { $("play").click(); e.preventDefault(); }
+});
+</script>
+</body>
+</html>
