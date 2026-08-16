@@ -370,37 +370,90 @@ function overlaps(
 }
 
 /**
- * Can this mob stand with its corner here?
+ * The tiles a mob sweeps into when it steps, copied from Mob.getXMovementTiles and
+ * getYMovementTiles.
  *
- * A mob's footprint runs east and north from `location`, matching the tiles
- * Mob.getXMovementTiles/getYMovementTiles walk over.
+ * Not the destination footprint - the LEADING EDGE of it. Moving east, that is the single
+ * column at `x + size`; moving west, the column at `x - 1`; south, the row at `y + 1`; north,
+ * the row at `y - size`. A diagonal step sweeps both, and each is one tile longer, because the
+ * corner tile has to be clear too (`start`/`end` in the engine's loops).
  *
- * Two separate obstacles, exactly as the engine has it. Walls and pillars come from
- * canTileBePathedTo; other mobs are checked against the simulated positions rather than the
- * live ones, which is the whole point - a projection that used real mob positions would let
- * the whole stack walk through itself.
+ * The distinction is the whole of the overlapping-mobs bug. Everything already inside the
+ * footprint is, by definition, something the mob is already standing in - the engine never
+ * re-tests it, so a mob that begins overlapped can still walk.
  */
-function canOccupy(
+function sweptTiles(
+  mob: SimMob,
+  xOff: number,
+  yOff: number,
+): { x: number; y: number }[] {
+  const tiles: { x: number; y: number }[] = [];
+
+  if (xOff !== 0) {
+    const column = xOff === 1 ? mob.x + mob.size : mob.x - 1;
+    const start = yOff === -1 ? -1 : 0;
+    const end = yOff === 1 ? mob.size + 1 : mob.size;
+    for (let i = start; i < end; i++) {
+      tiles.push({ x: column, y: mob.y - i });
+    }
+  }
+
+  if (yOff !== 0) {
+    const row = yOff === -1 ? mob.y + 1 : mob.y - mob.size;
+    const start = xOff === -1 ? -1 : 0;
+    const end = xOff === 1 ? mob.size + 1 : mob.size;
+    for (let i = start; i < end; i++) {
+      tiles.push({ x: mob.x + i, y: row });
+    }
+  }
+
+  return tiles;
+}
+
+/**
+ * Can this mob step to this destination?
+ *
+ * Judged the way `Mob.movementStep` judges it: every tile the step SWEEPS INTO must be clear,
+ * each tested at size 1, for walls and for other mobs alike. It is not a test of the
+ * destination footprint, and the difference is not academic.
+ *
+ * Measured: a bat spawning inside a mager's 4x4 froze the mager for the whole projection.
+ * Every direction it could step still overlapped the bat somewhere inside the destination
+ * footprint, so the old footprint test refused all of them - while the engine, checking only
+ * the row being swept into, let it walk. The scorer then priced a board with two paralysed
+ * attackers: tiles quoting damage 0 and threats 3 that were really 138 and 6, the bot walked
+ * onto one, and died there. Any two overlapping mobs did this to each other - bloblet stacks,
+ * spawn clusters, anything jammed against something big.
+ *
+ * Mobs are checked against the SIMULATED positions rather than the live ones, which is the
+ * whole point - a projection reading real positions would let the stack walk through itself.
+ *
+ * Exported only so the geometry can be pinned by a test. The sign convention below is the
+ * kind of thing a tidy-up "fixes" - see `trajectoryBlocking.test.ts`, which fails if it is.
+ */
+export function canOccupy(
   snapshot: ArenaSnapshot,
   mob: SimMob,
   x: number,
   y: number,
   all: SimMob[],
 ): boolean {
-  for (let i = 0; i < mob.size; i++) {
-    for (let j = 0; j < mob.size; j++) {
-      if (!snapshot.canStandAt(x + i, y - j)) {
+  // The engine's two offsets do not share a sign convention - `movementStep` computes
+  // `xOff = dx - location.x` but `yOff = location.y - dy`, so yOff is POSITIVE going north.
+  // Getting that backwards swaps the row being tested for the one on the opposite side.
+  const tiles = sweptTiles(mob, Math.sign(x - mob.x), Math.sign(mob.y - y));
+
+  for (const tile of tiles) {
+    if (!snapshot.canStandAt(tile.x, tile.y)) {
+      return false;
+    }
+    for (const other of all) {
+      if (other === mob || !other.blocks) {
+        continue;
+      }
+      if (overlaps(tile.x, tile.y, 1, other.x, other.y, other.size)) {
         return false;
       }
-    }
-  }
-
-  for (const other of all) {
-    if (other === mob || !other.blocks) {
-      continue;
-    }
-    if (overlaps(x, y, mob.size, other.x, other.y, other.size)) {
-      return false;
     }
   }
   return true;

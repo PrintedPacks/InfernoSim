@@ -55,6 +55,16 @@ export function observeNibblers(region: Region) {
 }
 
 export interface NibblerThreat {
+  /**
+   * The live mob, so a caller that has to CLICK one is choosing from the same pool that
+   * decides where to stand.
+   *
+   * Two nibblers can share a tile - they do not consume space - so position is not an
+   * identity and matching a threat back to its mob by coordinates is ambiguous. Carrying the
+   * reference is the only way the positioning and targeting lanes can be talking about the
+   * same nibbler and be sure of it.
+   */
+  mob: Mob;
   x: number;
   y: number;
   size: number;
@@ -83,25 +93,36 @@ export function nibblerThreats(region: Region): NibblerThreat[] {
     if (mob.mobName() !== EntityNames.JAL_NIB || mob.dying > -1) {
       continue;
     }
-    // First visible tick: it has not visibly turned yet, so we do not know its pillar.
-    if (!seenBefore.has(mob)) {
-      continue;
-    }
-    const target = mob.aggro?.location;
-    if (!target) {
-      continue;
-    }
+    // The PILLAR is withheld on the first visible tick - a real nibbler has not visibly turned
+    // to it yet, so we are not allowed to know it - but the NIBBLER is always listed.
+    //
+    // Dropping the whole entry was a bug, and not only for pillar scoring: this list is what
+    // the targeting lane picks from, so a nibbler that had just spawned was not merely
+    // unpriced, it was unclickable. On a nearly-empty board a bat could win a target that a
+    // nibbler should have taken outright.
+    //
+    // Unknown pillar therefore means MAXIMALLY URGENT rather than absent. Conservative in the
+    // right direction: it over-prices the wall for exactly one tick, where omitting it
+    // under-priced the wall completely.
+    const target = seenBefore.has(mob) ? mob.aggro?.location : undefined;
 
     // Nibblers have attack range 1, so they close until adjacent. They move a tile a tick.
-    const distance = Math.max(
-      Math.abs(target.x - mob.location.x),
-      Math.abs(target.y - mob.location.y),
-    );
+    const ticksToReach = target
+      ? Math.max(
+          0,
+          Math.max(
+            Math.abs(target.x - mob.location.x),
+            Math.abs(target.y - mob.location.y),
+          ) - 1,
+        )
+      : 0;
+
     threats.push({
+      mob,
       x: mob.location.x,
       y: mob.location.y,
       size: mob.size,
-      ticksToReach: Math.max(0, distance - 1),
+      ticksToReach,
       frozen: Math.max(0, (mob as unknown as { frozen?: number }).frozen ?? 0),
     });
   }

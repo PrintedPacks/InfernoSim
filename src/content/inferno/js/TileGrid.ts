@@ -29,6 +29,15 @@ class GridTile extends TileMarker {
 
   private shade = COLOUR_FLAT;
   private label = "";
+  /**
+   * The tile the movement layer picked, tracked separately from the shade.
+   *
+   * Not derived from the colour, because the colour cannot express it: `shadeFor` checks the
+   * player's tile FIRST, so a decision to hold position paints white and the yellow is lost
+   * exactly when the bot is doing something deliberate. Carried as its own flag, the outline
+   * below draws on the chosen tile whether or not we are standing on it.
+   */
+  private chosen = false;
 
   constructor(region: Region, location: Location) {
     // saveable = false. Saveable markers are pushed onto TileMarker.saveableMarkers and
@@ -36,11 +45,12 @@ class GridTile extends TileMarker {
     super(region, location, COLOUR_FLAT, 1, false);
   }
 
-  place(x: number, y: number, shade: string, label: string) {
+  place(x: number, y: number, shade: string, label: string, chosen: boolean) {
     this.location.x = x;
     this.location.y = y;
     this.shade = shade;
     this.label = label;
+    this.chosen = chosen;
     this.candidate = true;
   }
 
@@ -82,7 +92,36 @@ class GridTile extends TileMarker {
     screenPosition: Location,
     context: OffscreenCanvasRenderingContext2D,
   ) {
-    if (!this.candidate || !this.label) {
+    if (!this.candidate) {
+      return;
+    }
+
+    // Outlined here rather than shaded in the 3d scene because the scene cannot make it stand
+    // out. Every marker is a flat square on the same plane as the floor and its neighbours, so
+    // the chosen one z-fights exactly like the other 440 and a colour swap barely registers.
+    // The UI layer draws after the scene and cannot be occluded by any of it.
+    if (this.chosen) {
+      const corners = GridTile.projectTileCorners(this.location.x, this.location.y);
+      if (corners) {
+        context.save();
+        context.beginPath();
+        context.moveTo(corners[0].x, corners[0].y);
+        for (const corner of corners.slice(1)) {
+          context.lineTo(corner.x, corner.y);
+        }
+        context.closePath();
+        // Black underneath so the outline survives a bright tile as well as a dark one.
+        context.lineWidth = 5;
+        context.strokeStyle = "#000000";
+        context.stroke();
+        context.lineWidth = 2.5;
+        context.strokeStyle = COLOUR_CHOSEN;
+        context.stroke();
+        context.restore();
+      }
+    }
+
+    if (!this.label) {
       return;
     }
     const at = GridTile.projectTileCentre(this.location.x, this.location.y) ?? screenPosition;
@@ -97,6 +136,36 @@ class GridTile extends TileMarker {
     context.fillStyle = this.shade;
     context.fillText(this.label, at.x, at.y);
     context.restore();
+  }
+
+  /**
+   * The tile's four corners in screen space, in draw order.
+   *
+   * Same projection and same height as the centre - see `projectTileCentre` for why the
+   * renderer's own offset cannot be used - but the square runs from `location` east and south
+   * in world terms, matching how TileMarkerModel builds it: local x in [0, size], z in
+   * [-size, 0].
+   */
+  private static projectTileCorners(
+    x: number,
+    y: number,
+  ): { x: number; y: number }[] | null {
+    const delegate = Viewport.viewport?.getDelegate() as unknown as {
+      projectToScreen?: (v: THREE.Vector3) => { x: number; y: number };
+    };
+    if (!delegate?.projectToScreen) {
+      return null;
+    }
+    try {
+      return [
+        [x, y],
+        [x + 1, y],
+        [x + 1, y - 1],
+        [x, y - 1],
+      ].map(([cx, cy]) => delegate.projectToScreen!(new THREE.Vector3(cx, -0.49, cy)));
+    } catch (e) {
+      return null;
+    }
   }
 
   /** Screen position of a tile's centre, matching where TileMarkerModel puts its square. */
@@ -173,6 +242,7 @@ export class TileGrid {
         tile.y,
         TileGrid.shadeFor(tile, score, low, range, player, chosen),
         TileGrid.labelFor(score),
+        !!chosen && tile.x === chosen.x && tile.y === chosen.y,
       );
     }
     for (let index = count; index < TileGrid.tiles.length; index++) {

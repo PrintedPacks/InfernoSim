@@ -8,11 +8,11 @@ import { applyAttackPlan } from "./AttackPlanner";
 import { equipSet, GearSetName, isWearing, requiredSetFor, weaponForSet } from "./GearSets";
 import { hasIceBarrageSelected, selectedSpell, selectIceBarrage } from "./SpellCaster";
 import { isAttackable } from "./AttackPlanner";
-import { bestMove, ScoredTile, scoreCandidates, waveHomeTile } from "./TileScorer";
+import { bestMove, focusNibbler, ScoredTile, scoreCandidates, waveHomeTile } from "./TileScorer";
 import { hasDyingBlob } from "./Trajectory";
 import { ArenaSnapshot } from "./ArenaSnapshot";
 import { chooseByPriority, chooseJadWaveTarget, chooseZukWaveTarget, killPriority } from "./KillPriority";
-import { observeNibblers } from "./PillarDefence";
+import { nibblerThreats, observeNibblers } from "./PillarDefence";
 import { attackOptionFor, chooseTarget } from "./TargetPlanner";
 import { visibleMobs } from "./Visibility";
 
@@ -420,6 +420,42 @@ export class InfernoAutomation {
    * centres, because the centre has to be a real mob and an already-frozen one may still sit in
    * the best position to cover the others.
    */
+  /**
+   * The one nibbler answer, shared by the ice cast and the ordinary attack so the two can
+   * never disagree about which one matters.
+   *
+   * Freeze is read FIRST, and that ordering is the whole point:
+   *
+   *  - ANYTHING FROZEN -> `focusNibbler`, the same selector the tile score positions for. It
+   *    takes the most urgent LOOSE nibbler while any is loose, and falls back to the whole
+   *    pool once everything is held. So on a part-frozen board the lane we walk for and the
+   *    lane we shoot at are the same nibbler by construction, not by coincidence.
+   *  - NOTHING FROZEN -> `bestBarrageNibbler`, the best-covered 3x3 centre. With nothing
+   *    neutralised the blast catching two or three is worth more than urgency ordering.
+   *
+   * Why coverage cannot decide the all-frozen board: `bestBarrageNibbler` counts only
+   * UNFROZEN nibblers, so with the whole pack held every candidate scores zero coverage, they
+   * all tie, and the tie-break silently becomes distance from the PLAYER - which is the wrong
+   * question entirely. Nothing is moving; the only thing that ranks them is how close each
+   * already sits to its pillar, which is exactly what `ticksToReach` measures.
+   *
+   * The seam that remains, stated so nobody claims more than is true: with NO nibbler frozen,
+   * positioning still takes the most urgent and this takes the best-covered, so they can name
+   * different nibblers. Both are usually inside barrage range of the chosen tile so the cast
+   * still lands, but it is the original three-mechanism bug in miniature and it is the first
+   * thing to look at if the bot ever walks for one nibbler and casts at another.
+   */
+  private static nibblerTarget(region: Region, player: Player): Mob | null {
+    const threats = nibblerThreats(region);
+    if (threats.length === 0) {
+      return null;
+    }
+    if (threats.some((threat) => threat.frozen > 0)) {
+      return focusNibbler(threats)?.mob ?? null;
+    }
+    return InfernoAutomation.bestBarrageNibbler(region, player);
+  }
+
   private static bestBarrageNibbler(region: Region, player: Player): Mob | null {
     const nibblers = visibleMobs(region).filter(
       (mob) => mob.mobName() === EntityNames.JAL_NIB && mob.dying <= -1,
@@ -1236,7 +1272,7 @@ ${spellLine}`);
     // without casting" behaviour. Setting aggro and holding lets the engine decide when it can
     // cast: Player.attackIfPossible() checks hasLOS and attackDelay itself.
     if (hasIceBarrageSelected(player)) {
-      const nibbler = InfernoAutomation.bestBarrageNibbler(region, player);
+      const nibbler = InfernoAutomation.nibblerTarget(region, player);
       if (nibbler) {
         if (player.aggro !== nibbler) {
           player.setAggro(nibbler);
@@ -1474,9 +1510,21 @@ ${spellLine}`);
         const jadWave = visibleMobs(region).some(
           (mob) => mob.dying === -1 && mob.mobName() === EntityNames.JAL_TOK_JAD,
         );
-        intended = jadWave
-          ? chooseJadWaveTarget(region, player)
-          : chooseByPriority(region, player, InfernoAutomation.target);
+        // Nibblers are taken AHEAD of the priority table, and not because they outrank it -
+        // JAL_NIB is already 10, the top of it. It is `chooseByPriority`'s stickiness that has
+        // to be defeated: equal priority is never a reason to switch, so a FROZEN nibbler
+        // already held as the target keeps focus while a loose one walks into a pillar. Asking
+        // `nibblerTarget` first means the freeze-aware pick wins, and it is the same pick the
+        // ice cast makes - one answer, two consumers.
+        //
+        // Not on Jad waves: the tag-and-turn owns targeting entirely there, and nibblers do
+        // not spawn on them anyway.
+        const nibbler = jadWave ? null : InfernoAutomation.nibblerTarget(region, player);
+        intended =
+          nibbler ??
+          (jadWave
+            ? chooseJadWaveTarget(region, player)
+            : chooseByPriority(region, player, InfernoAutomation.target));
       }
 
       if (!intended) {
