@@ -67,6 +67,8 @@ import {
 } from "osrs-sdk";
 import { filter, indexOf, map } from "lodash";
 
+import { InfernoRuneCrossbow } from "./InfernoRuneCrossbow";
+
 export class InfernoLoadout {
   wave: number;
   loadoutType: string;
@@ -160,6 +162,36 @@ export class InfernoLoadout {
         new BastionPotion(),
       ],
     };
+  }
+
+  /**
+   * The speedrunner set with a rune crossbow where the twisted bow was.
+   *
+   * Everything else is `loadoutMaxTbowSpeedrunner`'s and stays that way by derivation: same
+   * armour, same chins, same blowpipe, same potions, so a sweep against the tbow loadout is
+   * measuring the weapon and nothing else.
+   *
+   * Two things do have to move with it:
+   *
+   *   Ammo.    A crossbow fires the ammo slot, so Diamond bolts (e) replace the Dragon arrows.
+   *            That is safe to do here and NOT in the shared loadout because the engine only
+   *            counts ammo bonuses when the worn weapon's `compatibleAmmo()` lists them: the
+   *            blowpipe declares none (its darts are built in), so its damage is untouched,
+   *            while the twisted bow declares Dragon arrows and WOULD have been gutted. Hence
+   *            a separate loadout rather than a bolt swap on the existing one.
+   *   Offhand. The rune crossbow is one-handed, so the Crystal Shield stays on underneath it
+   *            instead of being knocked off the way a bow knocks it off. Nothing here does
+   *            that - `getLoadout`'s wave-67 swap already checks `isTwoHander`, and
+   *            `gearSetItems` puts the shield back on with the crossbow mid-fight.
+   */
+  loadoutMaxRcbSpeedrunner(): UnitOptions {
+    // Widened to UnitOptions before the swaps: the speedrunner literal's inferred inventory type
+    // is a union of exactly the classes it lists, which no other item can be assigned into.
+    const loadout = this.loadoutMaxTbowSpeedrunner() as UnitOptions;
+    loadout.equipment.ammo = new DiamondBoltsE();
+    loadout.inventory[this.findItemByName(loadout.inventory, ItemName.TWISTED_BOW)] =
+      new InfernoRuneCrossbow();
+    return loadout;
   }
 
   loadoutMaxTbow() {
@@ -493,6 +525,9 @@ export class InfernoLoadout {
     switch (this.loadoutType) {
       case "max_tbow_speed":
         loadout = this.loadoutMaxTbowSpeedrunner();
+        break;
+      case "max_rcb_speed":
+        loadout = this.loadoutMaxRcbSpeedrunner();
         break;
       case "max_tbow":
         loadout = this.loadoutMaxTbow();

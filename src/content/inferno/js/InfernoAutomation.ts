@@ -3,7 +3,7 @@
 import { Player, Region, Location, Mob, Chrome, ControlPanelController, EntityNames, MapController, Random, Settings } from "osrs-sdk";
 
 import { AutomationOverlay, ClickStep } from "./AutomationOverlay";
-import { applyPrayerPlan, incomingThreats } from "./PrayerPlanner";
+import { applyPrayerPlan, incomingThreats, knownAttackStyle, prayerForAttackStyle } from "./PrayerPlanner";
 import { applyAttackPlan } from "./AttackPlanner";
 import { equipSet, GearSetName, isWearing, requiredSetFor, weaponForSet } from "./GearSets";
 import { hasIceBarrageSelected, selectedSpell, selectIceBarrage } from "./SpellCaster";
@@ -631,42 +631,18 @@ export class InfernoAutomation {
         : mobs.reduce((best, mob) => (dist(mob) < dist(best) ? mob : best));
 
     /**
-     * Would attacking `candidate` RIGHT NOW sync its attack cycle with an ALREADY-tagged
-     * shield attacker's, forever?
-     *
-     * The engine's flinch rule sets `attackDelay = max(current, flinchDelay+1)` the instant a
-     * hit changes a mob's aggro (`Unit.processIncomingAttacks`), and flinchDelay = 2 for
-     * mager, ranger AND Jad alike (mager/ranger via `floor(attackSpeed/2)` on their shared
-     * attackSpeed 4; Jad via its own override, despite an attackSpeed of 8) - so the floor is
-     * 3 for all three. The mod-4 test below is correct for Jad too, not just for mager-vs-
-     * ranger: Jad's attackSpeed (8) is an exact multiple of theirs (4), so Jad's future attack
-     * ticks (delay, delay+8, delay+16, ...) all land on the SAME residue mod 4 as its first -
-     * meaning "same residue as an already-tagged mager/ranger" still means "collides on every
-     * future attack", just one-directional (Jad hits every one of their cycles; they still
-     * get every OTHER cycle free of Jad). A hit on an ALREADY-tagged mob does not re-trigger
-     * the floor, so a collision, once landed, cannot be corrected afterward. Checked against
-     * EVERY already-tagged attacker, not just one designated partner: with two pairs
-     * overlapping, a fresh tag can collide with either pair's already-established mob, not
-     * only its own pair-mate. Jad is included in the checked set alongside mager/ranger, not
-     * just checked FROM Jad's own side (step 4) - a fresh mager/ranger tag (step 1) has to
-     * avoid an already-tagged Jad exactly as much as an already-tagged mager/ranger has to be
-     * avoided when tagging Jad. Without this half, a late second pair spawning after Jad was
-     * already tagged (Zuk dipping back under 480 un-pauses the spawn timer) could still land
-     * on Jad's residue with nothing to stop it.
+     * The overhead a mob needs blocked. Two mobs wanting the SAME one may share a fire tick
+     * freely - one prayer covers both - which is the whole point of the rule below.
      */
-    const collisionTracked = jad ? [...shieldAttackers, jad] : shieldAttackers;
+    const overheadFor = (mob: Mob): string | null =>
+      prayerForAttackStyle(knownAttackStyle(mob) ?? "");
 
     /**
-     * Ticks from THIS decision until our hit actually lands on `candidate` - read from the
-     * real weapon (`attackOptionFor` gives the set, `weaponForSet` the real `Weapon`,
-     * `Weapon.calculateHitDelay(distance)` the engine's own formula: blowpipe
-     * `floor(distance/6)+1`, bow `floor((3+distance)/6)+1`) plus two fixed ticks, both
-     * measured against the engine rather than assumed: `Projectile` itself adds 1 whenever
-     * `from.isPlayer` (always us), and a further 1 for the input-queue gap between `decide()`
-     * choosing a target and the click actually landing (the same latency the gear-switch
-     * queue has, `InputController.queueAction` - see `waveRun.test.ts`'s header comment).
-     * Verified directly: a decision-to-observed-tag gap of 5 ticks, where the weapon formula
-     * alone predicted 4 - the missing tick was exactly this one.
+     * Roughly when our tag lands: the weapon cannot fire before its own cooldown ends (clicking
+     * only sets aggro; the engine fires at `player.attackStep` once `attackDelay` hits zero),
+     * then the shot flies. Floored at 1 for the input-queue tick, plus 1 for the `isPlayer` bump
+     * `Projectile` adds. An estimate, not a guarantee - see the rule below for why that is now
+     * survivable.
      */
     const ticksUntilLanding = (candidate: Mob): number => {
       const option = attackOptionFor(region, player, candidate);
@@ -674,38 +650,88 @@ export class InfernoAutomation {
         ? (weaponForSet(player, option.set) as { calculateHitDelay?(distance: number): number } | null)
         : null;
       const hitDelay = weapon?.calculateHitDelay?.(dist(candidate)) ?? 1;
-      return hitDelay + 1 + 1; // isPlayer bump + input-queue tick, both explained above
+      const cooldown = (player as unknown as { attackDelay?: number }).attackDelay ?? 0;
+      return hitDelay + 1 + Math.max(1, cooldown);
     };
 
     /**
-     * Real absolute tick numbers, both sides read at the SAME instant (this call), not
-     * relative-delay snapshots compared across two different moments - three rounds of that (a
-     * wrong floor constant, a missed same-tick decrement, a stale established-side read) each
-     * fixed one bug and left another, because every relative reading silently assumed "read
-     * now" means "the same now" as whatever it was compared against, and across a multi-tick
-     * decision-to-landing gap it never was. A fourth round tried tracking each mob's observed
-     * fire tick across calls and hit a subtler version of the same mistake: `decide()` does not
-     * run every world tick (confirmed: `InfernoAutomation.tickCount` itself never skips, but
-     * `decideZukTarget` is not reached on every tick it's called from), so "the first tick I
-     * happened to observe this mob tagged" is not reliably the actual tagging tick, and seeding
-     * a fixed `+2` from an ARBITRARY observation tick produced the same bug in a new shape.
-     *
-     * The fix needs no history at all. `other.attackDelay`, read RIGHT NOW on an already-tagged
-     * mob, already IS "real ticks until its next fire" - that is what the field means, honestly,
-     * for a mob past its flinch (nothing re-floors it after the first tag). So
-     * `InfernoAutomation.tickCount + other.attackDelay` is that mob's real next fire tick,
-     * computed fresh, no tracking, no seeding, no staleness possible because both sides of
-     * every comparison below are read in this same call, at this same tick.
+     * The tick floor a tag applies, read from the engine rather than hardcoded:
+     * `Unit.processIncomingAttacks` runs `if (attackDelay < flinchDelay + 1) attackDelay =
+     * flinchDelay + 1`. Mager and ranger get 3 from `floor(attackSpeed / 2)` on their shared
+     * speed 4; Jad overrides `flinchDelay` to 2 despite speed 8, so also 3.
      */
-    const collidesIfTaggedNow = (candidate: Mob): boolean => {
-      const candidateFireTick = InfernoAutomation.tickCount + ticksUntilLanding(candidate) + 2;
-      for (const other of collisionTracked) {
+    const flinchFloor = (mob: Mob): number =>
+      ((mob as unknown as { flinchDelay?: number }).flinchDelay ??
+        Math.floor((mob.attackSpeed ?? 4) / 2)) + 1;
+
+    /**
+     * The tick this mob will fire on if we tag it now - modelling BOTH flinch outcomes.
+     *
+     * The floor is conditional, and that is the half the previous version got wrong: it assumed
+     * every tag re-phases, so it always predicted `landing + 3`. A tag landing while the mob
+     * still has 3 or 4 ticks on its clock changes nothing about its cycle, and the fire tick is
+     * then `landing + whatever the clock reads`, not `landing + 3`. Predicting the wrong branch
+     * is a whole residue wrong.
+     *
+     * A delay at or below zero means the mob is not cycling - inside its spawn delay
+     * (`Mob.attackStep` returns early while `age > 0`, but `Unit.attackStep` has already
+     * decremented, so it counts negative), or stalled with nothing to shoot. Those always take
+     * the floor.
+     */
+    const fireTickIfTaggedNow = (candidate: Mob): number => {
+      const speed = candidate.attackSpeed ?? 4;
+      const now = (candidate as unknown as { attackDelay?: number }).attackDelay ?? 0;
+      const travel = ticksUntilLanding(candidate);
+      const landing = InfernoAutomation.tickCount + travel;
+      const floor = flinchFloor(candidate);
+      // Not cycling: the floor is certain.
+      if (now <= 0) {
+        return landing + floor;
+      }
+      // Cycling: walk the clock forward to the landing tick. Phrased over 1..speed rather than
+      // 0..speed-1 because attackDelay resets TO attackSpeed on the tick it fires.
+      const delayAtLanding = ((((now - 1 - travel) % speed) + speed) % speed) + 1;
+      return landing + (delayAtLanding < floor ? floor : delayAtLanding);
+    };
+
+    /**
+     * Would tagging this mob now put it on the same fire tick as an already-tagged mob that
+     * needs a DIFFERENT overhead?
+     *
+     * STYLE, NOT COUNT, is the constraint. Only one overhead can be up, so two attackers sharing
+     * a tick is only a problem when they want different ones: `planOverheads` then protects the
+     * bigger max hit and eats the other. Mager and mager on one tick is free - a single Protect
+     * from Magic blocks both - and measured, that is most of what happens: a run with three
+     * magers stacked on one residue took ZERO damage from any of them, while a single ranger
+     * sharing a mager's tick did every point of mob damage in the run.
+     *
+     * So capacity is not "4 residues for 4 attackers". It is two styles needing disjoint
+     * residues, and any number of each fits as long as no residue holds both.
+     *
+     * WHY DEFERRING CAN ACTUALLY WORK HERE. The set interval is 350 ticks and 350 mod 4 = 2,
+     * while the mager/ranger spawn offset is 9 - 7 = 2 as well. Both are 2 mod 4, so with
+     * untouched phases set N+1's ranger inherits set N's MAGER residue and vice versa - every
+     * consecutive pair of sets cross-collides, structurally, and simply preserving phase
+     * guarantees the thing we are trying to avoid. The flinch is the only lever that breaks that,
+     * and it is available: waiting a tick moves both the landing tick and the mob's own clock, so
+     * the predicted fire tick sweeps through residues until one is free of the opposite style.
+     */
+    const collidesWithOppositeStyle = (candidate: Mob): boolean => {
+      const candidatePrayer = overheadFor(candidate);
+      if (!candidatePrayer) {
+        return false;
+      }
+      const fireTick = fireTickIfTaggedNow(candidate);
+      for (const other of shieldAttackers) {
         if (other === candidate || !isTagged(other)) {
           continue;
         }
+        if (overheadFor(other) === candidatePrayer) {
+          continue; // same prayer covers both - they may line up freely
+        }
         const otherDelay = (other as unknown as { attackDelay?: number }).attackDelay ?? 0;
         const otherFireTick = InfernoAutomation.tickCount + otherDelay;
-        if ((((candidateFireTick - otherFireTick) % 4) + 4) % 4 === 0) {
+        if ((((fireTick - otherFireTick) % 4) + 4) % 4 === 0) {
           return true;
         }
       }
@@ -726,12 +752,12 @@ export class InfernoAutomation {
     }
     const forced = InfernoAutomation.zukPairForceTarget;
     if (forced) {
-      if (!collidesIfTaggedNow(forced) && attackOptionFor(region, player, forced) !== null) {
+      if (!collidesWithOppositeStyle(forced) && attackOptionFor(region, player, forced) !== null) {
         return forced;
       }
-      // Either the collision guard held this tick, or it is not reachable yet - either way,
-      // fall through rather than idle: a safe attack on whatever else applies is better than
-      // nothing, and re-arming next tick re-evaluates with fresh delay values.
+      // Either this tick would line the tag up against the opposite style, or it is not
+      // reachable yet - fall through rather than idle, and next tick re-evaluates with every
+      // delay moved on by one.
     }
 
     // --- 2. Rangers, fully committed once tagged - nearest tagged one. ---
@@ -754,7 +780,7 @@ export class InfernoAutomation {
     // No pairing partner of its own, so no "arm and wait" state needed: if this tick would
     // collide, skip to the fallback and retry next tick once the established delays have
     // moved on, exactly like step 1 falling through. ---
-    if (jad && jad.aggro !== player && !collidesIfTaggedNow(jad)) {
+    if (jad && jad.aggro !== player) {
       return jad;
     }
 

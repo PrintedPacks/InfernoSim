@@ -17,7 +17,8 @@ import { clickInventoryItem, findInventoryItem, InventoryClickReporter } from ".
  *   range <-> mage      4-5 clicks
  *
  * Both bows are two-handed, so equipping one removes the Kodai Wand and the Crystal Shield
- * together; going back to mage has to put both back.
+ * together; going back to mage has to put both back. A rune crossbow is one-handed and so
+ * does neither - see `gearSetItems`, which is where the difference is absorbed.
  */
 
 // Use ItemName rather than string literals. Hand-written names silently do not match -
@@ -38,28 +39,83 @@ const RANGE_ARMOUR = [
   ItemName.NECKLACE_OF_ANGUISH,
 ];
 
-export const TBOW_SET = [ItemName.TWISTED_BOW, ...RANGE_ARMOUR];
 export const BLOWPIPE_SET = [ItemName.TOXIC_BLOWPIPE, ...RANGE_ARMOUR];
+
+/**
+ * The heavy ranged weapon a loadout might carry, in preference order.
+ *
+ * Same list and same order as `InfernoLoadout.getLoadout`'s wave-67 swap, deliberately: the
+ * weapon that swap puts in the player's hand for the boss waves is the one this set has to be
+ * able to equip. The "tbow" set is therefore the loadout's BIG BOW, whatever that happens to
+ * be - a twisted bow, a bowfa, or a rune crossbow - not the twisted bow specifically. The set
+ * keeps its name because it is the name every log line, comment and caller already uses.
+ */
+const HEAVY_RANGED_WEAPONS: string[] = [
+  ItemName.TWISTED_BOW,
+  ItemName.BOWFA,
+  ItemName.RUNE_CROSSBOW,
+];
 
 export type GearSetName = "mage" | "tbow" | "blowpipe";
 
-export const GEAR_SETS: Record<GearSetName, string[]> = {
-  mage: MAGE_SET,
-  tbow: TBOW_SET,
-  blowpipe: BLOWPIPE_SET,
-};
+/** An equipment item as far as this module cares: a name, and whether it eats the offhand. */
+type WeaponItem = { itemName?: string; isTwoHander?: boolean } | null;
+
+/** Worn, or in the inventory, or nothing - the two places a carried item can be. */
+function carriedItem(player: Player, itemName: string): WeaponItem {
+  const worn = player.equipment?.weapon as WeaponItem;
+  if (worn?.itemName === itemName) {
+    return worn;
+  }
+  const index = findInventoryItem(player, itemName);
+  return index >= 0 ? (player.inventory[index] as WeaponItem) : null;
+}
 
 /**
- * The weapon each set fights with.
+ * The heavy ranged weapon this loadout actually carries.
  *
- * Named rather than taken as "the first entry of the set", so the ordering of those arrays stays
- * a presentational detail instead of load-bearing.
+ * Resolved from the player rather than hardcoded so a crossbow loadout is a loadout change and
+ * nothing else. A loadout carrying none of them resolves to null, and every consumer below
+ * degrades the same way it always did for a loadout without a big bow: no fallback reach, and
+ * a "tbow" set that is trivially already worn.
  */
-export const WEAPON_FOR_SET: Record<GearSetName, string> = {
-  mage: ItemName.KODAI_WAND,
-  tbow: ItemName.TWISTED_BOW,
-  blowpipe: ItemName.TOXIC_BLOWPIPE,
-};
+export function heavyRangedWeapon(player: Player): WeaponItem {
+  for (const itemName of HEAVY_RANGED_WEAPONS) {
+    const item = carriedItem(player, itemName);
+    if (item) {
+      return item;
+    }
+  }
+  return null;
+}
+
+/**
+ * The items a set is made of, for THIS player.
+ *
+ * Only the "tbow" set varies, and it varies twice. The weapon is whichever heavy bow the
+ * loadout carries, and a ONE-HANDED one (the rune crossbow) leaves the offhand slot free, so
+ * the Crystal Shield goes back on with it - the two-handed bows knock it off by equipping at
+ * all, which is the only reason the set never had to mention it.
+ *
+ * The shield is listed AFTER the weapon and that ordering is load-bearing: coming off the
+ * blowpipe, the two-hander has to be replaced before the offhand can be filled. Anything
+ * already worn is not in the inventory and is skipped, so both halves stay self-correcting.
+ */
+export function gearSetItems(player: Player, set: GearSetName): string[] {
+  if (set === "mage") {
+    return MAGE_SET;
+  }
+  if (set === "blowpipe") {
+    return BLOWPIPE_SET;
+  }
+  const heavy = heavyRangedWeapon(player);
+  if (!heavy?.itemName) {
+    return RANGE_ARMOUR;
+  }
+  return heavy.isTwoHander === false
+    ? [heavy.itemName, ItemName.CRYSTAL_SHIELD, ...RANGE_ARMOUR]
+    : [heavy.itemName, ...RANGE_ARMOUR];
+}
 
 /**
  * The set's weapon, whether it is currently worn or still sitting in the inventory.
@@ -69,13 +125,10 @@ export const WEAPON_FOR_SET: Record<GearSetName, string> = {
  * depend on which target won - a loop that oscillates rather than settling.
  */
 export function weaponForSet(player: Player, set: GearSetName): unknown {
-  const itemName = WEAPON_FOR_SET[set];
-  const worn = player.equipment?.weapon as { itemName?: string } | null | undefined;
-  if (worn?.itemName === itemName) {
-    return worn;
+  if (set === "tbow") {
+    return heavyRangedWeapon(player);
   }
-  const index = findInventoryItem(player, itemName);
-  return index >= 0 ? player.inventory[index] : null;
+  return carriedItem(player, set === "mage" ? ItemName.KODAI_WAND : ItemName.TOXIC_BLOWPIPE);
 }
 
 /**
@@ -108,7 +161,7 @@ export function requiredSetFor(mob: Mob): GearSetName {
 
 /** True when every item of the set is already worn (none of them are in the inventory). */
 export function isWearing(player: Player, set: GearSetName): boolean {
-  return GEAR_SETS[set].every((itemName) => findInventoryItem(player, itemName) < 0);
+  return gearSetItems(player, set).every((itemName) => findInventoryItem(player, itemName) < 0);
 }
 
 /**
@@ -126,7 +179,7 @@ export function equipSet(
   report?: InventoryClickReporter,
 ): string[] {
   const clicked: string[] = [];
-  for (const itemName of GEAR_SETS[set]) {
+  for (const itemName of gearSetItems(player, set)) {
     const index = findInventoryItem(player, itemName);
     if (index < 0) {
       continue; // already worn

@@ -9,6 +9,8 @@
     "test": "jest",
     "test:harness": "jest --config jest.harness.config.js",
     "test:sweep": "node test/harness/sweep.js",
+    "test:zuk": "jest --config jest.zuk.config.js",
+    "test:zuk-sweep": "node test/harness/zukSweep.js",
     "lint": "eslint . --ext .ts --fix",
     "prettier": "prettier --write ."
   },
@@ -38,6 +40,7 @@
   },
   "dependencies": {
     "osrs-sdk": "0.1.4",
+    "osrscachereader": "^1.1.3",
     "three": "^0.163.0"
   }
 }

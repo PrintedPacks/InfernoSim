@@ -4,7 +4,7 @@ import { EntityNames, Location, Mob, Player, Region } from "osrs-sdk";
 
 import { ArenaSnapshot, snapshotPlayerCanSeeMob } from "./ArenaSnapshot";
 import { planOverheads } from "./OverheadPlanner";
-import { BARRAGE_RANGE, NibblerThreat, nibblerThreats } from "./PillarDefence";
+import { BARRAGE_RANGE, nibblerAt, NibblerThreat, nibblerThreats } from "./PillarDefence";
 import { attackReachFor, attackReachForName } from "./TargetPlanner";
 import {
   mobSeesPlayer,
@@ -45,7 +45,10 @@ import { visibleMobs } from "./Visibility";
  * inside the arena, walkable, reachable, and the walk to it does not enter the coin-flip melee
  * zone - see `routeEntersForbiddenZone`.
  *
- * `barrageReach` is 1 if a barrage thrown from this tile reaches the nibbler that matters.
+ * `barrageReach` is BARRAGE_REACH_BONUS if a barrage thrown from this tile reaches the nibbler
+ * that matters - not where it stands now, but where it will be standing on the tick the shot can
+ * actually be taken: the later of arriving here and the weapon coming off cooldown, plus a step
+ * of lead. See `barrageReach`, which is the only term in this file that simulates its target.
  *
  * `blobletReach` is BLOBLET_REACH_BONUS if a barrage from this tile reaches ANY bloblet - the
  * same shape as `barrageReach` with the focus pick dropped, since the three land together and
@@ -231,33 +234,79 @@ export function focusNibbler(threats: NibblerThreat[]): NibblerThreat | null {
 }
 
 /**
- * BARRAGE_REACH_BONUS if a barrage from the end of this route reaches the focus nibbler, zero
- * otherwise.
+ * BARRAGE_REACH_BONUS if a barrage from the end of this route reaches the focus nibbler ON THE
+ * TICK THE SHOT ACTUALLY HAPPENS, zero otherwise.
  *
  * Judged from where the route ENDS. Reach is the same test the engine uses for a player clicking
  * a mob - `snapshotPlayerCanSeeMob` - at the barrage's range of 10.
+ *
+ * The tick is the whole change. This used to ask whether the tile reaches the nibbler where it
+ * stands RIGHT NOW, which is a question about a shot nobody is taking: the nibbler is walking,
+ * and by the time we have got to the tile and the weapon is off cooldown it is somewhere else.
+ * Scored that way the bot shadows the nibbler a step at a time, re-deciding every tick, always
+ * positioned for the shot it could have taken a tick ago.
+ *
+ * So the shot is placed on a clock, and both halves of it are things we already know:
+ *
+ *  - THE WALK. `arrivalTicks`, the route's length at PLAYER_TILES_PER_TICK. Zero for holding
+ *    position. Walking is not attacking - a reposition clears aggro (`moveTo` interrupts
+ *    combat) and the automation attacks only on ticks it is not repositioning - so no shot
+ *    exists before this.
+ *  - THE COOLDOWN. `player.attackDelay`, the weapon's own countdown from the last shot, floored
+ *    at zero because it keeps counting past it while nothing is being fought.
+ *
+ * Whichever is LATER is when the barrage leaves, so a far tile is judged further into the
+ * nibbler's walk than a near one, and a tile chosen while the weapon is mid-cooldown is judged
+ * at the tick the cooldown ends rather than now. That is what turns a step-at-a-time shadow into
+ * a move to somewhere the shot can be taken FROM.
+ *
+ * Then NIBBLER_LEAD_TICKS on top - see there. Nothing here is a prediction of the nibbler's
+ * choices: it has none, its aggro is a pillar and it walks straight at it.
  */
 function barrageReach(
   snapshot: ArenaSnapshot,
   focus: NibblerThreat | null,
+  cooldownTicks: number,
   route: Location[],
 ): number {
   if (!focus) {
     return 0;
   }
   const destination = route[route.length - 1];
+  const arrivalTicks = Math.ceil((route.length - 1) / PLAYER_TILES_PER_TICK);
+  const shotTick = Math.max(arrivalTicks, cooldownTicks) + NIBBLER_LEAD_TICKS;
+  const at = nibblerAt(focus, shotTick);
   return snapshotPlayerCanSeeMob(
     snapshot,
     destination.x,
     destination.y,
-    focus.x,
-    focus.y,
+    at.x,
+    at.y,
     focus.size,
     BARRAGE_RANGE,
   )
     ? BARRAGE_REACH_BONUS
     : 0;
 }
+
+/**
+ * How far PAST the shot tick the nibbler is simulated, so the tile stays ahead of its move.
+ *
+ * One. The shot tick is the earliest tick the barrage can leave, not a guarantee it leaves
+ * exactly then: a click can slip a tick, the walk can be a tile longer than the route says once
+ * the engine's own pathing has its say, and the automation has other work competing for the same
+ * tick. Judging the tile at the earliest possible tick therefore picks tiles the nibbler is
+ * about to walk out of - the edge of range is exactly where "reaches" and "just missed" are one
+ * tile apart.
+ *
+ * Simulating one step further asks for a tile that still reaches after the nibbler's next step,
+ * so the answer is stable across the tick it is cashed on rather than true only at the instant
+ * it was computed. It costs nothing on a nibbler that is frozen or already adjacent to its
+ * pillar - both are capped by `nibblerAt` - so this only bites while one is actually walking.
+ *
+ * Set to 0 to judge at the shot tick exactly.
+ */
+export const NIBBLER_LEAD_TICKS = 1;
 
 /**
  * What reaching the focus nibbler is worth.
@@ -1193,6 +1242,8 @@ function scoreRoute(
   snapshot: ArenaSnapshot,
   mobs: SimMob[],
   focus: NibblerThreat | null,
+  /** Ticks until the weapon is off cooldown - see `barrageReach`, its only consumer. */
+  cooldownTicks: number,
   bloblets: ReachTarget[],
   healer: ReachTarget | null,
   home: Location | null,
@@ -1499,7 +1550,7 @@ function scoreRoute(
   const losBonus = npcReachSoon > 0 ? LOS_BONUS / Math.max(1, watchers.size) : 0;
 
   const parts: ScoreParts = {
-    barrageReach: barrageReach(snapshot, focus, route),
+    barrageReach: barrageReach(snapshot, focus, cooldownTicks, route),
     // The bloblet pull: the nibbler rule with the focus pick dropped, since one blast is meant
     // for the whole landing trio. Zero whenever no blob has died, so it costs nothing elsewhere.
     blobletReach: blobletReach(snapshot, bloblets, route),
@@ -1550,7 +1601,7 @@ function scoreRoute(
       parts.losBonus +
       parts.safeSpot +
       parts.homePull +
-      parts.shieldPenalty +
+      parts.shieldPenalty +
       parts.healerAoePenalty -
       parts.damageTaken,
     parts,
@@ -1602,6 +1653,11 @@ export function scoreCandidates(
     isInsideArena(x, y) && snapshot.canStandAt(x, y),
   );
   const focus = focusNibbler(nibblerThreats(region));
+  // Ticks until the weapon is off cooldown, which is half of when the barrage at that focus
+  // really leaves - see `barrageReach`. Floored at zero: `attackDelay` keeps counting DOWN past
+  // zero while nothing is being fought, so a bot that has been walking for ten ticks reads -10,
+  // and a negative would pull the shot tick backwards into the past.
+  const cooldownTicks = Math.max(0, player.attackDelay ?? 0);
   // The Jad-wave analogue of the focus nibbler: null on every other wave, so this costs
   // nothing outside 67+.
   const healer = focusHealer(region, player);
@@ -1663,6 +1719,7 @@ export function scoreCandidates(
       snapshot,
       mobs,
       focus,
+      cooldownTicks,
       bloblets,
       healer,
       home,

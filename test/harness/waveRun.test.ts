@@ -154,6 +154,7 @@ const DUMP_COLUMNS = [
 // select to "" and InfernoLoadout.getLoadout() would return nothing.
 const VALID_LOADOUTS = [
   "max_tbow_speed",
+  "max_rcb_speed",
   "max_tbow",
   "max_fbow",
   "budget_fbow",

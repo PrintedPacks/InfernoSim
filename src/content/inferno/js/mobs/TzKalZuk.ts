@@ -60,7 +60,7 @@ class ZukProjectile extends Projectile {
 }
 
 export class TzKalZuk extends Mob {
-  shield: ZukShield;
+  shield: ZukShield | null;
   enraged = false;
 
   setTimer = 72;
@@ -124,9 +124,9 @@ export class TzKalZuk extends Mob {
       if (this.setTimer === 0) {
         this.setTimer = 350;
 
-        const mager = new JalZek(this.region, { x: 20, y: 21 }, { aggro: this.shield, spawnDelay: 7 });
+        const mager = new JalZek(this.region, { x: 20, y: 21 }, { aggro: this.shield ?? this.aggro, spawnDelay: 7 });
         this.region.addMob(mager);
-        const ranger = new JalXil(this.region, { x: 29, y: 21 }, { aggro: this.shield, spawnDelay: 9 });
+        const ranger = new JalXil(this.region, { x: 29, y: 21 }, { aggro: this.shield ?? this.aggro, spawnDelay: 9 });
         this.region.addMob(ranger);
       }
     }
@@ -150,7 +150,7 @@ export class TzKalZuk extends Mob {
           this.region,
           { x: 24, y: 25 },
           {
-            aggro: this.shield,
+            aggro: this.shield ?? this.aggro,
             attackSpeed: 8,
             stun: 1,
             healers: 3,
@@ -196,13 +196,31 @@ export class TzKalZuk extends Mob {
     if (!this.aggro || this.aggro.dying >= 0) {
       return false;
     }
-    let shieldOrPlayer: Unit = this.shield;
-
-    if (this.aggro.location.x < this.shield.location.x || this.aggro.location.x >= this.shield.location.x + 5) {
-      shieldOrPlayer = this.aggro as Unit;
+    // THE SHIELD IS DESTRUCTIBLE, so this reference has to be dropped the moment it dies.
+    //
+    // `ZukShield.dead()` removes it from the region, but nothing used to clear this field - so it
+    // lingered at whatever tile it expired on, and the geometry below kept treating that tile as
+    // cover. Zuk then fired at a mob no longer in `region.mobs`, whose `processIncomingAttacks`
+    // therefore never ran, so the damage was applied to nothing at all. Losing the shield became
+    // permanent free immunity instead of the death sentence it is: measured, 570 shieldless ticks
+    // in which roughly 40 Zuk attacks landed exactly 2 hits, the player parked in the phantom band.
+    //
+    // Checked against the region rather than trusting a callback to reach us, because the removal
+    // is a DelayedAction and this is the only place that has to notice it.
+    if (this.shield && (this.shield.dying !== -1 || this.region.mobs.indexOf(this.shield) === -1)) {
+      this.shield = null;
     }
-    if (this.aggro.location.y > 16) {
-      shieldOrPlayer = this.aggro as Unit;
+
+    // No shield left means no cover left: every attack from here on is aimed at the player.
+    let shieldOrPlayer: Unit = this.aggro as Unit;
+    if (this.shield) {
+      shieldOrPlayer = this.shield;
+      if (this.aggro.location.x < this.shield.location.x || this.aggro.location.x >= this.shield.location.x + 5) {
+        shieldOrPlayer = this.aggro as Unit;
+      }
+      if (this.aggro.location.y > 16) {
+        shieldOrPlayer = this.aggro as Unit;
+      }
     }
     this.weapons["typeless"].attack(this, shieldOrPlayer, {
       attackStyle: "typeless",

@@ -15,6 +15,11 @@
 module.exports = {
   testEnvironment: "jsdom",
   testMatch: ["<rootDir>/test/harness/**/*.test.ts"],
+  // The Zuk harness lives beside these but is NOT part of the baseline command: it is a
+  // separate, much longer question with its own runner (jest.zuk.config.js). Without this,
+  // `npm run test:harness` - and every seed of `npm run test:sweep`, which shells out to this
+  // same config - would silently start fighting Zuk as well.
+  testPathIgnorePatterns: ["<rootDir>/test/harness/zukRun\\.test\\.ts$"],
   // Shims must exist before osrs-sdk's import-time singletons construct their canvases.
   setupFiles: ["<rootDir>/test/harness/browserShims.js"],
   transform: {

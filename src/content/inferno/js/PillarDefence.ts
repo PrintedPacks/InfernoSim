@@ -1,6 +1,6 @@
 "use strict";
 
-import { EntityNames, Mob, Region } from "osrs-sdk";
+import { EntityNames, Location, Mob, Region } from "osrs-sdk";
 
 import { ArenaSnapshot, snapshotPlayerCanSeeMob } from "./ArenaSnapshot";
 import { visibleMobs } from "./Visibility";
@@ -45,6 +45,30 @@ const NIBBLER_ATTACK_SPEED = 4;
  */
 const seenBefore = new WeakSet<Mob>();
 
+/**
+ * Chebyshev distance from a tile to the nearest tile of a footprint - zero if it is inside one.
+ *
+ * A pillar is 3x3 and `location` is one CORNER of it, so measuring to that tile is measuring to
+ * a 1x1 pillar that does not exist. The engine's own convention, from `LocationUtils.
+ * closestPointTo` and every draw call in InfernoPillar: the footprint runs EAST and NORTH of
+ * `location`, x over [x, x+size-1] and y over [y-size+1, y].
+ *
+ * Getting this wrong was worth up to two whole ticks, and always in the same direction, because
+ * `location` is the south-west corner: a nibbler biting the NORTH or EAST face of a pillar read
+ * as two or three ticks of walking still to do while it was already chewing.
+ */
+export function distanceToFootprint(
+  x: number,
+  y: number,
+  originX: number,
+  originY: number,
+  size: number,
+): number {
+  const nearestX = Math.min(Math.max(x, originX), originX + size - 1);
+  const nearestY = Math.min(Math.max(y, originY - size + 1), originY);
+  return Math.max(Math.abs(x - nearestX), Math.abs(y - nearestY));
+}
+
 /** Call once per tick, before anything asks about pillar targets. */
 export function observeNibblers(region: Region) {
   for (const mob of visibleMobs(region)) {
@@ -68,10 +92,59 @@ export interface NibblerThreat {
   x: number;
   y: number;
   size: number;
+  /**
+   * The tile it is walking at, or null while its pillar is still being withheld.
+   *
+   * Carried purely so the nibbler can be SIMMED - `nibblerAt` needs a direction, and a
+   * direction is the one thing position and `ticksToReach` between them do not give you.
+   * Null is not a special case anywhere: an unknown pillar already means `ticksToReach` 0,
+   * which caps the projection at zero steps, so such a nibbler simply stands still.
+   */
+  pillar: Location | null;
   /** Ticks of walking before it is adjacent to its pillar and can start biting. */
   ticksToReach: number;
   /** Ticks of freeze left. Zero means loose and already walking. */
   frozen: number;
+}
+
+/**
+ * Where this nibbler will be standing in `ticks` ticks.
+ *
+ * The same model `ticksToReach` already encodes, run forwards instead of counted: one tile a
+ * tick towards the pillar, diagonals included, and it stops the moment it is adjacent. Written
+ * as one expression per axis rather than a loop, which is the same thing for a straight-line
+ * chase and cheaper when 441 tile scores each ask for it.
+ *
+ * Two things bound the walk, and both are the numbers the threat already carries:
+ *
+ *  - FREEZE. A frozen nibbler is not walking, so the first `frozen` ticks buy no steps at all.
+ *    Past that it walks normally, which is what makes a long freeze read as a nibbler that is
+ *    still where you left it rather than one that has vanished from the problem.
+ *  - ARRIVAL. It stops at `ticksToReach`, because that is the definition of that number - the
+ *    walk before it is adjacent and starts biting. Projecting past it would march the nibbler
+ *    into and through its own pillar.
+ *
+ * Deliberately NOT routed around anything. Nibblers do not consume space (`consumesSpace`
+ * returns null) so nothing blocks them but the map, and the arena between a nibbler's spawn and
+ * its pillar is open. This matches `stepMob`'s greedy sign-per-axis chase for the same reason:
+ * the engine does not pathfind here either.
+ */
+export function nibblerAt(threat: NibblerThreat, ticks: number): { x: number; y: number } {
+  const pillar = threat.pillar;
+  if (!pillar) {
+    return { x: threat.x, y: threat.y };
+  }
+  const steps = Math.min(threat.ticksToReach, Math.max(0, ticks - threat.frozen));
+  if (steps <= 0) {
+    return { x: threat.x, y: threat.y };
+  }
+
+  const dx = pillar.x - threat.x;
+  const dy = pillar.y - threat.y;
+  return {
+    x: threat.x + Math.sign(dx) * Math.min(steps, Math.abs(dx)),
+    y: threat.y + Math.sign(dy) * Math.min(steps, Math.abs(dy)),
+  };
 }
 
 /**
@@ -104,15 +177,27 @@ export function nibblerThreats(region: Region): NibblerThreat[] {
     // Unknown pillar therefore means MAXIMALLY URGENT rather than absent. Conservative in the
     // right direction: it over-prices the wall for exactly one tick, where omitting it
     // under-priced the wall completely.
-    const target = seenBefore.has(mob) ? mob.aggro?.location : undefined;
+    const pillar = seenBefore.has(mob) ? mob.aggro : undefined;
+    const target = pillar?.location;
 
     // Nibblers have attack range 1, so they close until adjacent. They move a tile a tick.
+    //
+    // Measured to the pillar's FOOTPRINT, not to its `location` corner - see
+    // `distanceToFootprint`. This is not merely a tidier number: it is the cap `nibblerAt`
+    // projects against, and against the corner that cap let a nibbler already pressed to the
+    // north face be walked two more steps, which put it INSIDE the pillar. Nothing on the grid
+    // has line of sight to a tile inside a pillar, so `barrageReach` came back zero from every
+    // one of the 441 candidates and the bot was never pulled towards it at all - the nibbler ate
+    // that pillar unopposed.
     const ticksToReach = target
       ? Math.max(
           0,
-          Math.max(
-            Math.abs(target.x - mob.location.x),
-            Math.abs(target.y - mob.location.y),
+          distanceToFootprint(
+            mob.location.x,
+            mob.location.y,
+            target.x,
+            target.y,
+            pillar?.size ?? 1,
           ) - 1,
         )
       : 0;
@@ -122,6 +207,7 @@ export function nibblerThreats(region: Region): NibblerThreat[] {
       x: mob.location.x,
       y: mob.location.y,
       size: mob.size,
+      pillar: target ? { x: target.x, y: target.y } : null,
       ticksToReach,
       frozen: Math.max(0, (mob as unknown as { frozen?: number }).frozen ?? 0),
     });
