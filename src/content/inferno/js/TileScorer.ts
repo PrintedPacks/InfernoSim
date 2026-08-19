@@ -3,6 +3,7 @@
 import { EntityNames, Location, Mob, Player, Region } from "osrs-sdk";
 
 import { ArenaSnapshot, snapshotPlayerCanSeeMob } from "./ArenaSnapshot";
+import { weaponForSet } from "./GearSets";
 import { planOverheads } from "./OverheadPlanner";
 import { BARRAGE_RANGE, nibblerAt, NibblerThreat, nibblerThreats } from "./PillarDefence";
 import { attackReachFor, attackReachForName } from "./TargetPlanner";
@@ -17,7 +18,10 @@ import {
   snapshotMobs,
   withinMeleeRange,
 } from "./Trajectory";
+import { PlayerAttackClock } from "./PlayerAttackClock";
 import { visibleMobs } from "./Visibility";
+import { ZukAttackClock } from "./ZukAttackClock";
+import { ZukSetTimer } from "./ZukSetTimer";
 
 /**
  * Where the bot should be standing.
@@ -26,10 +30,14 @@ import { visibleMobs } from "./Visibility";
  * number attached to each one. The debug grid draws the exact same list this chooses from, so
  * what you see on screen is the decision's real input rather than a reconstruction of it.
  *
+ * WAVE 69 USES NONE OF IT. That wave is being rebuilt from the ground up and gets
+ * `scoreZukTiles` instead - one term, the shield - reached by an early return in
+ * `scoreCandidates`. Everything below describes waves 1 to 68.
+ *
  * The terms, in hitpoints over a twelve tick horizon except where noted:
  *
  *     score = barrageReach + blobletReach + healerReach + npcReachSoon + quietTicks + losBonus
- *             + safeSpot + homePull + healerAoePenalty - damageTaken
+ *             + safeSpot + homePull - damageTaken
  *
  * `quietTicks` applies ONLY to tiles `safeSpot` has already accepted, and is zero everywhere
  * else - the loud version of that bonus. On a safespot it is QUIET_TICK_BONUS per tick of the
@@ -443,14 +451,17 @@ function focusHealer(region: Region, player: Player): ReachTarget | null {
  * threat-generation loop's line-of-sight-and-range test never fires for it - so without this,
  * the tile scorer has no idea the 251 exists at all, on any tile.
  */
+const ZUK_SHIELD_WIDTH = 5;
+const ZUK_SHIELD_COVER_MAX_Y = 16;
+/** ZukShield.movementStep bounces the instant x leaves these - see `bounceIsClose`. */
 const ZUK_SHIELD_MIN_X = 11;
 const ZUK_SHIELD_MAX_X = 35;
-const ZUK_SHIELD_WIDTH = 5;
+/** ZukShield.freeze(5) on a bounce, which projectShieldX has to replay to stay in step. */
 const ZUK_SHIELD_BOUNCE_FREEZE = 5;
-const ZUK_SHIELD_COVER_MAX_Y = 16;
 
-interface ShieldState {
+export interface ShieldState {
   x: number;
+  /** ZukShield.movementDirection: true is east (x++), false is west. */
   direction: boolean;
   frozen: number;
 }
@@ -471,13 +482,17 @@ function findShield(region: Region): ShieldState | null {
 }
 
 /**
- * Where the shield's x will be `ticks` from now - a straight replay of `ZukShield.movementStep`,
- * in the same order the engine runs it: movementStep decides whether to move (and freezes +
- * flips on a bounce) BEFORE attackStep's unconditional `this.frozen--` runs later that same
- * tick, so the check has to happen against the pre-decrement value and the decrement has to
- * happen after - reversing that order shifts every bounce by a tick.
+ * The shield as it will be `ticks` from now - a straight replay of `ZukShield.movementStep`, in
+ * the same order the engine runs it: movementStep decides whether to move (and freezes + flips on
+ * a bounce) BEFORE attackStep's unconditional `this.frozen--` runs later that same tick, so the
+ * check has to happen against the pre-decrement value and the decrement has to happen after -
+ * reversing that order shifts every bounce by a tick.
+ *
+ * The whole state comes back, not just x. Which way it is heading and whether it is mid-bounce
+ * are as time-dependent as its position, and every consumer here is asking about the deadline
+ * rather than about now.
  */
-function projectShieldX(shield: ShieldState, ticks: number): number {
+export function projectShield(shield: ShieldState, ticks: number): ShieldState {
   let x = shield.x;
   let direction = shield.direction;
   let frozen = shield.frozen;
@@ -491,72 +506,97 @@ function projectShieldX(shield: ShieldState, ticks: number): number {
     }
     frozen--;
   }
-  return x;
+  return { x, direction, frozen };
+}
+
+/**
+ * The x the bot aims for inside the band - the leading face, pulled SHIELD_LEAD_INSET tiles in.
+ *
+ * This is the whole of the wave's positioning. The band is `x` to `x + 4` and it steps one tile
+ * per tick, so where you stand inside it decides how many ticks of cover you have banked: on the
+ * trailing face you are uncovered by the shield's very next step, on the leading face you have
+ * four. Standing "under the shield" is not the goal - staying on the side it is moving towards
+ * is, and everything else about this wave's movement falls out of that one number.
+ *
+ * Correct through a bounce for free. `ZukShield.movementStep` freezes for 5 ticks AND flips
+ * `movementDirection` in the same breath when it hits x < 11 or x > 35, so during the freeze the
+ * direction already points the new way - and the leading face this returns is the one the shield
+ * is about to move towards, which is exactly where the bot should already be walking.
+ */
+function leadAnchorX(shield: ShieldState): number {
+  return shield.direction ? shield.x + ZUK_SHIELD_WIDTH - 1 : shield.x;
+}
+
+/**
+ * The face the shield is moving AWAY from - the opposite end of the band to leadAnchorX.
+ *
+ * The one tile of the five that the shield's very next step uncovers.
+ */
+function trailAnchorX(shield: ShieldState): number {
+  return shield.direction ? shield.x : shield.x + ZUK_SHIELD_WIDTH - 1;
+}
+
+/**
+ * Is the shield about to turn round?
+ *
+ * `ZukShield.movementStep` bounces the tick x leaves 11..35, so heading east the last stride is
+ * from 35 and heading west from 11. Symmetric at both walls because the shield's own rule is.
+ */
+function bounceIsClose(shield: ShieldState): boolean {
+  const tilesLeft = shield.direction
+    ? ZUK_SHIELD_MAX_X - shield.x
+    : shield.x - ZUK_SHIELD_MIN_X;
+  return tilesLeft < SHIELD_BOUNCE_PREP_TILES;
 }
 
 /** TzKalZuk.attack()'s own coverage test, unchanged. */
-function isCoveredByShield(px: number, py: number, shieldX: number): boolean {
+export function isCoveredByShield(px: number, py: number, shieldX: number): boolean {
   return px >= shieldX && px < shieldX + ZUK_SHIELD_WIDTH && py <= ZUK_SHIELD_COVER_MAX_Y;
 }
 
 /**
- * Whether this route ends somewhere the shield will not be covering - a SCORE PENALTY, not a
- * candidate filter, and the difference is the whole fix.
+ * The entire wave-69 score, and deliberately the only one.
  *
- * The first version of this dropped a failing tile from the candidate list outright, exactly
- * like the melee-zone veto, WITH the same "route length 1 is always exempt" escape hatch. That
- * was wrong for this specific case, and it is what actually killed the bot: the shield is a
- * MOVING target, so standing still is never durably safe the way it is near a static melee
- * zone - a tile covered when it was chosen can be abandoned by the shield a few ticks later
- * with the player never having moved. Exempting hold-position from the check meant nothing
- * was ever telling the bot "the shield left you behind, walk back" - it just sat there,
- * uncovered, until Zuk's next attack landed. Measured: parked at 11,14 while the shield's
- * frozen bounce ended and it resumed east, uncovering that tile by roughly five more ticks of
- * drift, dead at the next attack.
+ * Everything else the tile scorer knows how to price - reach, safe spots, quiet ticks, blob
+ * steering, the damage simulation - is switched off on this wave. Wave 69 is being rebuilt from
+ * the ground up and this is rung one: is the tile behind the shield, yes or no.
  *
- * The fix is not "stop exempting hold position" on its own - `bestMove` requires the player's
- * own tile to appear in `scored` or it returns null and the ENTIRE 441-tile search is skipped,
- * so simply excluding a failing hold-position candidate would make the bot give up looking for
- * a way back rather than find one. So every route, hold included, is scored normally and this
- * failure is priced as ZUK_SHIELD_UNCOVERED_PENALTY instead of removed - large enough that a
- * covered alternative always wins the comparison outright, small enough (unlike an exclusion)
- * that the comparison still happens at all. Holding an uncovered tile now loses to walking back
- * into cover on points, the same way every other veto-scale risk in this file is priced.
+ * CHARGED AT ZUK'S NEXT ATTACK TICK, NOT EVERY TICK. Zuk only threatens on the ticks it fires,
+ * so cover is a deadline rather than a standing requirement - which is where the freedom of
+ * movement comes from. Between attacks any tile is equal; the penalty appears on tiles that will
+ * not be covered when the shot is aimed.
  *
- * Judged at the ARRIVAL tick (route length in TILES converted to ticks at
- * PLAYER_TILES_PER_TICK - zero for a length-1 hold route, i.e. checked from right now), not
- * tick 0 relative to the CURRENT position for a longer walk: a three-tick walk has to be
- * checked against where the shield will have slid to in three ticks, not where it is right
- * now - that mismatch is the "not looking far enough ahead" gap this was built to close.
+ * TWO OFFSETS MAKE THIS WORK, AND BOTH ARE EASY TO GET WRONG.
  *
- * ARRIVAL ALONE IS STILL NOT ENOUGH: a tile covered for the single tick it is judged is one
- * tile from the TRAILING edge of the band, or dead centre with the shield about to slide past
- * - it falls back out of cover the moment the shield takes its next step. So this demands the
- * destination stay covered through ZUK_SHIELD_COVER_BUFFER_TICKS ticks past arrival too,
- * assuming the player then holds - which is the real scenario, since holding is exactly what
- * happens whenever nothing scores better. Only a tile nearer the LEADING edge of the band, the
- * side the shield is currently sliding towards, survives the whole window - "stay ahead of the
- * shield, not merely inline with it" falls out of that as a consequence, not a rule written
- * separately. No directional logic needed: `projectShieldX` already knows which way it is
- * moving, and a trailing-edge tile simply cannot survive the extra ticks.
+ *  - `TzKalZuk.attack()` picks its target at the moment it FIRES, reading `this.aggro.location`
+ *    right then, and the projectile is aimed for the whole of its flight. So the tick that
+ *    matters is the fire tick, not the landing tick four ticks later.
+ *  - Inside a tick, `World.tickRegion` steps every mob before any player. On fire tick F, Zuk
+ *    therefore reads the position the player held at the END of tick F-1. Being in cover on F
+ *    itself is one tick too late, so the walk has `untilFire - 1` ticks to finish, not
+ *    `untilFire`.
+ *
+ * The shield, in contrast, HAS moved by the time Zuk fires - its movementStep runs earlier in
+ * the same tick - so it is projected the full `untilFire` ticks.
+ *
+ * Before the first observed attack `ZukAttackClock` has no phase and this falls back to the old
+ * rule, cover judged right now, which is the safe reading when the deadline is unknown.
  */
-const ZUK_SHIELD_COVER_BUFFER_TICKS = 3;
 export const ZUK_SHIELD_UNCOVERED_PENALTY = -1000;
 
-function routeLeavesShieldCover(shield: ShieldState | null, route: Location[]): boolean {
-  if (!shield) {
-    return false;
-  }
-  const arrivalTicks = Math.ceil((route.length - 1) / PLAYER_TILES_PER_TICK);
-  const destination = route[route.length - 1];
-  for (let extra = 0; extra <= ZUK_SHIELD_COVER_BUFFER_TICKS; extra++) {
-    const shieldXAtTick = projectShieldX(shield, arrivalTicks + extra);
-    if (!isCoveredByShield(destination.x, destination.y, shieldXAtTick)) {
-      return true;
-    }
-  }
-  return false;
-}
+/**
+ * The only thing separating one safe tile from another: nearer the leading face wins.
+ *
+ * Wave 69 has no scoring left beyond "will this tile be behind the shield when Zuk fires". Safe
+ * tiles are all worth the same 0, unsafe ones all cost ZUK_SHIELD_UNCOVERED_PENALTY, and there is
+ * no gradient, no partial credit and no term that can trade cover away for anything else.
+ *
+ * A thousandth of a point, so the entire arena's worth of it cannot approach the cover penalty.
+ * It exists purely to settle ties, which is the case `bestMove` cannot otherwise reach: it needs
+ * STRICTLY better than holding, so without this the bot keeps whatever safe tile it happens to be
+ * standing on - including the trailing edge of the band it is about to need.
+ */
+const SHIELD_FACE_TIEBREAK = 0.001;
 
 /**
  * Where a tagged Zuk healer's AOE is about to land - a soft steer, not a veto, so it never
@@ -572,7 +612,155 @@ function routeLeavesShieldCover(shield: ShieldState | null, route: Location[]): 
  * they exist, the same way a player reacts to seeing the spark. They stay in `region.projectiles`
  * for `totalDelay` (4) ticks after casting (`Projectile.shouldDestroy`), comfortably covering
  * the actual hit check at cast+3 (`InfernoHealerSpark`'s own `DelayedAction` + one more tick).
+ *
+ * HALF A POINT MEANS SOMETHING DIFFERENT NOW than it did when this was one term among eight. The
+ * only things left on this wave are a 1000 and a thousandth, so it sits cleanly between them: it
+ * cannot be seen by cover, and it flattens the face tie-break completely. That ordering is the
+ * intended one - stepping out of a spark is worth giving up the leading face for, and is never
+ * worth giving up the shield for - but it is now the ONLY thing the face preference ever loses
+ * to, so a mistuned value here has nowhere to hide.
  */
+/**
+ * Worth a point to be standing where a healer can be blowpiped.
+ *
+ * A healer is the only thing on this wave that gives Zuk hitpoints back, and the tag is what
+ * stops it - `JalMejJak.attackStyleForNewAttack` returns "heal" while its aggro is Zuk and "aoe"
+ * once it is ours - so being in range of one is worth moving for rather than waiting for it to
+ * wander into reach. They spawn at y 9 in a row across the arena while cover sits at y 13-16, so
+ * from most of the band they are outside the blowpipe's 5 and nothing else would ever pull the
+ * bot towards them.
+ *
+ * The BLOWPIPE's range specifically, not `attackReachFor`: that answers with `requiredSetFor`,
+ * which lists YtHurKot as a blowpipe target but leaves JalMejJak on the default bow - so it would
+ * report the long weapon's reach for exactly the healer this wave cares about.
+ *
+ * A whole point, so it beats the face tie-break outright and cannot be seen by
+ * ZUK_SHIELD_UNCOVERED_PENALTY. Note it also outweighs ZUK_HEALER_AOE_PENALTY, so the bot will
+ * stand in a live spark to keep a healer in range - deliberate at 1 against 0.5, since the spark
+ * is survivable and the healing is not, but it is the pair of numbers to look at first if that
+ * trade turns out wrong.
+ */
+const ZUK_HEALER_REACH_BONUS = 1;
+
+/**
+ * Paid to a tile that can shoot a set mob still aggroed to the shield.
+ *
+ * A pair spawns stunned - `spawnDelay` 7 on the mager, 9 on the ranger - and a tag lands about
+ * five ticks after the click, so a mob inside weapon range when it spawns never fires at all.
+ * Measured on seed 67: five of ten were, and all five cost the shield nothing. Every point of the
+ * 559 it lost came from the other five, which were out of range at spawn and stayed out of range
+ * for 13 to 24 ticks.
+ */
+const ZUK_TAG_REACH_BONUS = 1;
+
+/**
+ * BE STANDING SOMEWHERE THAT REACHES THE PAIR BEFORE IT LANDS.
+ *
+ * Paid per spawn tile, so a tile covering both is worth twice one covering either - which pulls
+ * towards the middle of the arena without naming a number to aim at.
+ *
+ * The two tiles never move: `TzKalZuk.attackIfPossible` constructs the pair at (20,21) and (29,21)
+ * every single set, and `ZukSetTimer` already counts down to the tick they appear. The bot even
+ * announces it - "holding fire for the spawn (set in 2)" - so it knows the moment is coming and
+ * stops shooting for it. It just does not stand anywhere useful for it.
+ *
+ * Measured, seed 26 set 5: at t1955 the band was 22..26 and the bot was at x29. From x25, a
+ * covered tile in that same band, the mager's spawn tile is exactly 7 away and in crossbow range.
+ * It stood on the east end instead, the mager landed at d9 unreachable, the shield carried the bot
+ * further east every tick, and the mager was still untagged 25 ticks later having put four hits
+ * and 204 damage into the shield. Two tiles of standing position, at a tick when the bot was
+ * deliberately doing nothing else.
+ *
+ * WHY THE EXISTING BONUS CANNOT DO THIS. `tagReach` needs a live untagged mob, and `visibleMobs`
+ * withholds a spawn for one tick - so the earliest it can pay is the tick AFTER the pair lands, by
+ * which point the distance is already fixed. This is the same bonus asked one tick earlier, of the
+ * only thing that is knowable that early: the tiles themselves.
+ */
+const ZUK_SPAWN_REACH_BONUS = 1;
+
+/** Where a pair always lands. Fixed in TzKalZuk, not derived from anything. */
+const ZUK_SPAWN_TILES: Location[] = [
+  { x: 20, y: 21 },
+  { x: 29, y: 21 },
+];
+
+/**
+ * How early to start caring, in ticks before the pair lands.
+ *
+ * Enough to cross the band and no more. It is five wide, the bot runs two tiles a tick, so three
+ * ticks reaches any tile in it from any other. Starting earlier would trade away the leading face
+ * for longer than the move needs.
+ */
+const ZUK_SPAWN_PREP_TICKS = 3;
+
+/**
+ * What it costs to be OUT OF COVER at the fire tick... which is a thing that never happens, and
+ * that is the point.
+ *
+ * COVER IS ABOUT WHERE WE STAND WHEN ZUK FIRES, NOT ABOUT WHERE WE GO. The scorer used to treat
+ * those as the same question, so a tile uncovered at the fire tick was refused outright even when
+ * there were nine ticks to walk out, shoot, and walk back before the shot was aimed. That refusal
+ * is what left half of every pair unshootable: the mob sits at y 21 and the band is often nowhere
+ * near it, so the only tile that could tag it was one the bot was not allowed to stand on.
+ *
+ * A SORTIE is that trip, and it is only ever offered when the round trip fits inside the clock
+ * with a tick to spare - see ZUK_SORTIE_SAFETY. The penalty is small because the trip is not
+ * dangerous when it fits; it exists to keep a covered firing position preferred over a sortie to
+ * the same target, and to stop the bot wandering out when standing still would do.
+ *
+ * It can never be earned by a tile that has nothing to shoot. Without that condition every
+ * uncovered tile within a round trip becomes acceptable and the -1000 stops protecting anything.
+ */
+const ZUK_SORTIE_PENALTY = -0.25;
+
+/**
+ * Slack, in ticks, on top of the round trip.
+ *
+ * The return leg is priced with straight-line distance rather than a real route, because routing
+ * every tile back to a moving band each tick is not affordable - and that estimate errs on the
+ * fatal side, since a real path around a mob is longer than the line. One tick of margin covers
+ * the difference. Two hundred and fifty-one damage is the price of being wrong here, so the margin
+ * is not negotiable down to zero.
+ */
+const ZUK_SORTIE_SAFETY = 1;
+
+/**
+ * What the sortie test decided this tick, for the harness to read back.
+ *
+ * REPORTED BY THE CODE THAT DECIDES, not reconstructed afterwards. A harness-side copy would need
+ * the same routes, the same projected band and the same reach test, and any drift between the two
+ * makes the report describe a scorer that does not exist. Diagnostic only - nothing reads it to
+ * make a decision.
+ */
+export interface SortieDebug {
+  /** Tiles from which something still on the shield could be shot. */
+  canTag: number;
+  /** Of those, tiles already covered at the fire tick - no trip needed. */
+  canTagCovered: number;
+  /** Of those, tiles offered as a step out. */
+  sorties: number;
+  /** The cheapest round trip among uncovered canTag tiles, and the budget it had to fit in. */
+  bestTrip: number | null;
+  walkTicks: number | null;
+  /** Why the cheapest one was refused, when it was. */
+  refusedFor: string | null;
+}
+let lastSortie: SortieDebug = {
+  canTag: 0,
+  canTagCovered: 0,
+  sorties: 0,
+  bestTrip: null,
+  walkTicks: null,
+  refusedFor: null,
+};
+
+export function sortieDebug(): SortieDebug {
+  return lastSortie;
+}
+
+/** Wave 69 prices a route exactly as every other wave does. */
+const ZUK_TILES_PER_TICK = PLAYER_TILES_PER_TICK;
+
 const ZUK_HEALER_AOE_PENALTY = -0.5;
 /** Chebyshev radius matching `InfernoHealerSpark`'s own hit check - a 3x3 box on the spark. */
 const ZUK_HEALER_AOE_RADIUS = 1;
@@ -595,6 +783,43 @@ function healerAoeLandings(region: Region): Location[] {
 function nearHealerAoeLanding(landings: Location[], destination: Location): boolean {
   return landings.some((landing) => chebyshevDistance(destination, landing) <= ZUK_HEALER_AOE_RADIUS);
 }
+
+
+
+/**
+ * How many ticks past NOW a tile must stay covered for, while the attack clock has no sync.
+ *
+ * Only the unsynced opening needs this. Once Zuk has been seen to attack, cover is judged at the
+ * exact tick the shot is aimed and a buffer would be superstition. Before that there is no
+ * deadline, and "covered right now" is a strictly one-tick-too-late test: the shield steps at the
+ * start of a tick and Zuk fires later in the SAME tick, so a tile that is covered when it is
+ * scored can already be exposed when the shot is aimed. Measured, the bot sat exactly one tile
+ * behind the band for the whole opening and took Zuk's first attack for 251, both directions,
+ * every time.
+ *
+ * It also does the job the lead term cannot. `shieldLead` is zero on the tile underfoot, so the
+ * bot holds the instant it is nominally covered - which is the trailing edge, the worst tile in
+ * the band. Demanding the tile survive a few more shield steps makes the trailing edge score as
+ * unsafe, so the walk continues to somewhere that actually keeps working.
+ */
+const ZUK_SHIELD_COVER_BUFFER_TICKS = 3;
+
+/**
+ * How close to a wall the shield has to be for the leading face to stop meaning anything.
+ *
+ * The leading face is worth chasing only while the shield keeps going that way, and this close
+ * to a wall it does not: it bounces, freezes for 5 ticks, and the end the bot just walked to
+ * becomes the TRAILING end - four ticks of cover thrown away for a walk that was wrong before it
+ * finished. So inside this window the pull is switched off entirely and every tile in the band
+ * scores the same 0. Nothing in the band is worse than anything else, `bestMove` breaks the tie
+ * on walk length, and the nearest covered tile wins - which for a bot already under the shield
+ * means standing still until the direction actually flips.
+ *
+ * Switched off rather than re-aimed at the far end: the bounce has not happened yet, and paying
+ * a real walk for it early is the same mistake in the other direction. The moment
+ * `movementDirection` flips, `leadAnchorX` follows it on its own.
+ */
+const SHIELD_BOUNCE_PREP_TILES = 3;
 
 function reachTargets(player: Player, mobs: Mob[]): ReachTarget[] {
   const targets: ReachTarget[] = [];
@@ -1214,7 +1439,12 @@ export interface ScoreParts {
   barrageReach: number;
   /** BLOBLET_REACH_BONUS if any bloblet is in barrage range of here - see `blobletReach`. */
   blobletReach: number;
-  /** 1 if the nearest still-healing Jad healer can be tagged from here - see `focusHealer`. */
+  /**
+   * Waves 67/68: 1 if the nearest still-healing Jad healer can be tagged from here - see
+   * `focusHealer`. Wave 69: ZUK_HEALER_REACH_BONUS if any healer is inside BLOWPIPE range AND the
+   * weapon is off cooldown by the time this tile can be stood on - reach with no shot behind it
+   * pays for a walk that buys nothing.
+   */
   healerReach: number;
   npcReachSoon: number;
   /** QUIET_TICK_BONUS per counted tick, on safespot tiles only - zero everywhere else. */
@@ -1226,8 +1456,18 @@ export interface ScoreParts {
   homePull: number;
   /** ZUK_SHIELD_UNCOVERED_PENALTY if this route ends uncovered; 0 on every wave but 69. */
   shieldPenalty: number;
-  /** ZUK_HEALER_AOE_PENALTY if this destination is near a live tagged-healer AOE landing. */
+  /** A thousandth of a point per tile of x from the shield's leading face; 69 only. */
+  shieldLead: number;
+  /** Unused. Kept on the interface so the score dump and its column stay in step. */
+  zukReach: number;
+  /** ZUK_HEALER_AOE_PENALTY if this tile is near a live tagged-healer AOE landing; 69 only. */
   healerAoePenalty: number;
+  /** ZUK_TAG_REACH_BONUS if an untagged set mob can be shot from here; 69 only. */
+  tagReach: number;
+  /** ZUK_SORTIE_PENALTY if this tile is a step out of cover to take a shot; 69 only. */
+  sortie: number;
+  /** ZUK_SPAWN_REACH_BONUS per spawn tile this tile can shoot, with a pair due; 69 only. */
+  spawnReach: number;
   damageTaken: number;
   threats: number;
 }
@@ -1247,8 +1487,6 @@ function scoreRoute(
   bloblets: ReachTarget[],
   healer: ReachTarget | null,
   home: Location | null,
-  shield: ShieldState | null,
-  healerAoe: Location[],
   targets: ReachTarget[],
   reaches: Map<string, number>,
   route: Location[],
@@ -1576,14 +1814,17 @@ function scoreRoute(
     safeSpot,
     // Negative or zero: the drift anchor for the open-arena waves - see HOME_PULL_PER_TILE.
     homePull: home ? -HOME_PULL_PER_TILE * chebyshevDistance(destination, home) : 0,
-    // ZUK_SHIELD_UNCOVERED_PENALTY if this route - hold position included - will not be
-    // covered through the buffer window; 0 (and null shield) on every wave but 69. Priced,
-    // not filtered - see routeLeavesShieldCover for why holding must stay a real candidate.
-    shieldPenalty: routeLeavesShieldCover(shield, route) ? ZUK_SHIELD_UNCOVERED_PENALTY : 0,
-    // ZUK_HEALER_AOE_PENALTY if a live tagged-healer AOE is already going to land here or
-    // next to it - a nudge, not a veto, so it never outbids shieldPenalty and never pulls the
-    // bot out from under the shield to dodge it. 0 (and empty healerAoe) on every wave but 69.
-    healerAoePenalty: nearHealerAoeLanding(healerAoe, destination) ? ZUK_HEALER_AOE_PENALTY : 0,
+    // Both wave-69 terms live in `scoreZukTiles` now and cannot reach this path - wave 69
+    // returns before the loop that calls this. Kept on ScoreParts at zero rather than deleted:
+    // DebugPanel dumps every field, and the Zuk harness reads `shieldPenalty` to decide whether
+    // the player was behind cover.
+    shieldPenalty: 0,
+    shieldLead: 0,
+    zukReach: 0,
+    healerAoePenalty: 0,
+    tagReach: 0,
+    spawnReach: 0,
+    sortie: 0,
     damageTaken,
     // priced.length, not threats.length - the dump's threat count should match what was
     // actually charged, or a healer-chase-eight-ticks-out would read as a threat that costs
@@ -1601,7 +1842,8 @@ function scoreRoute(
       parts.losBonus +
       parts.safeSpot +
       parts.homePull +
-      parts.shieldPenalty +
+      parts.shieldPenalty +
+
       parts.healerAoePenalty -
       parts.damageTaken,
     parts,
@@ -1636,12 +1878,335 @@ export interface ScoredTile {
  * `snapshot` is a parameter so a caller that already built one this tick can hand it over.
  * Constructing it walks every entity in the region, and both this and the target scorer need it.
  */
+/** Every term at zero, for a scorer that only fills one of them in. */
+function emptyParts(): ScoreParts {
+  return {
+    barrageReach: 0,
+    blobletReach: 0,
+    healerReach: 0,
+    npcReachSoon: 0,
+    quietTicks: 0,
+    losBonus: 0,
+    safeSpot: 0,
+    homePull: 0,
+    shieldPenalty: 0,
+    shieldLead: 0,
+    zukReach: 0,
+    healerAoePenalty: 0,
+    tagReach: 0,
+    spawnReach: 0,
+    sortie: 0,
+    damageTaken: 0,
+    threats: 0,
+  };
+}
+
+/**
+ * Wave 69's score: ZUK_SHIELD_UNCOVERED_PENALTY on any tile the shield is not covering, zero on
+ * the ones it is. Nothing else - see the note on ZUK_SHIELD_UNCOVERED_PENALTY.
+ *
+ * Routes come from the same breadth-first sweep the general scorer uses, so the walk the bot
+ * takes is the engine's own pathing and `bestMove` can break ties on its real length. A tile the
+ * player cannot path to is dropped rather than scored, exactly as it is on every other wave.
+ *
+ * With no shield on the board every tile scores zero and the grid goes flat - which is the
+ * honest picture, since once the shield is gone there is no cover anywhere and no face to follow.
+ */
+export function scoreZukTiles(
+  region: Region,
+  player: Player,
+  snapshot: ArenaSnapshot = new ArenaSnapshot(region),
+): ScoredTile[] {
+  const shield = findShield(region);
+  // The mager/ranger/Jad melee zones, so the same veto waves 1-68 use applies here too. Nothing
+  // else from the snapshot is read - no simulation, no damage - this is geometry only.
+  const mobs = snapshotMobs(region, player, true);
+  const tiles = candidateTiles(region, player, snapshot);
+  const routes = routesFrom(player.location, tiles, (x, y) =>
+    isInsideArena(x, y) && snapshot.canStandAt(x, y),
+  );
+
+  // The deadline. Null until Zuk has been seen to attack once - see the note above.
+  const untilFire = ZukAttackClock.ticksUntilNextAttack();
+  // The shield as it will be when the shot is aimed. EVERYTHING below reads this rather than the
+  // shield's position now, including the leading face: the cover test and the pull towards the
+  // face have to be answering the same question about the same tick, or they fight each other -
+  // the face can even have flipped in between, if the shield bounces before the deadline.
+  const shieldAtFire =
+    shield === null ? null : untilFire === null ? shield : projectShield(shield, untilFire);
+  // Unsynced only: the shield's x on each of the next few ticks, any of which could be the one
+  // Zuk fires on. See ZUK_SHIELD_COVER_BUFFER_TICKS.
+  const unsyncedBand: number[] = [];
+  if (shield !== null && untilFire === null) {
+    for (let ahead = 1; ahead <= ZUK_SHIELD_COVER_BUFFER_TICKS; ahead++) {
+      unsyncedBand.push(projectShield(shield, ahead).x);
+    }
+  }
+  // Ticks of walking available before the position is locked in - one less than the deadline,
+  // because mobs step before players. Zero means "wherever you are now is what Zuk will see".
+  const walkTicks = untilFire === null ? null : Math.max(0, untilFire - 1);
+  // Null with no shield on the board, and null through a bounce window - both mean "no opinion
+  // about x", which is exactly what a flat band is. See SHIELD_BOUNCE_PREP_TILES.
+  // Null with no shield on the board, and null through a bounce window - both mean "no opinion
+  // about x", which is exactly what a flat band is. See SHIELD_BOUNCE_PREP_TILES.
+  const leading =
+    shieldAtFire && !bounceIsClose(shieldAtFire) ? leadAnchorX(shieldAtFire) : null;
+  // Empty unless a tagged healer has a live ghost projectile in flight - see the note above.
+  const healerAoe = healerAoeLandings(region);
+  // Both kinds: JalMejJak heals Zuk from the enrage, YtHurKot heals Jad. Asked once per tick.
+  const healers = visibleMobs(region).filter(
+    (mob) =>
+      mob.dying <= -1 &&
+      (mob.mobName() === EntityNames.JAL_MEJ_JAK || mob.mobName() === EntityNames.YT_HUR_KOT),
+  );
+  // Still on the shield, so still costing us. Aggro flips when our projectile LANDS, so a mob
+  // already shot at stays here for the few ticks the shot is in the air - which is correct: it is
+  // still hitting the shield until the tag actually resolves.
+  const untagged = visibleMobs(region).filter(
+    (mob) =>
+      mob.dying <= -1 &&
+      mob.aggro !== player &&
+      (mob.mobName() === EntityNames.JAL_ZEK || mob.mobName() === EntityNames.JAL_XIL),
+  );
+  // Asked of the LONG weapon: tagging is the job and the long weapon is what reaches. The blowpipe
+  // cannot reach the spawn row from y 14 at all - dy alone is 7 against its 5.
+  // Asked unconditionally. It used to short-circuit to 0 when nothing was untagged, which is
+  // precisely the state the spawn bonus works in - so every spawn tile would have been measured
+  // against a reach of nothing and no tile would ever have earned it.
+  const tagWeaponReach =
+    (weaponForSet(player, "tbow") as { attackRange?: number } | null)?.attackRange ?? 0;
+
+  /**
+   * Ticks to walk from a tile back into cover, for the shield as it will be when Zuk fires.
+   *
+   * The covered band at that tick is contiguous - `shieldAtFire.x` to `+4`, less the trailing tile
+   * the next step abandons - so the return is just the distance to that range, plus whatever it
+   * takes to get back under y 16.
+   */
+  const ticksBackToCover = (tile: Location): number | null => {
+    if (shieldAtFire === null) {
+      return 0; // no shield on the board: nothing to return to, and nothing to hide from
+    }
+    const trailing = trailAnchorX(shieldAtFire);
+    const lo = shieldAtFire.direction ? shieldAtFire.x + 1 : shieldAtFire.x;
+    const hi = shieldAtFire.direction
+      ? shieldAtFire.x + ZUK_SHIELD_WIDTH - 1
+      : shieldAtFire.x + ZUK_SHIELD_WIDTH - 2;
+    if (lo > hi || trailing < lo - 1) {
+      return null; // no covered tile to come back to
+    }
+    const dx = tile.x < lo ? lo - tile.x : tile.x > hi ? tile.x - hi : 0;
+    const dy = tile.y > ZUK_SHIELD_COVER_MAX_Y ? tile.y - ZUK_SHIELD_COVER_MAX_Y : 0;
+    return Math.ceil(Math.max(dx, dy) / ZUK_TILES_PER_TICK);
+  };
+
+  // Only inside the window, and only while there is nothing already on the board to shoot -
+  // once a pair is live, `tagReach` is the better question because it knows where they actually
+  // are rather than where they were going to be.
+  const untilSet = ZukSetTimer.ticksUntilSet();
+  const spawnDue =
+    untagged.length === 0 &&
+    untilSet !== null &&
+    !ZukSetTimer.isPaused() &&
+    untilSet <= ZUK_SPAWN_PREP_TICKS;
+
+  const blowpipeReach =
+    healers.length === 0
+      ? 0
+      : (weaponForSet(player, "blowpipe") as { attackRange?: number } | null)?.attackRange ?? 0;
+  // Ticks until the weapon can fire again, which is what turns "reaches a healer" into "can
+  // actually tag one from there". Null when nothing has been observed yet - treated as no
+  // objection rather than as a refusal, since an unknown cooldown is not evidence of one.
+  const untilShot = PlayerAttackClock.earliestShotOffset();
+
+  const sortieReport: SortieDebug = {
+    canTag: 0,
+    canTagCovered: 0,
+    sorties: 0,
+    bestTrip: null,
+    walkTicks,
+    refusedFor: null,
+  };
+
+  const scored: ScoredTile[] = [];
+  for (const tile of tiles) {
+    const route = routes.get(routeKey(tile.x, tile.y));
+    if (!route) {
+      continue; // walled off from the player, so not actually a candidate
+    }
+    // DROPPED, NOT SCORED BADLY, exactly as on every other wave. Standing beside a mager makes
+    // its attack a coin flip between magic and stab (`canMeleeIfClose` re-rolled at fire time),
+    // and a 50/50 cannot be prayed - half-praying is not a thing. Pricing that at its average is
+    // the one treatment that makes no sense, so the tile is not an option at all. Exit is still
+    // allowed and holding position is never blocked - see routeEntersForbiddenZone.
+    if (routeEntersForbiddenZone(mobs, route)) {
+      continue;
+    }
+    const parts = emptyParts();
+    // Reachable in time? A destination that is covered but cannot be stood on before the shot is
+    // aimed protects nothing, so it is charged exactly like an uncovered one.
+    const arrivalTicks = Math.ceil((route.length - 1) / ZUK_TILES_PER_TICK);
+    const inPlace = walkTicks === null || arrivalTicks <= walkTicks;
+    const safe =
+      shieldAtFire === null ||
+      (inPlace &&
+        isCoveredByShield(tile.x, tile.y, shieldAtFire.x) &&
+        // THE TRAILING TILE IS NOT COVER. It is inside the band by TzKalZuk's own test and the
+        // shield's very next step leaves it behind, so treating it as safe banks zero ticks and
+        // is what puts the bot one tile short when the window opens.
+        tile.x !== trailAnchorX(shieldAtFire) &&
+        unsyncedBand.every((x) => isCoveredByShield(tile.x, tile.y, x)));
+    // Can this tile shoot something still on the shield? Asked before cover, because it is what
+    // decides whether leaving cover is worth considering at all.
+    const canTag =
+      untagged.length > 0 &&
+      untagged.some((mob) =>
+        snapshotPlayerCanSeeMob(
+          snapshot,
+          tile.x,
+          tile.y,
+          mob.location.x,
+          mob.location.y,
+          mob.size,
+          tagWeaponReach,
+        ),
+      );
+
+    // THE ROUND TRIP. See ZUK_SORTIE_PENALTY.
+    //
+    //   out    reaching the firing tile
+    //   shoot  one tick that clicks the NPC instead of a walk - a tick cannot do both
+    //   back   returning to the band as it will be at the fire tick
+    //
+    // Plus ZUK_SORTIE_SAFETY. And the weapon has to be up by the time we are stood there, or the
+    // trip buys nothing and we have left cover to watch a cooldown run down.
+    const backTicks = ticksBackToCover(tile);
+    const sortie =
+      !safe &&
+      canTag &&
+      walkTicks !== null &&
+      backTicks !== null &&
+      shieldAtFire !== null &&
+      arrivalTicks + 1 + backTicks + ZUK_SORTIE_SAFETY <= walkTicks &&
+      (untilShot === null || untilShot <= arrivalTicks + 1);
+
+    if (canTag) {
+      sortieReport.canTag++;
+      if (safe) {
+        sortieReport.canTagCovered++;
+      } else if (backTicks !== null && walkTicks !== null) {
+        const trip = arrivalTicks + 1 + backTicks + ZUK_SORTIE_SAFETY;
+        if (sortieReport.bestTrip === null || trip < sortieReport.bestTrip) {
+          sortieReport.bestTrip = trip;
+          sortieReport.refusedFor =
+            trip > walkTicks
+              ? `trip ${trip} > budget ${walkTicks}`
+              : untilShot !== null && untilShot > arrivalTicks + 1
+                ? `weapon ready in ${untilShot}, stood there at ${arrivalTicks + 1}`
+                : null;
+        }
+      }
+      if (sortie) {
+        sortieReport.sorties++;
+      }
+    }
+
+    parts.sortie = sortie ? ZUK_SORTIE_PENALTY : 0;
+    // Safe tiles only. A tile that reaches the spawn but does not survive the next shot is not a
+    // firing position, it is a death with good sightlines.
+    parts.spawnReach =
+      safe && spawnDue
+        ? ZUK_SPAWN_TILES.filter((spawn) =>
+            snapshotPlayerCanSeeMob(snapshot, tile.x, tile.y, spawn.x, spawn.y, 1, tagWeaponReach),
+          ).length * ZUK_SPAWN_REACH_BONUS
+        : 0;
+    parts.tagReach = canTag && (safe || sortie) ? ZUK_TAG_REACH_BONUS : 0;
+    parts.shieldPenalty = safe || sortie ? 0 : ZUK_SHIELD_UNCOVERED_PENALTY;
+    parts.shieldLead =
+      leading === null ? 0 : -SHIELD_FACE_TIEBREAK * Math.abs(tile.x - leading);
+    parts.healerAoePenalty = nearHealerAoeLanding(healerAoe, tile)
+      ? ZUK_HEALER_AOE_PENALTY
+      : 0;
+    // REACHING A HEALER ONLY COUNTS IF THE SHOT EXISTS ON ARRIVAL.
+    //
+    // The bonus is a bribe to walk somewhere, so it has to be paid for a walk that buys something.
+    // A tile that reaches a healer but is stood on with three ticks of cooldown still to run buys
+    // nothing at the moment of arrival: the trip has been spent, the AOE has been walked into, the
+    // lead on the shield face has been given up, and the dart cannot go out. The cooldown runs
+    // whether the bot walks or stands, so those ticks are better spent travelling.
+    //
+    // STANDING STILL IS EXEMPT. `arrivalTicks` 0 is the tile already occupied, where there is no
+    // trip to justify and the shot happens from here the moment the weapon comes up. Charging it
+    // for the cooldown would strip the bonus off the very tile the shot is about to be taken from
+    // and hand it to a tile further away - walking off a shot to go and set up for it.
+    //
+    // Reach is asked of the BLOWPIPE only, matching the automation's healers-are-a-blowpipe-job
+    // rule, but the cooldown read is of whatever is in hand right now. A swap still to come costs
+    // its own tick on top and is not modelled here.
+    //
+    // AND ONLY ON A TILE THAT SURVIVES ZUK, which is not the same statement as the -1000 already
+    // outweighing the +1. The penalty separates a safe tile from an unsafe one; it does nothing
+    // to separate two UNSAFE ones, because both carry it. Cover is a yes/no test against a single
+    // future tick, so once the band has outrun the player every reachable tile scores -1000 alike
+    // and the bonus becomes the only term on the board with an opinion.
+    //
+    // Observed, seed 9: the shield ran east while the bot traded ticks with four healers, and from
+    // the moment it could no longer make the band the +1 pointed WEST, at the healers, and it
+    // walked further from cover every tick until Zuk killed it. The score was buying blowpipe
+    // range with a life.
+    //
+    // Costs nothing where it matters: a covered tile scores exactly as it did. All this removes is
+    // a doomed tile being PREFERRED to another doomed tile, after which they tie and the shorter
+    // walk wins - which at least stops the bot walking away from the shield.
+    const shotOnArrival = arrivalTicks === 0 || untilShot === null || untilShot <= arrivalTicks;
+    parts.healerReach =
+      safe &&
+      shotOnArrival &&
+      healers.some((healer) =>
+        snapshotPlayerCanSeeMob(
+          snapshot,
+          tile.x,
+          tile.y,
+          healer.location.x,
+          healer.location.y,
+          healer.size,
+          blowpipeReach,
+        ),
+      )
+        ? ZUK_HEALER_REACH_BONUS
+        : 0;
+    scored.push({
+      tile,
+      score:
+        parts.shieldPenalty +
+        parts.shieldLead +
+        parts.healerAoePenalty +
+        parts.tagReach +
+        parts.spawnReach +
+        parts.sortie +
+        parts.healerReach,
+      route,
+      parts,
+    });
+  }
+  lastSortie = sortieReport;
+  return scored;
+}
+
 export function scoreCandidates(
   region: Region,
   player: Player,
   snapshot: ArenaSnapshot = new ArenaSnapshot(region),
 ): ScoredTile[] {
   const startedAt = performance.now();
+  // WAVE 69 IS BEING REBUILT AND TAKES NONE OF THIS. Not a term switched off inside the loop
+  // below - the whole 441-route simulation is skipped, so nothing downstream can quietly reach
+  // it. Everything the wave used to add here (the shield lookahead, the healer AOE steer) went
+  // with it; see scoreZukTiles.
+  if (((region as unknown as { wave?: number }).wave ?? 0) === 69) {
+    return scoreZukTiles(region, player, snapshot);
+  }
+
 
   // Advance the standoff clocks exactly once per world tick, before any score is assembled.
   updateStandStillDecay(region, player);
@@ -1663,11 +2228,6 @@ export function scoreCandidates(
   const healer = focusHealer(region, player);
   // The drift anchor for the open-arena waves; null everywhere else.
   const home = waveHomeTile((region as unknown as { wave?: number }).wave ?? 0);
-  // Null on every wave but 69, so this costs nothing elsewhere.
-  const shield = findShield(region);
-  // Empty on every wave but 69 - region.projectiles only ever holds these while a tagged
-  // Jal-MejJak's AoeWeapon has a live ghost projectile in flight.
-  const healerAoe = healerAoeLandings(region);
   // Frozen once and shared by all 441 simulations. Rebuilt each call rather than cached, because
   // mobs move and pillars die.
   // Jad included: the tile score is the one consumer that has to see it hitting, or the grid
@@ -1723,8 +2283,6 @@ export function scoreCandidates(
       bloblets,
       healer,
       home,
-      shield,
-      healerAoe,
       targets,
       reaches,
       route,

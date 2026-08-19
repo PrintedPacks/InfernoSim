@@ -27,6 +27,11 @@ import { DebugPanel } from "./DebugPanel";
 import { InfernoAutomation } from "./InfernoAutomation";
 import { canReach } from "./KillPriority";
 import { TileGrid } from "./TileGrid";
+import { PlayerAttackClock } from "./PlayerAttackClock";
+import { ShieldAttackerClock } from "./ShieldAttackerClock";
+import { ZukAttackClock } from "./ZukAttackClock";
+import { ZukSetTimer } from "./ZukSetTimer";
+import { ZukSimPanel } from "./ZukSimPanel";
 import { observeNibblers } from "./PillarDefence";
 import { distanceToNearestMob, GRID_SIZE, isInsideArena, lastScoreDurationMs, scoreCandidates } from "./TileScorer";
 
@@ -318,6 +323,14 @@ export class InfernoRegion extends Region {
       TileGrid.setVisible(tileGridCheckbox.checked);
     });
 
+    // The Zuk timeline strip - a view like the two above, and for now a static one. It draws
+    // placeholder marks until the lanes are wired, so it is safe to leave on while working.
+    const zukSimCheckbox = document.getElementById("showZukSim") as HTMLInputElement;
+    zukSimCheckbox?.addEventListener("change", () => {
+      ZukSimPanel.setVisible(zukSimCheckbox.checked);
+    });
+    window.addEventListener("resize", () => ZukSimPanel.onResize());
+
     // Same reasoning as the tile grid - a view, works with automation off.
     const debugPanelButton = document.getElementById("toggleDebugPanel") as HTMLButtonElement;
     debugPanelButton?.addEventListener("click", () => {
@@ -377,6 +390,10 @@ export class InfernoRegion extends Region {
           "safe",
           "home",
           "shield",
+          "lead",
+          "zukReach",
+          "tagReach",
+          "sortie",
           "damage",
           "threats",
           "routeLen",
@@ -394,6 +411,10 @@ export class InfernoRegion extends Region {
           entry.parts ? round(entry.parts.safeSpot) : null,
           entry.parts ? round(entry.parts.homePull) : null,
           entry.parts ? round(entry.parts.shieldPenalty) : null,
+          entry.parts ? round(entry.parts.shieldLead) : null,
+          entry.parts ? round(entry.parts.zukReach) : null,
+          entry.parts ? round(entry.parts.tagReach) : null,
+          entry.parts ? round(entry.parts.sortie) : null,
           entry.parts ? round(entry.parts.damageTaken) : null,
           entry.parts ? entry.parts.threats : null,
           entry.route.length,
@@ -988,12 +1009,163 @@ export class InfernoRegion extends Region {
     // calls it too and that is harmless - it only adds to a WeakSet.
     observeNibblers(this);
 
+    // Watching Zuk attack is an OBSERVATION too, and it has to happen BEFORE automation decides:
+    // wave 69 positions against "where must I be when Zuk next fires", so a clock read after the
+    // decision would always be a tick stale. Same reasoning as observeNibblers above.
+    // ---- SIM POOLS: prayer and run energy pinned, exactly as the harness pins them ----
+    //
+    // The harness runs with a 99999 prayer pool and run energy re-pinned every tick, so neither
+    // can end a run. Without the same here, a browser run of the same seed diverges for reasons
+    // that have nothing to do with the fight: prayer empties, overheads drop, and the orb dying
+    // halves the bot's movement to one tile a tick - which is the difference between reaching a
+    // spawn and not.
+    //
+    // Run is re-pinned EVERY TICK because `Player.movementStep` ends by clamping it, so setting it
+    // once at spawn lasts about a minute. Prayer only needs the pool raised once.
+    //
+    // Only with ?seed= present, so ordinary play is untouched.
+    {
+      const sim = this as unknown as { zukSimPools?: boolean | null };
+      if (sim.zukSimPools === undefined) {
+        sim.zukSimPools = new URLSearchParams(window.location.search).get("seed") !== null;
+      }
+      const player = this.players[0] as unknown as {
+        stats?: { prayer: number };
+        currentStats?: { prayer: number; run: number };
+        running?: boolean;
+      };
+      if (sim.zukSimPools && player?.currentStats && player.stats) {
+        if (player.stats.prayer < 99999) {
+          player.stats.prayer = 99999;
+          player.currentStats.prayer = 99999;
+        }
+        player.currentStats.run = 10000;
+        player.running = true;
+      }
+    }
+
+    // ---- Set watch, printed in the same shape the harness reports ----
+    //
+    // So a run watched in the browser can be compared with a run read in the harness. It has to be
+    // the same three numbers or the comparison is worthless: WHERE we were when the pair landed,
+    // HOW FAR each half was, and HOW LONG until each was pulled off the shield.
+    //
+    // The two are not the same fight from the same seed - the 3D path consumes Math.random during
+    // model warmup and the harness never runs it - so this is here to make the difference visible
+    // rather than to pretend it away.
+    {
+      const watcher = this as unknown as {
+        zukSetWatch?: Map<Mob, { tick: number; distance: number }>;
+        zukSetTick?: number;
+        zukLastSetTick?: number;
+        zukShieldSeen?: Set<unknown>;
+      };
+      watcher.zukSetTick = (watcher.zukSetTick ?? 0) + 1;
+      watcher.zukSetWatch = watcher.zukSetWatch ?? new Map();
+      const player = this.players[0];
+      if (player) {
+        for (const mob of this.mobs.concat(this.newMobs)) {
+          const name = mob.mobName();
+          if (name !== EntityNames.JAL_ZEK && name !== EntityNames.JAL_XIL) {
+            continue;
+          }
+          const distance = Math.max(
+            Math.abs(mob.location.x - player.location.x),
+            Math.abs(mob.location.y - player.location.y),
+          );
+          const seen = watcher.zukSetWatch.get(mob);
+          if (!seen) {
+            watcher.zukSetWatch.set(mob, { tick: watcher.zukSetTick, distance });
+            watcher.zukLastSetTick = watcher.zukSetTick;
+            console.log(
+              `t${watcher.zukSetTick} SPAWN ${name} | player ${player.location.x},` +
+                `${player.location.y} | distance ${distance}`,
+            );
+            continue;
+          }
+          if (mob.aggro === player && seen.distance >= 0) {
+            console.log(
+              `t${watcher.zukSetTick} TAGGED ${name} | +${watcher.zukSetTick - seen.tick} ticks ` +
+                `after spawn (was d${seen.distance})`,
+            );
+            seen.distance = -1; // reported once
+          }
+        }
+      }
+    }
+
+    // ---- Every hit the shield takes, in the same shape the harness table prints ----
+    //
+    // The offset from the last spawn is the number that means something: both halves fire on a
+    // fixed schedule from the tick they land - 7 and 9, then every 4 - so +11 is their first shot
+    // arriving and every 4 after it is one more the tag was late for. A hit at all means the tag
+    // landed after +7.
+    //
+    // Attributed the same way the harness does: a projectile counts on the tick its remainingDelay
+    // reaches 0, not when it leaves the list.
+    {
+      const watch = this as unknown as {
+        zukShieldSeen?: Set<unknown>;
+        zukSetTick?: number;
+        zukLastSetTick?: number;
+      };
+      watch.zukShieldSeen = watch.zukShieldSeen ?? new Set();
+      const shield = this.mobs.find((mob) => mob.mobName() === EntityNames.INFERNO_SHIELD) as
+        | { currentStats?: { hitpoint: number }; incomingProjectiles?: unknown[] }
+        | undefined;
+      if (shield) {
+        for (const projectile of shield.incomingProjectiles ?? []) {
+          if (watch.zukShieldSeen.has(projectile)) {
+            continue;
+          }
+          const shot = projectile as {
+            remainingDelay?: number;
+            damage?: number;
+            from?: { mobName?: () => string };
+          };
+          if ((shot.remainingDelay ?? 1) > 0) {
+            continue;
+          }
+          watch.zukShieldSeen.add(projectile);
+          if ((shot.damage ?? 0) <= 0) {
+            continue;
+          }
+          const from = shot.from?.mobName?.() ?? "?";
+          const who =
+            from === EntityNames.JAL_ZEK
+              ? "MAGER"
+              : from === EntityNames.JAL_XIL
+                ? "RANGER"
+                : from === EntityNames.JAL_TOK_JAD
+                  ? "JAD"
+                  : from;
+          const offset =
+            watch.zukLastSetTick === undefined
+              ? "-"
+              : `+${(watch.zukSetTick ?? 0) - watch.zukLastSetTick}`;
+          console.log(
+            `t${watch.zukSetTick} SHIELD HIT ${who} ${shot.damage} | ${offset} after spawn | ` +
+              `shield ${shield.currentStats?.hitpoint ?? "?"} left`,
+          );
+        }
+      }
+    }
+
+    ZukAttackClock.observe(this);
+    ShieldAttackerClock.observe(this, this.players[0]);
+    ZukSetTimer.observe(this);
+    PlayerAttackClock.observe(this.players[0]);
+
     // Automation decides last, so it sees this tick's wave state - including a wave that
     // handleWaveProgression() has only just spawned.
     InfernoAutomation.onTick(this, this.players[0]);
     this.updatePlayerTileReadout();
     this.updateTileGrid();
-    this.updateDebugPanel();  }
+    this.updateDebugPanel();
+    // A view, same as the two above - and after them, so the strip reports the tick everything
+    // else has already finished reading. Costs nothing while the checkbox is off.
+    ZukSimPanel.update();
+  }
 
   /**
    * Feed the debug panel its numbers. A view, same as the tile grid - only does the work while

@@ -18,6 +18,10 @@
   <label for="showTileGrid">Show tile grid</label>
   <span id="tile_grid_count"></span>
 </div>
+<div id="zuk_sim_toggle">
+  <input type="checkbox" id="showZukSim" />
+  <label for="showZukSim">Show zuk sim</label>
+</div>
 <button id="toggleDebugPanel" type="button">Debug Panel</button>
 <button id="dumpScores" type="button">Dump Scores</button>
 <button id="customScenario" type="button">CUSTOM wave</button>
@@ -49,7 +53,7 @@
   <option value="max_melee">Max Melee (WIP)</option>
 </select>
 
-<select name="shieldDirection" id="shieldDirection" style="display: none;">
+<select name="shieldDirection" id="shieldDirection">
   <option value="random">Random Shield Direction</option>
   <option value="west">West Zuk Shield</option>
   <option value="east">East Zuk Shield</option>

@@ -18,6 +18,9 @@
  *   INFERNO_LOADOUT  loadout key from the sidebar select, default max_tbow_speed
  *   INFERNO_PRAYER   the prayer pool for the run, default 99999 - see DEFAULT_PRAYER. Set it to
  *                    99 for the loadout's real pool, when prayer is the thing being measured
+ *   INFERNO_RUN      the run-energy pool, default 999999 - deep enough that the orb never drops
+ *                    and the bot never falls back to walking speed. Set it to 10000 for the real
+ *                    pool, when stamina is the thing being measured
  *   ZUK_WAVE         wave to start on, default 69. 67 or 68 arrive at Zuk having actually
  *                    spent supplies on the Jads, at a few times the wall cost
  *   ZUK_SHIELD       random (default) | west | east - which way the shield sets off
@@ -29,11 +32,19 @@
 import * as fs from "fs";
 import * as path from "path";
 
-import { EntityNames, ItemName } from "osrs-sdk";
+import { EntityNames, ItemName, Player } from "osrs-sdk";
 
+import { weaponForSet } from "../../src/content/inferno/js/GearSets";
+
+import { committedStyle, isJad, ticksUntilJadLands } from "../../src/content/inferno/js/JadTracker";
 import { InfernoAutomation } from "../../src/content/inferno/js/InfernoAutomation";
+import { isCoveredByShield, projectShield, sortieDebug } from "../../src/content/inferno/js/TileScorer";
+import { PlayerAttackClock } from "../../src/content/inferno/js/PlayerAttackClock";
+import { ZukAttackClock } from "../../src/content/inferno/js/ZukAttackClock";
 import type { ShieldDirection } from "../../src/content/inferno/js/ZukShield";
+import { seedEverything } from "../../src/content/inferno/js/SeededRandom";
 import { bootHarness, out, restoreConsole, silenceConsole } from "./bootHarness";
+import { buildReplayHtml } from "./replayHtml";
 
 /**
  * The prayer pool a Zuk run gets unless asked for otherwise.
@@ -48,13 +59,56 @@ import { bootHarness, out, restoreConsole, silenceConsole } from "./bootHarness"
  */
 const DEFAULT_PRAYER = 99999;
 
+/**
+ * Run energy the player is held at, every tick. 10000 is full; 0 disables the aid entirely.
+ *
+ * TOPPED UP RATHER THAN DEEPENED, because a deep pool is not possible - `Player.movementStep`
+ * ends with `currentStats.run = Math.min(Math.max(run, 0), 10000)`, so it re-clamps to 10000 on
+ * every single movement step and any larger starting value is gone within a tick.
+ *
+ * Not cosmetic: the tile scorer prices every walk at PLAYER_TILES_PER_TICK = 2, which is only
+ * true while running. A drained run makes every arrival estimate twice as optimistic as reality,
+ * so the bot misses deadlines it believed it could make - and that failure drowns out whatever
+ * the run was actually measuring. Until that assumption is fixed, energy wants to be off the
+ * table.
+ *
+ * Set INFERNO_RUN=0 for honest stamina, when the drain IS the question.
+ */
+const DEFAULT_RUN = 10000;
+
 const SEED = parseInt(process.env.INFERNO_SEED || "1", 10);
 const LOADOUT = process.env.INFERNO_LOADOUT || "max_tbow_speed";
 const START_WAVE = parseInt(process.env.ZUK_WAVE || "69", 10);
 const SHIELD = (process.env.ZUK_SHIELD || "random") as ShieldDirection;
 const PRAYER_OVERRIDE = parseInt(process.env.INFERNO_PRAYER || String(DEFAULT_PRAYER), 10);
+const RUN_OVERRIDE = parseInt(process.env.INFERNO_RUN || String(DEFAULT_RUN), 10);
 const TICK_LIMIT = parseInt(process.env.ZUK_TICK_LIMIT || "4000", 10);
 const JSON_OUT = process.env.ZUK_JSON_OUT || "";
+/**
+ * ZUK_TRACE=1600-1660 - a tick by tick account of a window of the real run.
+ *
+ * The browser cannot show this fight: its RNG stream, its input timing and its renderer all differ
+ * from the harness, and a seed that matches on the first tick has drifted by the hundredth. This
+ * is the same information without the parity problem, because it IS the run being reported.
+ *
+ * One line per tick: where the player stands, where the shield covers, where every set mob is and
+ * how far away, whether it is tagged, and the decision the automation made that tick.
+ */
+/**
+ * ZUK_REPLAY=1 - write a scrubbable view of the run next to its log.
+ *
+ * The browser cannot show this fight. Its RNG stream, its input timing and its renderer all differ
+ * from the harness, and every attempt to align them has aligned one and broken another. So instead
+ * of making the engine reproduce the run, the run records itself and is drawn back: same numbers
+ * the report is built from, one frame per tick, no simulation involved and nothing to diverge.
+ */
+const REPLAY = process.env.ZUK_REPLAY === "1";
+
+const TRACE = (() => {
+  const raw = process.env.ZUK_TRACE ?? "";
+  const match = raw.match(/^(\d+)\s*-\s*(\d+)$/);
+  return match ? { from: parseInt(match[1], 10), to: parseInt(match[2], 10) } : null;
+})();
 
 // Must match the sidebar's <select id="loadouts"> options - an unknown value would set the
 // select to "" and InfernoLoadout.getLoadout() would return nothing.
@@ -114,6 +168,7 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
     wave: START_WAVE,
     loadout: LOADOUT,
     prayerOverride: PRAYER_OVERRIDE,
+    runOverride: RUN_OVERRIDE,
     shieldDirection: SHIELD,
   });
 
@@ -215,6 +270,103 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
   const damageBySource = new Map<string, number>();
   const recentHits: { tick: number; phase: Phase; from: string; damage: number; hpAfter: number }[] = [];
   const seenMobs = new Set<unknown>();
+
+  /**
+   * EVERY ZUK ATTACK, GRADED AGAINST WHAT THE SCORER BELIEVED WHEN IT CHOSE THE TILE.
+   *
+   * Three hits in forty runs is not a tuning problem, it is a specific disagreement between the
+   * model and the world happening three times in seven thousand attacks - so the only useful
+   * record is the one taken AT the disagreement, with both sides of it written down.
+   *
+   * Reasoning backwards from a death cannot separate the candidates. A projection that drifts, an
+   * arrival estimate that overpromises and a clock that mis-dates the fire all end with the same
+   * corpse on the same tile. They do NOT leave the same row here: the first shows predicted x not
+   * matching real x, the second shows a tile marked safe that was never stood on, the third shows
+   * the fire landing on a tick nothing was predicted for.
+   *
+   * `beliefs` is the rolling trail, keyed by nothing - just the last ~16 ticks - because the tick
+   * a decision was committed on is exactly what is in question and must not be assumed.
+   */
+  interface Belief {
+    tick: number;
+    untilFire: number | null;
+    /** The tick the clock said this attack would land on, or null with no sync yet. */
+    predictedFireTick: number | null;
+    playerX: number;
+    playerY: number;
+    shieldX: number | null;
+    shieldDir: boolean | null;
+    shieldFrozen: number;
+    /** What the scorer projected the shield to be at the fire tick it was aiming for. */
+    projectedShieldX: number | null;
+    chosenX: number | null;
+    chosenY: number | null;
+    /** The scorer's own verdict on the tile the player is STANDING on. */
+    standingSafe: boolean;
+    /** Real geometry, TzKalZuk.attack's own test - not the scorer's opinion of it. */
+    standingCovered: boolean;
+    /**
+     * WHY THE WALK IS THE SPEED IT IS - the four readings that separate the candidates.
+     *
+     * Measured, seed 9 with the sprint active: eight tiles in seven ticks, moving two and then
+     * none, repeating, with no attack, no gear swap and the sprint gate returning early on every
+     * one of those ticks. So the stall is not the bot spending the tick elsewhere, and every
+     * remaining explanation lives in these fields.
+     *
+     *   dest      null or already-arrived on the still ticks means the destination is being
+     *             dropped and re-issued rather than held, and the re-click costs the tick
+     *   running   false on the still ticks means the orb is being turned off, and a walk is 1
+     *   runEnergy falling to 0 means the engine downgraded the run despite the harness pin
+     *   moved     the ground truth the other three are explaining
+     */
+    destX: number | null;
+    destY: number | null;
+    running: boolean;
+    runEnergy: number;
+    moved: number;
+  }
+  const beliefs: Belief[] = [];
+  interface FireAudit {
+    tick: number;
+    /** Where the player was when Zuk aimed: end of the PREVIOUS tick, since mobs step first. */
+    aimedAtX: number;
+    aimedAtY: number;
+    shieldX: number | null;
+    covered: boolean;
+    damage: number;
+    trail: Belief[];
+  }
+  const fires: FireAudit[] = [];
+  const zukHitTicks: { tick: number; damage: number }[] = [];
+  let zukAttacks = 0;
+  let zukFiresUncovered = 0;
+  let lastZukDelay: number | null = null;
+  let prevPlayerX = 0;
+  let prevPlayerY = 0;
+  /**
+   * Damage that arrived with no projectile to blame it on.
+   *
+   * Jad, in practice, and only Jad. Its `DelayedAction` calls `super.attack()` three ticks late,
+   * and the projectile that call builds carries `reduceDelay: JAD_PROJECTILE_DELAY` - which floors
+   * `remainingDelay` at 1 and lets the player's `processIncomingAttacks` resolve it in the SAME
+   * tick it was created. The attribution above compares two snapshots a tick apart, so a
+   * projectile that never survives a tick boundary is invisible to it: hitpoints fall and nothing
+   * is named. Every other attacker's shot lives at least one full tick and attributes fine.
+   *
+   * `delta + landedTotal` is the arithmetic. `delta` is the tick's whole hitpoint change and
+   * `landedTotal` is the part with a projectile behind it, so a negative sum is damage that
+   * happened without one.
+   */
+  const unattributed: {
+    tick: number;
+    phase: Phase;
+    damage: number;
+    hpAfter: number;
+    overhead: string;
+    jadStyle: string;
+    jadLandsIn: string;
+  }[] = [];
+  let unattributedTotal = 0;
   const spawnCounts: Record<string, number> = {};
   let maxPhase: Phase = "opening";
   let phase: Phase = "opening";
@@ -223,6 +375,125 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
   let zukHealed = 0;
   let shieldSeen = false;
   let shieldGoneTick: number | null = null;
+  /**
+   * WHERE THE SHIELD'S 600 HITPOINTS ACTUALLY WENT.
+   *
+   * Two sources, and they mean opposite things:
+   *
+   *   TzKal-Zuk        structural and not a failure. `attackIfPossible` aims at the SHIELD rather
+   *                    than at us whenever we are inside the band, so every shot we successfully
+   *                    hide from is paid for out of these hitpoints. Being hidden IS spending
+   *                    them, and nothing about our targeting changes it.
+   *   Jal-Zek/Jal-Xil  a tagging failure, and the only part that can be played better. A set
+   *                    spawns aggroed to the shield and stays on it until we land one hit, so
+   *                    every point here is one that a faster tag would have saved.
+   *
+   * Same resolution rule as the player's attribution - a projectile counts on the tick its
+   * `remainingDelay` reaches 0, not when it leaves the list.
+   */
+  /**
+   * WHAT THE BOT WAS DOING ON EVERY TICK A SET MOB SAT UNTAGGED.
+   *
+   * The gap between a pair spawning and being pulled off the shield is the whole of the shield's
+   * damage - Zuk contributes nothing to it - and the ordering is already untagged-first, so the
+   * delay is something REFUSING the shot rather than something choosing a different target.
+   * Reach, weapon cooldown, a hold, a gear swap and re-shooting a mob whose tag is still in flight
+   * all produce the same number and different reasons, so the reason is what gets counted.
+   *
+   * Keyed by the automation's own attackState, verbatim, so nothing here has to guess at intent.
+   */
+  /**
+   * WHY NO STEP-OUT WAS OFFERED, on the ticks one was wanted.
+   *
+   * Counted only while something is still on the shield, since that is the only time the question
+   * matters. Read straight off the scorer's own report so it cannot disagree with the code that
+   * decided - see SortieDebug.
+   */
+  const sortieRefusals = new Map<string, number>();
+  let sortieOfferedTicks = 0;
+  let sortieWantedTicks = 0;
+  /** One frame per tick when ZUK_REPLAY=1 - see REPLAY. */
+  const replayFrames: {
+    t: number;
+    px: number;
+    py: number;
+    hp: number;
+    sx: number | null;
+    sd: boolean;
+    shp: number;
+    mobs: { n: string; x: number; y: number; t: boolean }[];
+    s: string;
+  }[] = [];
+  const untaggedReasons = new Map<string, Map<string, number>>();
+  /**
+   * ARE WE TAGGING AS SOON AS IT IS POSSIBLE TO?
+   *
+   * A tick counts as an OPPORTUNITY when all three are true at once:
+   *
+   *   - an untagged set mob is alive and inside the long weapon's reach
+   *   - `earliestShotOffset` is 1, so the engine will let a shot go next tick
+   *   - therefore a click now becomes a tag
+   *
+   * If the bot attacked a set mob on that tick the opportunity was TAKEN. Anything else is a tick
+   * where the tag was available and something else was done with it, and the automation's own
+   * state string says what. Two untagged mobs in reach on the same tick is still one opportunity,
+   * because there is one weapon - so this never counts an unavoidable wait as a miss.
+   *
+   * Zero missed means the answer is yes and any remaining shield damage is reach or cooldown,
+   * neither of which is a targeting fault.
+   */
+  let tagChances = 0;
+  let tagChancesTaken = 0;
+  const tagMissReasons = new Map<string, number>();
+  /**
+   * UNCONTESTED: the mob was the ONLY untagged thing in reach, so no other tag was competing for
+   * the tick. A miss here cannot be explained by "it was busy tagging the other one" - there was
+   * no other one - and is the sharpest evidence of a real delay in the automation rather than in
+   * the geometry. Tracked per mob because the two halves of a pair fail for different reasons.
+   */
+  /**
+   * EVERY SET MOB'S LIFE FROM SPAWN TO TAG, with where we were standing when it landed.
+   *
+   * The `west/mager` line in the automation log answers a different question badly: it is latched
+   * at the FIRST set and never re-read, so it says nothing about where the shield had carried us
+   * for sets two through six - which is the only thing that decides which half of the pair is
+   * reachable. This records the answer per set instead of per fight.
+   *
+   * The three ticks that matter are spawn, first-in-reach and tagged. Their gaps separate the two
+   * failures completely: spawn -> in-reach is geometry, nothing the targeting can do about it;
+   * in-reach -> tagged is the automation, and should be one cooldown at most.
+   */
+  /**
+   * HOW LONG EACH HEALER WAS ACTUALLY ALIVE.
+   *
+   * "During enrage" and "while a healer was alive" are not the same window and reading one as the
+   * other overstates the healers badly: they spawn together at enrage and are killed, while the
+   * enrage phase label then runs to the end of the fight. A set arriving 200 ticks into enrage may
+   * be arriving into four healers or into none, and only this can tell them apart.
+   */
+  const healerLives: { spawned: number; died: number | null }[] = [];
+  const healerIndex = new Map<unknown, number>();
+  const setSpawns: {
+    tick: number;
+    name: string;
+    playerX: number;
+    playerY: number;
+    distance: number;
+    firstInReach: number | null;
+    taggedAt: number | null;
+    /** Live healers at the moment this pair landed - the whole question, recorded once. */
+    healersAlive: number;
+    mob: unknown;
+  }[] = [];
+  const soloChances = new Map<string, number>();
+  const soloTaken = new Map<string, number>();
+  const soloMissReasons = new Map<string, Map<string, number>>();
+  const shieldDamageBySource = new Map<string, number>();
+  /** Every hit the shield took, so the SHAPE of the drain is visible and not just its total. */
+  const shieldHits: { tick: number; phase: Phase; from: string; damage: number; hpAfter: number }[] =
+    [];
+  const shieldShotsSeen = new Set<unknown>();
+  let shieldDamageTotal = 0;
   const collisionsSeen = new Set<string>();
   const taggedSeen = new Set<unknown>();
   const spawnTicks = new Map<unknown, number>();
@@ -249,8 +520,25 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
   let cause = "";
   let killers: Landed[] = [];
   let botLogAtStop = "";
+  /**
+   * Read BEFORE `setEnabled(false)`, for the same reason `botLogAtStop` is: disabling resets every
+   * piece of per-run automation state, the heal counter included, so asking afterwards reports a
+   * flat zero on every seed no matter what happened.
+   */
+  let scaffoldHealing = { used: 0, total: 0 };
   let zukWaveHadMobs = false;
-  let tracked = new Set<unknown>();
+  let zukEverSeen = false;
+  // Projectiles already counted, by identity - see the attribution block.
+  const tracked = new WeakSet<object>();
+  /**
+   * Last tick's hits, kept because a death is noticed a tick after the blow that caused it.
+   *
+   * `Player.attackStep` runs `detectDeath()` BEFORE `processIncomingAttacks()`, so the fatal
+   * damage is applied after that tick's death check has already passed and `dying` is not set
+   * until the following tick. Blaming the death on the hits resolving on the tick it is NOTICED
+   * therefore finds nothing - the killer landed one tick earlier.
+   */
+  let previousLanded: Landed[] = [];
   const startedAt = Date.now();
 
   const note = (text: string) => events.push({ tick, text });
@@ -259,13 +547,19 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
   out(
     `zuk harness | seed ${SEED} | loadout ${LOADOUT} | wave ${START_WAVE} | shield ${SHIELD} | ` +
       `tick limit ${TICK_LIMIT} | prayer pool ${PRAYER_OVERRIDE}` +
-      (PRAYER_OVERRIDE === DEFAULT_PRAYER ? " (default - drain cannot end a run)" : ""),
+      (PRAYER_OVERRIDE === DEFAULT_PRAYER ? " (default - drain cannot end a run)" : "") +
+      ` | run ${RUN_OVERRIDE > 0 ? `pinned ${Math.min(RUN_OVERRIDE, 10000)}` : "real drain"}` +
+      (RUN_OVERRIDE === DEFAULT_RUN ? " (default - never walks)" : ""),
   );
 
   // Legacy fake timers on purpose: they fake setTimeout/setInterval (all the engine uses) without
   // freezing Date, so the wall-time figure below stays honest. Inventory clicks route through
   // InputController's setTimeout(inputDelay), so without this every gear switch silently no-ops.
   jest.useFakeTimers("legacy");
+  // Matches the browser's re-seed on the line before its first tick, so a run watched at
+  // /?seed=N&shield=X is the run this reports. See src/index.ts.
+  seedEverything(SEED);
+
   InfernoAutomation.setEnabled(true);
 
   try {
@@ -275,6 +569,14 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
       // the render loop in the browser, so the pump has to own it here.
       if (world.getReadyTimer > 0) {
         world.getReadyTimer--;
+      }
+
+      // Held at the top of the tick so the movement step this tick runs on full energy. Both
+      // fields, because the engine latches `running` to false the moment energy touches zero and
+      // never turns it back on by itself - refilling the number alone would leave it walking.
+      if (RUN_OVERRIDE > 0) {
+        (anyPlayer.currentStats as { run?: number }).run = Math.min(RUN_OVERRIDE, 10000);
+        anyPlayer.running = true;
       }
 
       const hpBefore = hp();
@@ -304,6 +606,30 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
         | undefined;
       if (shieldNow) {
         shieldSeen = true;
+        for (const projectile of (shieldNow as { incomingProjectiles?: unknown[] })
+          .incomingProjectiles ?? []) {
+          if (shieldShotsSeen.has(projectile)) {
+            continue;
+          }
+          const shot = projectile as { remainingDelay?: number; damage?: number };
+          if ((shot.remainingDelay ?? 1) > 0) {
+            continue;
+          }
+          shieldShotsSeen.add(projectile);
+          const damage = shot.damage ?? 0;
+          if (damage > 0) {
+            const from = sourceOf(projectile as { from?: unknown });
+            shieldDamageBySource.set(from, (shieldDamageBySource.get(from) ?? 0) + damage);
+            shieldDamageTotal += damage;
+            shieldHits.push({
+              tick,
+              phase,
+              from,
+              damage,
+              hpAfter: (shieldNow as { currentStats?: { hitpoint: number } }).currentStats?.hitpoint ?? 0,
+            });
+          }
+        }
       } else if (shieldSeen && shieldGoneTick === null) {
         shieldGoneTick = tick;
         note("Zuk's shield destroyed - no cover left");
@@ -312,16 +638,243 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
       const cover = () =>
         !shieldNow ? "NO SHIELD" : covered() ? "covered" : "EXPOSED";
 
-      // ---- Damage attribution. A projectile sits in the player's incoming list for its whole
-      // flight and is removed the tick it resolves, so the set that disappeared between the last
-      // snapshot and this one is exactly what landed this tick. ----
-      const inFlight = new Set<unknown>(anyPlayer.incomingProjectiles);
-      const landed: Landed[] = [];
-      tracked.forEach((projectile) => {
-        if (inFlight.has(projectile)) {
-          return;
+      // Healer lifetimes. Death is "no longer live" rather than removal from the region, so the
+      // death animation does not count as time spent healing.
+      for (const mob of allMobs()) {
+        if (mob.mobName() !== EntityNames.JAL_MEJ_JAK) {
+          continue;
         }
-        const shot = projectile as { damage?: number; attackStyle?: string };
+        if (!healerIndex.has(mob)) {
+          healerIndex.set(mob, healerLives.length);
+          healerLives.push({ spawned: tick, died: null });
+        }
+        const record = healerLives[healerIndex.get(mob) as number];
+        if (record.died === null && mob.dying !== -1) {
+          record.died = tick;
+        }
+      }
+
+      // Fill in the two milestones for anything still unresolved - see `setSpawns`.
+      {
+        const bowNow = weaponForSet(anyPlayer as unknown as Player, "tbow") as
+          | { attackRange?: number }
+          | null;
+        const reachNow = bowNow?.attackRange ?? 0;
+        for (const record of setSpawns) {
+          const mob = record.mob as {
+            location: { x: number; y: number };
+            aggro?: unknown;
+            dying: number;
+          };
+          if (record.taggedAt !== null || mob.dying !== -1) {
+            continue;
+          }
+          if (
+            record.firstInReach === null &&
+            Math.max(
+              Math.abs(mob.location.x - anyPlayer.location.x),
+              Math.abs(mob.location.y - anyPlayer.location.y),
+            ) <= reachNow
+          ) {
+            record.firstInReach = tick;
+          }
+          if (mob.aggro === anyPlayer) {
+            record.taggedAt = tick;
+          }
+        }
+      }
+
+      {
+        const debug = sortieDebug();
+        if (debug.canTag > 0 || debug.canTagCovered > 0) {
+          sortieWantedTicks++;
+          if (debug.sorties > 0 || debug.canTagCovered > 0) {
+            sortieOfferedTicks++;
+          } else {
+            const why = debug.refusedFor ?? "no tile could reach it at all";
+            sortieRefusals.set(why, (sortieRefusals.get(why) ?? 0) + 1);
+          }
+        } else if (liveMobs().some((mob) => {
+          const name = mob.mobName();
+          return (
+            (name === EntityNames.JAL_ZEK || name === EntityNames.JAL_XIL) &&
+            (mob as { aggro?: unknown }).aggro !== anyPlayer
+          );
+        })) {
+          // Something is on the shield and not one tile in the grid can shoot it.
+          sortieWantedTicks++;
+          const why = `nothing in range (budget ${debug.walkTicks ?? "-"})`;
+          sortieRefusals.set(why, (sortieRefusals.get(why) ?? 0) + 1);
+        }
+      }
+
+      if (TRACE && tick >= TRACE.from && tick <= TRACE.to) {
+        const shieldMob = liveMobs().find(
+          (mob) => mob.mobName() === EntityNames.INFERNO_SHIELD,
+        ) as { location?: { x: number }; movementDirection?: boolean; currentStats?: { hitpoint: number } } | undefined;
+        const band = shieldMob?.location
+          ? `${shieldMob.location.x}..${shieldMob.location.x + 4}${shieldMob.movementDirection ? "E" : "W"}`
+          : "gone";
+        const mobs = liveMobs()
+          .filter((mob) =>
+            mob.mobName() === EntityNames.JAL_ZEK || mob.mobName() === EntityNames.JAL_XIL)
+          .map((mob) => {
+            const distance = Math.max(
+              Math.abs(mob.location.x - anyPlayer.location.x),
+              Math.abs(mob.location.y - anyPlayer.location.y),
+            );
+            const tagged = (mob as { aggro?: unknown }).aggro === anyPlayer ? "TAGGED" : "onShield";
+            return `${mob.mobName().replace("Jal-", "")}@${mob.location.x},${mob.location.y} d${distance} ${tagged}`;
+          })
+          .join("  ");
+        out(
+          `TRACE t${String(tick).padStart(4)} player ${anyPlayer.location.x},${anyPlayer.location.y} ` +
+            `| shield ${band} ${shieldMob?.currentStats?.hitpoint ?? "-"}hp ` +
+            `| zukIn ${ZukAttackClock.ticksUntilNextAttack() ?? "-"} ` +
+            `| ${mobs || "no set mobs"} ` +
+            `| ${InfernoAutomation.getAttackState?.() ?? "-"}`,
+        );
+      }
+
+      if (REPLAY) {
+        const shieldMob = liveMobs().find(
+          (mob) => mob.mobName() === EntityNames.INFERNO_SHIELD,
+        ) as
+          | { location?: { x: number }; movementDirection?: boolean; currentStats?: { hitpoint: number } }
+          | undefined;
+        replayFrames.push({
+          t: tick,
+          px: anyPlayer.location.x,
+          py: anyPlayer.location.y,
+          hp: hp(),
+          sx: shieldMob?.location?.x ?? null,
+          sd: Boolean(shieldMob?.movementDirection),
+          shp: shieldMob?.currentStats?.hitpoint ?? 0,
+          mobs: liveMobs()
+            .filter((mob) => mob.mobName() !== EntityNames.INFERNO_SHIELD)
+            .map((mob) => ({
+              n: mob.mobName(),
+              x: mob.location.x,
+              y: mob.location.y,
+              t: (mob as { aggro?: unknown }).aggro === anyPlayer,
+            })),
+          s: InfernoAutomation.getAttackState?.() ?? "-",
+        });
+      }
+
+      // See `tagChances`. The reach asked about is the LONGEST weapon carried, because that is
+      // what decides whether a shot is possible at all - which weapon is on is the bot's problem
+      // and is exactly what this is measuring.
+      {
+        const bow = weaponForSet(anyPlayer as unknown as Player, "tbow") as
+          | { attackRange?: number }
+          | null;
+        const reach = bow?.attackRange ?? 0;
+        const state = InfernoAutomation.getAttackState?.() ?? "-";
+        // `region.mobs` ONLY, deliberately. The automation reads through `visibleMobs`, which
+        // withholds `newMobs` for a tick - a spawn is not knowable until the tick after it lands -
+        // so counting a mob's spawn tick as a missed chance would be grading the bot against
+        // information it is not allowed to have. One phantom miss per set, otherwise.
+        const inReach = anyRegion.mobs
+          .filter((mob) => mob.dying === -1)
+          .filter((mob) => {
+          const name = mob.mobName();
+          if (name !== EntityNames.JAL_ZEK && name !== EntityNames.JAL_XIL) {
+            return false;
+          }
+          if ((mob as { aggro?: unknown }).aggro === anyPlayer) {
+            return false;
+          }
+          return (
+            Math.max(
+              Math.abs(mob.location.x - anyPlayer.location.x),
+              Math.abs(mob.location.y - anyPlayer.location.y),
+            ) <= reach
+          );
+        });
+        if (inReach.length > 0 && PlayerAttackClock.earliestShotOffset() === 1) {
+          // AGGRO, NOT THE STATE STRING. Matching on wording graded the bot against my choice of
+          // words: a rule added to shoot with the held weapon says "shooting ... with what is in
+          // hand", which no pattern written for "attacking ..." matches, so four real tags on
+          // seed 67 were reported as misses. Aggro is the engine's own record of what we are
+          // shooting, and it also counts correctly when the shot goes out on its own from aggro
+          // set on an earlier tick - which is a chance taken, however it was set up.
+          const shooting = inReach.some(
+            (mob) => mob === (anyPlayer as { aggro?: unknown }).aggro,
+          );
+          const reason = state.replace(/^wave 69: /, "").split(" (")[0];
+          tagChances++;
+          if (shooting) {
+            tagChancesTaken++;
+          } else {
+            tagMissReasons.set(reason, (tagMissReasons.get(reason) ?? 0) + 1);
+          }
+          // Uncontested only - one untagged mob in reach, one weapon, nothing to argue with.
+          if (inReach.length === 1) {
+            const name = inReach[0].mobName();
+            soloChances.set(name, (soloChances.get(name) ?? 0) + 1);
+            if (shooting) {
+              soloTaken.set(name, (soloTaken.get(name) ?? 0) + 1);
+            } else {
+              const perMob = soloMissReasons.get(name) ?? new Map<string, number>();
+              perMob.set(reason, (perMob.get(reason) ?? 0) + 1);
+              soloMissReasons.set(name, perMob);
+            }
+          }
+        }
+      }
+
+      // See `untaggedReasons`. Distance is Chebyshev, as the engine measures it, so a reach
+      // explanation can be checked against the weapon rather than taken on trust.
+      for (const mob of liveMobs()) {
+        const name = mob.mobName();
+        if (name !== EntityNames.JAL_ZEK && name !== EntityNames.JAL_XIL) {
+          continue;
+        }
+        if ((mob as { aggro?: unknown }).aggro === anyPlayer) {
+          continue;
+        }
+        const distance = Math.max(
+          Math.abs(mob.location.x - anyPlayer.location.x),
+          Math.abs(mob.location.y - anyPlayer.location.y),
+        );
+        const state = InfernoAutomation.getAttackState?.() ?? "-";
+        // Bucketed to the leading phrase, so "attacking Jal-Xil" and "attacking Jal-Zek" do not
+        // become two reasons, but the distance band is kept - it is the whole reach question.
+        const reason = `${state.replace(/^wave 69: /, "").split(" (")[0].replace(/ (Jal|TzKal)-\S+/, "")}` +
+          ` [d${distance <= 5 ? "<=5" : distance <= 7 ? "6-7" : distance <= 10 ? "8-10" : ">10"}]`;
+        const perMob = untaggedReasons.get(name) ?? new Map<string, number>();
+        perMob.set(reason, (perMob.get(reason) ?? 0) + 1);
+        untaggedReasons.set(name, perMob);
+      }
+
+      // ---- Damage attribution, BY RESOLUTION rather than by removal.
+      //
+      // The old version diffed the incoming-projectile set across ticks and treated anything that
+      // vanished as having just landed. That is a tick late, and the comment claiming otherwise
+      // was wrong: `Unit.processIncomingAttacks` filters `shouldDestroy()` at the START of the
+      // tick and applies damage further down, so a shot resolves on tick N and is still in the
+      // list at postTick N - it only disappears on N+1. Hitpoints therefore fell a tick before
+      // the blame did, and every hit was reported twice by the reconciliation below: once as
+      // unexplained on the real tick, once attributed on the next.
+      //
+      // Resolution is `remainingDelay <= 0`, which is exactly the test the engine itself uses to
+      // decide the shot has arrived. Each projectile is counted once, tracked by identity.
+      //
+      // It also picks up Jad, which the diff could never see. Jad's deferred `super.attack()`
+      // builds a projectile with `reduceDelay: JAD_PROJECTILE_DELAY`, flooring `remainingDelay` at
+      // 1 so it is created and resolved inside a single tick - born and dead between two
+      // snapshots. Resolved-and-still-listed catches it like anything else.
+      const landed: Landed[] = [];
+      for (const projectile of anyPlayer.incomingProjectiles) {
+        if (tracked.has(projectile)) {
+          continue;
+        }
+        const shot = projectile as { damage?: number; attackStyle?: string; remainingDelay?: number };
+        if ((shot.remainingDelay ?? 1) > 0) {
+          continue; // still in flight
+        }
+        tracked.add(projectile);
         if ((shot.damage ?? 0) > 0) {
           landed.push({
             from: sourceOf(projectile as { from?: unknown }),
@@ -329,10 +882,12 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
             style: shot.attackStyle ?? "?",
           });
         }
-      });
-      tracked = inFlight;
+      }
 
       for (const hit of landed) {
+        if (hit.from === EntityNames.TZ_KAL_ZUK && hit.damage > 0) {
+          zukHitTicks.push({ tick, damage: hit.damage });
+        }
         damageTaken += hit.damage;
         damageBySource.set(hit.from, (damageBySource.get(hit.from) ?? 0) + hit.damage);
         recentHits.push({ tick, phase, from: hit.from, damage: hit.damage, hpAfter: hp() });
@@ -343,10 +898,31 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
           note(`took ${hit.damage} from ${hit.from} (hp ${hp()}, ${cover()})`);
         }
       }
+      const landedThisTick = landed;
       const delta = hp() - hpBefore;
       const landedTotal = landed.reduce((sum, hit) => sum + hit.damage, 0);
       if (delta + landedTotal > 0) {
         healed += delta + landedTotal;
+      } else if (delta + landedTotal < 0) {
+        // Damage with no resolved projectile behind it at all. With attribution now happening on
+        // the tick the shot resolves, this should be empty - anything landing here is a genuine
+        // hole rather than the one-tick lag it used to report.
+        const damage = -(delta + landedTotal);
+        unattributedTotal += damage;
+        const jad = liveMobs().find((mob) => isJad(mob)) ?? null;
+        unattributed.push({
+          tick,
+          phase,
+          damage,
+          hpAfter: hp(),
+          overhead: overhead(),
+          jadStyle: jad ? committedStyle(jad) ?? "-" : "no jad",
+          jadLandsIn: jad ? String(ticksUntilJadLands(jad) ?? "-") : "-",
+        });
+        note(
+          `UNATTRIBUTED ${damage} (hp ${hp()}, overhead ${overhead()}, ` +
+            `jad committed ${jad ? committedStyle(jad) ?? "-" : "none"})`,
+        );
       }
       lowestHp = Math.min(lowestHp, hp());
 
@@ -359,6 +935,24 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
         spawnTicks.set(mob, tick);
         const name = mob.mobName();
         spawnCounts[name] = (spawnCounts[name] ?? 0) + 1;
+        if (name === EntityNames.JAL_ZEK || name === EntityNames.JAL_XIL) {
+          setSpawns.push({
+            tick,
+            name,
+            playerX: anyPlayer.location.x,
+            playerY: anyPlayer.location.y,
+            distance: Math.max(
+              Math.abs(mob.location.x - anyPlayer.location.x),
+              Math.abs(mob.location.y - anyPlayer.location.y),
+            ),
+            firstInReach: null,
+            taggedAt: null,
+            healersAlive: liveMobs().filter(
+              (other) => other.mobName() === EntityNames.JAL_MEJ_JAK,
+            ).length,
+            mob,
+          });
+        }
         if (name === EntityNames.JAL_ZEK) {
           note(`set ${spawnCounts[name]} spawned (mager + ranger)`);
         } else if (name === EntityNames.JAL_TOK_JAD) {
@@ -503,14 +1097,60 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
         );
       }
 
-      // ---- Endings. Death first: a dying player is removed from region.players by the engine.
+      if (findLive(EntityNames.TZ_KAL_ZUK)) {
+        zukEverSeen = true;
+      }
+
+      // ---- Endings. ----
+      //
+      // ZUK DYING ENDS THE WAVE, and it is tested ahead of the player's own death on purpose.
+      //
+      // `TzKalZuk.damageTaken` sets `dying = 0` on every other mob the moment Zuk reaches zero -
+      // its own shield included - and `detectDeath` runs after `attackStep`, so Zuk fires one last
+      // shot in the same tick it dies, into an arena where the cover was destroyed earlier in that
+      // same tick. That shot travels three ticks and lands on a player with nothing to stand
+      // behind. Measured, four times in a hundred seeds, always at exactly +4 ticks: 1770 -> 1774,
+      // 2220 -> 2224, 2249 -> 2253, 2581 -> 2585.
+      //
+      // Those runs killed Zuk. Reporting them as deaths counted a win as a loss and, worse, put
+      // four unanswerable positional failures into the death column where they read as a bug in
+      // the movement. There is no tile that survives a shot fired after the shield is already
+      // gone, so there is nothing there to fix.
+      //
+      // NOT the old `no mobs left && ticksUntilNextWave === -1` test, which is what let these
+      // through: `ticksUntilNextWave` is a wave-complete TIMER, so it reads non-negative for a
+      // while after the kill and the run has to survive the countdown to be credited with a win it
+      // has already earned. `findLive` excludes a mob mid-death-animation, so this fires on the
+      // tick Zuk actually dies.
+      if (anyRegion.wave === 69 && zukEverSeen && !findLive(EntityNames.TZ_KAL_ZUK)) {
+        outcome = "completed";
+        cause = `completed in ${tick} ticks with ${hp()} hp left`;
+        break;
+      }
+
+      // Death second: a dying player is removed from region.players by the engine.
       if ((region as unknown as { players: unknown[] }).players.length === 0 || anyPlayer.isDying()) {
         outcome = "died";
-        killers = landed;
-        const blame = landed.length
-          ? landed.map((hit) => `${hit.from} for ${hit.damage}`).join(" + ")
-          : "no projectile resolved on the death tick";
-        cause = `killed by ${blame} at hp ${hpBefore} during ${phase}`;
+        // This tick's hits if there are any, otherwise last tick's - see `previousLanded`.
+        killers = landed.length ? landed : previousLanded;
+        // The tick offset between the blow and the death being noticed is a property of
+        // `Player.attackStep` running detectDeath before processIncomingAttacks, not of the run -
+        // so it belongs in the source, not in every death line.
+        const blame = killers.length
+          ? killers.map((hit) => `${hit.from} for ${hit.damage}`).join(" + ")
+          : "nothing resolved on the death tick or the one before";
+        // Cover state belongs in the cause, not just the arena dump. Without the shield there is
+        // no positional answer to Zuk at all, so "died to Zuk" means something completely
+        // different depending on this - and it is the first thing worth knowing.
+        const coverAtDeath =
+          shieldGoneTick !== null
+            ? ` - NO SHIELD (destroyed t${shieldGoneTick})`
+            : covered()
+              ? ""
+              : " - EXPOSED, shield alive";
+        // hp and phase are already their own columns in the sweep table, so repeating them
+        // here only pushed the part that differs per seed off the end of the line.
+        cause = `killed by ${blame}${coverAtDeath}`;
         break;
       }
 
@@ -530,14 +1170,108 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
           zukWaveHadMobs = true;
         } else if (zukWaveHadMobs && anyRegion.ticksUntilNextWave === -1) {
           outcome = "completed";
-          cause = `Zuk down in ${tick} ticks with ${hp()} hp left`;
+          cause = `completed in ${tick} ticks with ${hp()} hp left`;
           break;
         }
       }
+
+      // ---- Zuk fire audit. See `beliefs`. ----
+      //
+      // AFTER tickWorld, which is what makes the readings the right ones. Mobs step before
+      // players, so on a tick Zuk fires: the shield has ALREADY moved and its position now is the
+      // one Zuk aimed against, while the player has NOT yet moved from where Zuk saw them - which
+      // is the position at the end of the previous tick, hence `prevPlayer`.
+      {
+        const zukNow = findLive(EntityNames.TZ_KAL_ZUK) as
+          | { attackDelay?: number; attackSpeed?: number }
+          | null;
+        const shieldMob = liveMobs().find(
+          (mob) => mob.mobName() === EntityNames.INFERNO_SHIELD,
+        ) as { location?: { x: number }; movementDirection?: boolean; frozen?: number } | undefined;
+        const shieldX = shieldMob?.location?.x ?? null;
+        const shieldDir = shieldMob?.movementDirection ?? null;
+        const shieldFrozen = shieldMob?.frozen ?? 0;
+        const untilFire = ZukAttackClock.ticksUntilNextAttack();
+        const chosen = InfernoAutomation.getChosenTile?.() ?? null;
+
+        const belief: Belief = {
+          tick,
+          untilFire,
+          predictedFireTick: untilFire === null ? null : tick + untilFire,
+          playerX: anyPlayer.location.x,
+          playerY: anyPlayer.location.y,
+          shieldX,
+          shieldDir,
+          shieldFrozen,
+          // The scorer's own projection, called rather than reimplemented - a copy of it here
+          // would agree with a broken original by construction.
+          projectedShieldX:
+            shieldX === null || untilFire === null || shieldDir === null
+              ? null
+              : projectShield({ x: shieldX, direction: shieldDir, frozen: shieldFrozen }, untilFire)
+                  .x,
+          chosenX: chosen?.x ?? null,
+          chosenY: chosen?.y ?? null,
+          standingSafe: covered(),
+          standingCovered:
+            shieldX !== null &&
+            isCoveredByShield(anyPlayer.location.x, anyPlayer.location.y, shieldX),
+          destX:
+            ((anyPlayer as { destinationLocation?: { x: number; y: number } | null })
+              .destinationLocation ?? null)?.x ?? null,
+          destY:
+            ((anyPlayer as { destinationLocation?: { x: number; y: number } | null })
+              .destinationLocation ?? null)?.y ?? null,
+          running: Boolean((anyPlayer as { running?: boolean }).running),
+          runEnergy: (anyPlayer.currentStats as { run?: number }).run ?? 0,
+          // Chebyshev, because a diagonal step is one move in this engine.
+          moved: Math.max(
+            Math.abs(anyPlayer.location.x - prevPlayerX),
+            Math.abs(anyPlayer.location.y - prevPlayerY),
+          ),
+        };
+        beliefs.push(belief);
+        if (beliefs.length > 16) {
+          beliefs.shift();
+        }
+
+        // A FIRE IS THE DELAY GOING UP, the same rule ZukAttackClock syncs on: `didAttack` sets
+        // attackDelay back to attackSpeed at the moment of firing, so a reading higher than last
+        // tick's is an attack and nothing else is.
+        const delayNow = zukNow?.attackDelay ?? null;
+        if (delayNow !== null && lastZukDelay !== null && delayNow > lastZukDelay) {
+          zukAttacks++;
+          const aimedCovered =
+            shieldX !== null && isCoveredByShield(prevPlayerX, prevPlayerY, shieldX);
+          if (!aimedCovered) {
+            zukFiresUncovered++;
+            fires.push({
+              tick,
+              aimedAtX: prevPlayerX,
+              aimedAtY: prevPlayerY,
+              shieldX,
+              covered: aimedCovered,
+              // Whatever Zuk put on us this tick, so a breach that cost nothing is still visible.
+              // Filled in by the report - the shot has three ticks of travel still to run.
+              damage: 0,
+              trail: beliefs.slice(-12).map((entry) => ({ ...entry })),
+            });
+          }
+        }
+        lastZukDelay = delayNow;
+        prevPlayerX = anyPlayer.location.x;
+        prevPlayerY = anyPlayer.location.y;
+      }
+
+      // LAST thing in the iteration, past every `break` above. Set any earlier and the death
+      // check reads this tick's hits back as if they were last tick's, which is the same empty
+      // list it already had.
+      previousLanded = landedThisTick;
     }
   } finally {
-    // Read before disabling - setEnabled(false) clears the automation's rolling log.
+    // Read before disabling - setEnabled(false) clears the automation's per-run state.
     botLogAtStop = InfernoAutomation.getLog();
+    scaffoldHealing = InfernoAutomation.getZukHealing?.() ?? { used: 0, total: 0 };
     InfernoAutomation.setEnabled(false);
     jest.useRealTimers();
     restoreConsole();
@@ -578,6 +1312,294 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
   }
 
   out("");
+  out("unattributed damage (no projectile to blame - see the note in the source):");
+  if (unattributed.length === 0) {
+    out("  (none - every point of damage had a projectile behind it)");
+  }
+  for (const hit of unattributed) {
+    out(
+      `  t${String(hit.tick).padStart(4)}  ${String(hit.damage).padStart(3)} ` +
+        `-> hp ${String(hit.hpAfter).padStart(3)} | overhead ${hit.overhead.padEnd(16)} ` +
+        `| jad committed ${hit.jadStyle.padEnd(6)} lands in ${hit.jadLandsIn}  [${hit.phase}]`,
+    );
+  }
+  if (unattributed.length > 0) {
+    out(`  ${unattributed.length} hits, ${unattributedTotal} damage total`);
+  }
+
+  out("");
+  out(`zuk attacks: ${zukAttacks} | fired at an UNCOVERED player ${zukFiresUncovered} time` +
+    `${zukFiresUncovered === 1 ? "" : "s"}` +
+    `${zukAttacks > 0 ? ` (1 in ${Math.round(zukAttacks / Math.max(1, zukFiresUncovered))})` : ""}`);
+  if (fires.length === 0) {
+    out("  (every shot was aimed at a covered player - the model held all run)");
+  }
+  for (const fire of fires) {
+    // The shot lands three ticks out; anything from Zuk in the next few ticks belongs to it.
+    const hit = zukHitTicks.find((h) => h.tick > fire.tick && h.tick <= fire.tick + 5);
+    out("");
+    out(
+      `  BREACH t${fire.tick}: zuk aimed at ${fire.aimedAtX},${fire.aimedAtY} | ` +
+        `shield x ${fire.shieldX ?? "-"} (covers ${fire.shieldX ?? "-"}..${
+          fire.shieldX === null ? "-" : fire.shieldX + 4
+        }) | ` +
+        `${hit ? `HIT for ${hit.damage} on t${hit.tick}` : "no damage"}`,
+    );
+    out(
+      "    tick  untilFire  predFire  player  shield  proj  chosen   scorer  real  mv  dest     run",
+    );
+    for (const b of fire.trail) {
+      // predFire === the fire tick means this row is a belief ABOUT the shot that broke through.
+      const aboutThisShot = b.predictedFireTick === fire.tick ? "*" : " ";
+      out(
+        `    ${String(b.tick).padStart(4)}${aboutThisShot} ` +
+          `${String(b.untilFire ?? "-").padStart(9)} ` +
+          `${String(b.predictedFireTick ?? "-").padStart(9)} ` +
+          `${`${b.playerX},${b.playerY}`.padStart(7)} ` +
+          `${String(b.shieldX ?? "-").padStart(7)}${b.shieldDir === null ? " " : b.shieldDir ? "E" : "W"}` +
+          `${b.shieldFrozen > 0 ? `f${b.shieldFrozen}` : "  "} ` +
+          `${String(b.projectedShieldX ?? "-").padStart(4)} ` +
+          `${`${b.chosenX ?? "-"},${b.chosenY ?? "-"}`.padStart(7)} ` +
+          `${(b.standingSafe ? "safe" : "UNSAFE").padStart(7)} ` +
+          `${b.standingCovered ? "cov" : "EXP"}` +
+          `${String(b.moved).padStart(4)}  ` +
+          `${`${b.destX ?? "-"},${b.destY ?? "-"}`.padEnd(7)} ` +
+          `${b.running ? "run" : "WALK"}${String(Math.round(b.runEnergy / 100)).padStart(4)}%`,
+      );
+    }
+    out(
+      "    (* = a belief about THIS shot. proj = what the scorer projected the shield to be at " +
+        "the fire tick.",
+    );
+    out(
+      "     scorer = its verdict on the tile the player stood on; real = TzKalZuk's own cover " +
+        "test on that tile.)",
+    );
+  }
+
+  out("");
+  out("healers, and whether any set landed while one was alive:");
+  if (healerLives.length === 0) {
+    out("  (no healers ever spawned)");
+  }
+  for (const life of healerLives) {
+    out(
+      `  Jal-MejJak  t${life.spawned} -> ${life.died === null ? "still alive at the end" : `t${life.died}`}` +
+        `${life.died === null ? "" : ` (${life.died - life.spawned} ticks)`}`,
+    );
+  }
+  {
+    const overlapping = setSpawns.filter((record) => record.healersAlive > 0);
+    const setTicks: number[] = [];
+    for (const record of overlapping) {
+      if (setTicks.indexOf(record.tick) < 0) {
+        setTicks.push(record.tick);
+      }
+    }
+    out(
+      setTicks.length === 0
+        ? "  NO set spawned while a healer was alive - healers are ruled out"
+        : `  ${setTicks.length} set(s) landed with healers alive: ${setTicks
+            .map((tick) => `t${tick}`)
+            .join(", ")}`,
+    );
+  }
+
+  out("");
+  out("every set mob, spawn -> in reach -> tagged:");
+  out("  spawn  mob       player   dist  inReach(+n)  tagged(+n)   note");
+  for (const record of setSpawns) {
+    const reachGap = record.firstInReach === null ? null : record.firstInReach - record.tick;
+    const tagGap = record.taggedAt === null ? null : record.taggedAt - record.tick;
+    // The two halves of the gap, named. Geometry is spawn -> in reach; the automation owns the
+    // rest, and anything past one cooldown there is a real delay.
+    const note =
+      record.taggedAt === null
+        ? "NEVER TAGGED"
+        : reachGap === null
+          ? "-"
+          : `${reachGap} waiting for reach, ${(tagGap ?? 0) - reachGap} to shoot`;
+    out(
+      `  t${String(record.tick).padStart(5)}  ${record.name.padEnd(9)} ` +
+        `${`${record.playerX},${record.playerY}`.padEnd(7)} ` +
+        `${String(record.distance).padStart(4)}  ` +
+        `${String(record.firstInReach ?? "-").padStart(6)}${`(+${reachGap ?? "-"})`.padEnd(6)} ` +
+        `${String(record.taggedAt ?? "-").padStart(6)}${`(+${tagGap ?? "-"})`.padEnd(6)}  ${note}`,
+    );
+  }
+
+  out("");
+  out(
+    `tagging as soon as possible: ${tagChancesTaken}/${tagChances} chances taken` +
+      `${tagChances > 0 ? ` (${Math.round((tagChancesTaken / tagChances) * 100)}%)` : ""}`,
+  );
+  if (tagChances === tagChancesTaken) {
+    out("  (every tick where a tag was both in reach and off cooldown was used on one)");
+  }
+  {
+    const rows: { reason: string; ticks: number }[] = [];
+    tagMissReasons.forEach((ticks, reason) => rows.push({ reason, ticks }));
+    rows.sort((a, b) => b.ticks - a.ticks);
+    for (const row of rows) {
+      out(`  MISSED ${String(row.ticks).padStart(4)}  ${row.reason}`);
+    }
+  }
+  out("");
+  out("uncontested chances (that mob was the ONLY untagged one in reach):");
+  if (soloChances.size === 0) {
+    out("  (never - a tag was always competing with the other half of the pair)");
+  }
+  soloChances.forEach((chances, name) => {
+    const taken = soloTaken.get(name) ?? 0;
+    out(
+      `  ${name.padEnd(10)} ${taken}/${chances} taken` +
+        `${chances > 0 ? ` (${Math.round((taken / chances) * 100)}%)` : ""}`,
+    );
+    const perMob = soloMissReasons.get(name);
+    if (perMob) {
+      const rows: { reason: string; ticks: number }[] = [];
+      perMob.forEach((ticks, reason) => rows.push({ reason, ticks }));
+      rows.sort((a, b) => b.ticks - a.ticks);
+      for (const row of rows) {
+        out(`      MISSED ${String(row.ticks).padStart(4)}  ${row.reason}`);
+      }
+    }
+  });
+
+  out("");
+  out(
+    `step-out (sortie): ${sortieOfferedTicks}/${sortieWantedTicks} ticks had a firing tile ` +
+      `available while something was still on the shield`,
+  );
+  {
+    const rows: { why: string; ticks: number }[] = [];
+    sortieRefusals.forEach((ticks, why) => rows.push({ why, ticks }));
+    rows.sort((a, b) => b.ticks - a.ticks);
+    for (const row of rows) {
+      out(`  REFUSED ${String(row.ticks).padStart(4)}  ${row.why}`);
+    }
+  }
+
+  out("");
+  out("why a set mob was left untagged, per tick it stayed on the shield:");
+  if (untaggedReasons.size === 0) {
+    out("  (nothing ever sat untagged)");
+  }
+  untaggedReasons.forEach((perMob, name) => {
+    const rows: { reason: string; ticks: number }[] = [];
+    perMob.forEach((ticks, reason) => rows.push({ reason, ticks }));
+    rows.sort((a, b) => b.ticks - a.ticks);
+    const total = rows.reduce((sum, row) => sum + row.ticks, 0);
+    out(`  ${name} - ${total} untagged ticks in total`);
+    for (const row of rows) {
+      out(
+        `    ${String(row.ticks).padStart(4)}  ${String(Math.round((row.ticks / total) * 100)).padStart(3)}%  ` +
+          row.reason,
+      );
+    }
+  });
+
+  out("");
+  out(`shield damage by source (${shieldDamageTotal} attributed):`);
+  if (shieldDamageBySource.size === 0) {
+    out("  (nothing resolved against the shield)");
+  }
+  const shieldRows: { source: string; amount: number }[] = [];
+  shieldDamageBySource.forEach((amount, source) => shieldRows.push({ source, amount }));
+  shieldRows.sort((a, b) => b.amount - a.amount);
+  for (const { source, amount } of shieldRows) {
+    const share = shieldDamageTotal > 0 ? Math.round((amount / shieldDamageTotal) * 100) : 0;
+    out(
+      `  ${source.padEnd(16)} ${String(amount).padStart(5)}  ${String(share).padStart(3)}%` +
+        `${source === EntityNames.TZ_KAL_ZUK ? "  (structural - shots we hid from)" : "  (tag delay)"}`,
+    );
+  }
+
+  // EVERY HIT, NAMED AND TIMED AGAINST ITS OWN SET.
+  //
+  // The tick alone says nothing; the offset from that set's spawn says everything, because both
+  // halves fire on a fixed schedule from the moment they land - `spawnDelay` 7 on the mager and 9
+  // on the ranger, then every `attackSpeed` 4 ticks, with about three ticks of travel on top. So
+  // an offset of +11 is their FIRST shot arriving and every later one is 4 ticks behind the last.
+  //
+  // Which makes the target exact rather than vague: a tag has to land before +7, not merely
+  // "fast". A tag at +10 is already a hit taken, because their shot was in the air before ours
+  // resolved. Each further 4 ticks of delay is one more hit, and a hit averages about 45 - so the
+  // shield's 600 is a budget of roughly thirteen of them for the whole fight.
+  if (shieldHits.length > 0) {
+    const setTicks: number[] = [];
+    for (const record of setSpawns) {
+      if (setTicks.indexOf(record.tick) < 0) {
+        setTicks.push(record.tick);
+      }
+    }
+    setTicks.sort((a, b) => a - b);
+    const setOf = (tick: number) => {
+      let index = 0;
+      for (let i = 0; i < setTicks.length; i++) {
+        if (tick >= setTicks[i]) {
+          index = i + 1;
+        }
+      }
+      return index;
+    };
+    const who: Record<string, string> = {
+      [EntityNames.JAL_ZEK]: "MAGER",
+      [EntityNames.JAL_XIL]: "RANGER",
+      [EntityNames.JAL_TOK_JAD]: "JAD",
+    };
+    out("");
+    out("every hit the shield took:");
+    out("  set  tick    who      +after spawn   dmg   shield left");
+    let left = 600;
+    for (const hit of shieldHits) {
+      const index = setOf(hit.tick);
+      const offset = index > 0 ? hit.tick - setTicks[index - 1] : null;
+      left -= hit.damage;
+      out(
+        `   ${String(index || "-").padEnd(3)} t${String(hit.tick).padEnd(6)} ` +
+          `${(who[hit.from] ?? hit.from).padEnd(7)}  ` +
+          `+${String(offset ?? "-").padEnd(12)} ` +
+          `${String(hit.damage).padStart(3)}   ${String(left).padStart(3)}`,
+      );
+    }
+  }
+
+  // WHEN it drained, in blocks, because a total cannot tell a steady bleed from a burst. A set
+  // arriving and going untagged shows up as one block doing far more than its neighbours.
+  if (shieldHits.length > 0) {
+    const BLOCK = 250;
+    const blocks = new Map<number, { total: number; zuk: number; set: number }>();
+    for (const hit of shieldHits) {
+      const key = Math.floor(hit.tick / BLOCK) * BLOCK;
+      const row = blocks.get(key) ?? { total: 0, zuk: 0, set: 0 };
+      row.total += hit.damage;
+      if (hit.from === EntityNames.TZ_KAL_ZUK) {
+        row.zuk += hit.damage;
+      } else {
+        row.set += hit.damage;
+      }
+      blocks.set(key, row);
+    }
+    const keys: number[] = [];
+    blocks.forEach((_row, key) => keys.push(key));
+    keys.sort((a, b) => a - b);
+    out("");
+    out(`shield drain per ${BLOCK} ticks (zuk = shots we hid from, set = tag delay):`);
+    for (const key of keys) {
+      const row = blocks.get(key);
+      if (!row) {
+        continue;
+      }
+      out(
+        `  t${String(key).padStart(4)}-${String(key + BLOCK - 1).padEnd(5)} ` +
+          `${String(row.total).padStart(4)} total | zuk ${String(row.zuk).padStart(4)} | ` +
+          `set ${String(row.set).padStart(4)}  ${"#".repeat(Math.min(40, Math.round(row.total / 5)))}`,
+      );
+    }
+  }
+
+  out("");
   out("damage taken by source:");
   // forEach, NOT spread or for...of: with target es5 and no downlevelIteration, TypeScript
   // compiles Map iteration into an index-based loop that iterates zero times - silently.
@@ -615,7 +1637,7 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
           `hp ${mob.currentStats?.hitpoint ?? "?"}${(mob.frozen ?? 0) > 0 ? ` | frozen ${mob.frozen}` : ""}`,
       );
     }
-    const botLog = botLogAtStop.split("\n").slice(-12);
+    const botLog = botLogAtStop.split("\n").slice(-35);
     if (botLog.length > 0 && botLog[0] !== "") {
       out("last automation ticks:");
       for (const line of botLog) {
@@ -655,8 +1677,53 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
     lowestHp,
     prayer: prayer(),
     prayerPool: PRAYER_OVERRIDE,
+    runPool: RUN_OVERRIDE,
     overhead: overhead(),
+    scaffoldHealing,
+    zukAttacks,
+    zukFiresUncovered,
+    zukBreaches: fires.map((fire) => ({
+      tick: fire.tick,
+      aimedAt: { x: fire.aimedAtX, y: fire.aimedAtY },
+      shieldX: fire.shieldX,
+      damage: zukHitTicks.find((h) => h.tick > fire.tick && h.tick <= fire.tick + 5)?.damage ?? 0,
+      trail: fire.trail,
+    })),
+    setSpawns: setSpawns.map((record) => ({
+      tick: record.tick,
+      name: record.name,
+      playerX: record.playerX,
+      playerY: record.playerY,
+      distance: record.distance,
+      firstInReach: record.firstInReach,
+      taggedAt: record.taggedAt,
+      healersAlive: record.healersAlive,
+    })),
+    healerLives,
+    sortieOfferedTicks,
+    sortieWantedTicks,
+    tagChances,
+    tagChancesTaken,
+    soloChances: (() => {
+      const asObject: Record<string, { chances: number; taken: number }> = {};
+      soloChances.forEach((chances, name) => {
+        asObject[name] = { chances, taken: soloTaken.get(name) ?? 0 };
+      });
+      return asObject;
+    })(),
+    shieldDamageTotal,
+    shieldHits,
+    shieldDamageBySource: (() => {
+      const asObject: Record<string, number> = {};
+      shieldDamageBySource.forEach((amount, source) => {
+        asObject[source] = amount;
+      });
+      return asObject;
+    })(),
     damageTaken,
+    unattributedDamage: unattributedTotal,
+    unattributedHits: unattributed.length,
+    unattributed,
     healed,
     damageBySource: bySource.reduce(
       (map, [source, total]) => {
@@ -693,6 +1760,15 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
       `rangers ${summary.rangersSpawned} spawned, ${summary.rangersAlive} still up`,
   );
   out(
+    `unattributed (jad): ${unattributedTotal} over ${unattributed.length} hit` +
+      `${unattributed.length === 1 ? "" : "s"}`,
+  );
+  out(
+    `test heal used ${scaffoldHealing.used}/${scaffoldHealing.total} | sets seen ${
+      spawnCounts[EntityNames.JAL_ZEK] ?? 0
+    }`,
+  );
+  out(
     `player hp ${hp()} (lowest ${lowestHp}) | took ${damageTaken}, healed ${healed} | ` +
       `brew doses ${endingSupplies.brews}/${startingSupplies.brews}, ` +
       `restore doses ${endingSupplies.restores}/${startingSupplies.restores}`,
@@ -712,6 +1788,20 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
   // Machine-readable, one line, for zukSweep.js. Kept last so a truncated log still ends with it.
   out(`ZUK_JSON ${JSON.stringify(summary)}`);
   out("");
+
+  if (REPLAY) {
+    // Beside the log when the sweep says where, otherwise beside the results folder so a bare
+    // `npm run test:zuk` still produces one somewhere findable.
+    const target =
+      process.env.ZUK_REPLAY_OUT ||
+      path.resolve("test/harness/zuk-results", `seed-${SEED}.replay.html`);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(
+      target,
+      buildReplayHtml(SEED, replayFrames, shieldHits, setSpawns.map((record) => record.tick)),
+    );
+    out(`replay written: ${target} (${replayFrames.length} frames)`);
+  }
 
   if (JSON_OUT) {
     fs.mkdirSync(path.dirname(path.resolve(JSON_OUT)), { recursive: true });

@@ -11,6 +11,12 @@
  *   npm run test:zuk-sweep                        50 seeds (1..50), cores-1 in parallel
  *   ZUK_SEEDS=20 npm run test:zuk-sweep           seeds 1..20
  *   ZUK_SEED_START=100 npm run test:zuk-sweep     seeds 100..149
+ *   ZUK_SEED_LIST=38 npm run test:zuk-sweep        just seed 38
+ *   ZUK_SEED_LIST=11,38,73 npm run test:zuk-sweep  only those three, in that order
+ *
+ * ZUK_SEED_LIST wins over the range when both are set. It is the one to reach for when a specific
+ * seed has misbehaved: the report is identical to a full sweep's, so every per-seed section - the
+ * tag chances, the shield drain, the breach trails - is there for the one run.
  *   ZUK_PARALLEL=4 npm run test:zuk-sweep         cap concurrent runs at 4
  *
  * Every INFERNO_ and ZUK_ environment variable passes straight through to every run, so the
@@ -40,13 +46,23 @@ const STAMP = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
 const OUT_DIR = path.join(__dirname, "zuk-results", STAMP);
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
-const seeds = Array.from({ length: SEED_COUNT }, (_, i) => SEED_START + i);
+/** An explicit list beats the range - see the usage note above. Junk entries are dropped. */
+const SEED_LIST = (process.env.ZUK_SEED_LIST ?? "")
+  .split(",")
+  .map((entry) => parseInt(entry.trim(), 10))
+  .filter((seed) => Number.isFinite(seed));
+const seeds =
+  SEED_LIST.length > 0
+    ? SEED_LIST
+    : Array.from({ length: SEED_COUNT }, (_, i) => SEED_START + i);
 const results = [];
 let nextIndex = 0;
 const startedAt = Date.now();
 
 console.log(
-  `zuk sweep | seeds ${SEED_START}..${SEED_START + SEED_COUNT - 1} | ` +
+  `zuk sweep | seeds ${
+    SEED_LIST.length > 0 ? seeds.join(",") : `${SEED_START}..${SEED_START + SEED_COUNT - 1}`
+  } | ` +
     `loadout ${process.env.INFERNO_LOADOUT ?? "max_tbow_speed"} | wave ${process.env.ZUK_WAVE ?? 69} | ` +
     `prayer ${process.env.INFERNO_PRAYER ?? 99999} | ` +
     `${PARALLEL} in parallel | logs in ${path.relative(ROOT, OUT_DIR)}`,
@@ -77,7 +93,17 @@ function runSeed(seed) {
     const log = fs.createWriteStream(logPath);
     const child = spawn(process.execPath, [JEST, "--config", "jest.zuk.config.js"], {
       cwd: ROOT,
-      env: { ...process.env, INFERNO_SEED: String(seed) },
+      // The replay lands beside the log rather than wherever the run happens to be started
+      // from. ZUK_JSON_OUT is deliberately NOT used for this - the sweep reads the summary off
+      // stdout and never sets it, so anything gated on it never fires.
+      env: {
+        ...process.env,
+        INFERNO_SEED: String(seed),
+        ZUK_REPLAY_OUT:
+          process.env.ZUK_REPLAY === "1"
+            ? path.join(OUT_DIR, `seed-${seed}.replay.html`)
+            : "",
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -225,12 +251,19 @@ Promise.all(Array.from({ length: Math.min(PARALLEL, seeds.length) }, worker)).th
 
   put("");
   put("per seed:");
-  put("  seed | outcome         | phase    | ticks | zuk  | hp  | why");
+  put("  seed | outcome         | phase    | ticks | zuk  | hp  | heal  | sets | brch | why");
   for (const r of results) {
     put(
       `  ${String(r.seed).padStart(4)} | ${String(r.outcome).padEnd(15)} | ` +
         `${String(r.phase).padEnd(8)} | ${String(r.ticks).padStart(5)} | ` +
-        `${String(r.zukHp ?? "-").padStart(4)} | ${String(r.hp ?? "-").padStart(3)} | ${r.cause ?? ""}`,
+        `${String(r.zukHp ?? "-").padStart(4)} | ${String(r.hp ?? "-").padStart(3)} | ` +
+        `${String(((r.scaffoldHealing || {}).used) ?? "-").padStart(3)}/${
+          ((r.scaffoldHealing || {}).total) ?? "-"
+        } | ${String(r.sets ?? "-").padStart(4)} | ${
+          // Zuk shots aimed at an uncovered player. Anything but 0 means the cover model was
+          // wrong that many times - see the BREACH blocks in that seed's own log.
+          String(r.zukFiresUncovered ?? "-").padStart(4)
+        } | ${r.cause ?? ""}`,
     );
   }
 

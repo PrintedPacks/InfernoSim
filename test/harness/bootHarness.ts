@@ -38,6 +38,8 @@ export interface BootOptions {
   query?: string;
   /** Override the prayer pool for the whole run; NaN or undefined leaves the loadout's. */
   prayerOverride?: number;
+  /** Override the run-energy pool for the whole run; NaN or undefined leaves the loadout's. */
+  runOverride?: number;
   /** Which way Zuk's shield sets off. "random" is the browser default and is seeded. */
   shieldDirection?: ShieldDirection;
 }
@@ -48,17 +50,9 @@ export interface BootedRun {
   player: ReturnType<InfernoRegion["initialiseRegion"]>["player"];
 }
 
-/** Deterministic PRNG (mulberry32) - splittable enough for two independent streams. */
-export function mulberry32(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (state + 0x6d2b79f5) >>> 0;
-    let t = state;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+/** Re-exported so existing importers keep working; the implementation lives in src. */
+export { mulberry32 } from "../../src/content/inferno/js/SeededRandom";
+import { seedEverything } from "../../src/content/inferno/js/SeededRandom";
 
 /** Bypass jest's console capture so a report reads as plain lines, not log noise. */
 export function out(line: string) {
@@ -90,8 +84,7 @@ export function restoreConsole() {
 
 export function bootHarness(options: BootOptions): BootedRun {
   // ---- Seed every randomness source before any world object exists. ----
-  Random.setRandom(mulberry32(options.seed));
-  Math.random = mulberry32(options.seed ^ 0x9e3779b9);
+  seedEverything(options.seed);
 
   // ---- The DOM the boot sequence expects: real index.html body + real sidebar. ----
   const indexHtml = fs.readFileSync(
@@ -149,6 +142,19 @@ export function bootHarness(options: BootOptions): BootedRun {
   if (options.prayerOverride !== undefined && !isNaN(options.prayerOverride)) {
     player.stats.prayer = options.prayerOverride;
     player.currentStats.prayer = options.prayerOverride;
+  }
+
+  // Same idea for run energy, and it matters more than it looks. The engine flips `running` to
+  // false at zero and never turns it back on, and `InfernoAutomation.restoreRun` refuses below
+  // RUN_RESTORE_THRESHOLD - so a drained run walks at one tile a tick for the rest of the fight
+  // while every arrival estimate in the tile scorer still assumes PLAYER_TILES_PER_TICK = 2.
+  // With the pool deep enough to never drain, that whole class of failure is off the table and
+  // what is left is the behaviour actually under test.
+  const runStats = player.stats as unknown as { run?: number };
+  const runCurrent = player.currentStats as unknown as { run?: number };
+  if (options.runOverride !== undefined && !isNaN(options.runOverride)) {
+    runStats.run = options.runOverride;
+    runCurrent.run = options.runOverride;
   }
 
   return { region, world, player };

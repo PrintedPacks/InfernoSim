@@ -8,10 +8,14 @@ import { applyAttackPlan } from "./AttackPlanner";
 import { equipSet, GearSetName, isWearing, requiredSetFor, weaponForSet } from "./GearSets";
 import { hasIceBarrageSelected, selectedSpell, selectIceBarrage } from "./SpellCaster";
 import { isAttackable } from "./AttackPlanner";
-import { bestMove, focusNibbler, ScoredTile, scoreCandidates, waveHomeTile } from "./TileScorer";
+import { bestMove, focusNibbler, ScoredTile, scoreCandidates, scoreZukTiles, waveHomeTile } from "./TileScorer";
 import { hasDyingBlob } from "./Trajectory";
+import { PlayerAttackClock } from "./PlayerAttackClock";
+import { ShieldAttackerClock } from "./ShieldAttackerClock";
+import { ZukAttackClock } from "./ZukAttackClock";
+import { ZukSetTimer } from "./ZukSetTimer";
 import { ArenaSnapshot } from "./ArenaSnapshot";
-import { chooseByPriority, chooseJadWaveTarget, chooseZukWaveTarget, killPriority } from "./KillPriority";
+import { chooseByPriority, chooseJadWaveTarget, killPriority } from "./KillPriority";
 import { nibblerThreats, observeNibblers } from "./PillarDefence";
 import { attackOptionFor, chooseTarget } from "./TargetPlanner";
 import { visibleMobs } from "./Visibility";
@@ -148,6 +152,11 @@ export class InfernoAutomation {
     return InfernoAutomation.log.join("\n");
   }
 
+  /** What the bot decided this tick, verbatim - the same string its own log line carries. */
+  static getAttackState(): string {
+    return InfernoAutomation.attackState;
+  }
+
   static getChosenTile(): Location | null {
     return InfernoAutomation.chosenTile;
   }
@@ -210,12 +219,6 @@ export class InfernoAutomation {
   private static forceTarget: Mob | null = null;
   private static forceTicks = 0;
 
-  /**
-   * The Zuk-wave mager/ranger tag pairing: the OTHER one, once exactly one of the pair has
-   * been tagged, forced ahead of normal priority until it too is tagged. See the comment at
-   * the call site in `decide()` for the flinch-delay mechanic this exists to avoid.
-   */
-  private static zukPairForceTarget: Mob | null = null;
 
   /**
    * Every time the backstop has engaged this run - the instrumentation that keeps a forced
@@ -223,6 +226,19 @@ export class InfernoAutomation {
    * that only cleared because the bot was shoved reads as exactly that in every sweep.
    */
   private static forcedAttacks = 0;
+
+  /**
+    * Hitpoints healed by the wave-69 test scaffolding, and the cap it is drawing from.
+    *
+    * Reported so a run cannot look survivable on the strength of healing the real client would
+    * have done differently - see the note on ZUK_HEAL_AMOUNT.
+    */
+  static getZukHealing(): { used: number; total: number } {
+    return {
+      used: InfernoAutomation.zukHealsUsed * InfernoAutomation.ZUK_HEAL_AMOUNT,
+      total: InfernoAutomation.ZUK_HEAL_COUNT * InfernoAutomation.ZUK_HEAL_AMOUNT,
+    };
+  }
 
   static getForcedAttackCount(): number {
     return InfernoAutomation.forcedAttacks;
@@ -265,6 +281,10 @@ export class InfernoAutomation {
     InfernoAutomation.route = [];
     InfernoAutomation.target = null;
     InfernoAutomation.walkingTo = null;
+    InfernoAutomation.zukOnRangerSide = null;
+    InfernoAutomation.zukSelfClicked = false;
+    InfernoAutomation.zukHealsUsed = 0;
+    InfernoAutomation.zukEnraged = false;
     InfernoAutomation.chosenTile = null;
     InfernoAutomation.chosenPath = undefined;
     InfernoAutomation.chosenIsSafeSpot = false;
@@ -272,7 +292,6 @@ export class InfernoAutomation {
     InfernoAutomation.idleTicks = 0;
     InfernoAutomation.forceTarget = null;
     InfernoAutomation.forceTicks = 0;
-    InfernoAutomation.zukPairForceTarget = null;
     InfernoAutomation.stackHoldTicks = 0;
     InfernoAutomation.scoredTiles = [];
     InfernoAutomation.hoverTile = null;
@@ -542,269 +561,6 @@ export class InfernoAutomation {
   }
 
   /**
-   * The Zuk fight's target, as a boss-specific SEQUENCE rather than a flat ranking - `Jal-Xil`
-   * (8) and `Jal-Zek` (6) already outrank Zuk (2) in `ZUK_WAVE_PRIORITY`, but a flat table
-   * cannot express "attack Zuk instead of the mager you could otherwise reach", which is most
-   * of what this fight actually asks for. Every rule below reads off CURRENT observable state
-   * (Zuk's live hp, which mobs exist, whether each has been tagged) rather than remembered
-   * phase - so it self-corrects if automation is toggled off mid-fight instead of resuming
-   * from a stale memory of where the fight was.
-   *
-   * The sequence, and why each step is there:
-   *
-   *  1. MAGER/RANGER TAG PAIRING. Both spawn aggroed to the shield and switch to us the
-   *     instant we hit either one - the engine's own flinch rule then floors their
-   *     attackDelay at floor(attackSpeed/2)+1 (verified in the SDK: `Unit.
-   *     processIncomingAttacks`), which for their shared 4-tick attackSpeed is exactly 3. So
-   *     the TICK we land the tagging hit sets the phase of that mob's whole subsequent cycle
-   *     against us - tag both on the same tick (or any tick 4 apart) and their identical
-   *     4-tick cycles fire together FOREVER, magic and range on one tick neither overhead can
-   *     cover. Tag them a tick apart and that never happens, permanently, since two
-   *     same-period cycles that start offset stay offset by exactly that much every cycle
-   *     after. The FIRST tag goes to whichever is physically closer (fastest off the shield);
-   *     the instant that lands, the fix is not "wait before attacking the second one" -
-   *     ordinary stickiness would happily keep hammering whichever got tagged first, since it
-   *     is now the top-ranked reachable thing - it is the opposite: force an IMMEDIATE switch
-   *     to the other one. Only one attack lands per tick, so switching as fast as possible IS
-   *     a one-tick offset; there is no faster way to tag it, so this can never accidentally
-   *     land both on the same tick.
-   *  2. RANGER, fully committed, the instant tagging is settled: kill it before anything else
-   *     while it lives - already the emergent result of 8 > 6, stated explicitly here so nothing
-   *     else in this sequence can pull focus off it.
-   *  3. MAGER is deliberately left alive-but-tagged until Zuk's hp drops under 600 - the exact
-   *     threshold that permanently pauses `TzKalZuk`'s spawn timer in the real fight, so racing
-   *     Zuk down first is racing to shut off any FURTHER mager/ranger pairs, which matters far
-   *     more than finishing the one already on the board. Once Zuk is under 600, mager becomes
-   *     the priority again and gets killed.
-   *  4. JAD, once it spawns (Zuk < 480, also aggroed to the shield): tagged once, the same way
-   *     mager and ranger were, then never engaged again - guarded by the SAME collision check,
-   *     because Jad's 8-tick attackSpeed is exactly double mager/ranger's 4, not merely
-   *     unrelated to it. Jad's `flinchDelay` is overridden to 2, the same floor of 3 mager
-   *     and ranger get, and every one of Jad's future attack ticks (delay, delay+8, delay+16,
-   *     ...) is also a multiple-of-4 step from its first, so it lands on the exact same
-   *     residue mod 4 forever - meaning if that residue matches an already-tagged mager or
-   *     ranger's, EVERY Jad attack from then on lands on one of THEIR attack ticks too,
-   *     permanently, the identical unpickable-overhead problem step 1 exists to prevent, just
-   *     one-directional (Jad collides with them each cycle; they still get their other cycles
-   *     free). `TzKalZuk.damageTaken()` kills every other mob in the region the instant Zuk's
-   *     hp hits zero, so a second hit on Jad is pure wasted DPS - Zuk's own death clears it
-   *     for free.
-   *  5. Otherwise, the flat table decides - which by this point in the fight is just Zuk
-   *     against the enrage-phase healers (priority 10, correctly above Zuk's 2 with nothing
-   *     to override it), with mager and Jad explicitly excluded so this fallback can never
-   *     re-select what step 3 or step 4 already decided to leave alone.
-   *
-   * MULTIPLE PAIRS. `TzKalZuk`'s spawn timer resets to 350 and fires again every time it
-   * expires, so a slow kill - one that takes longer than that to get Zuk under 600 - spawns a
-   * SECOND mager+ranger pair while the first mager is still alive, tagged and deliberately
-   * deferred. Tracking "the mager" and "the ranger" as single references was blind to this:
-   * the second mager was invisible to steps 1 and 3, never tagged, never excluded from step
-   * 5, and the flat fallback picked it up as an ordinary priority-6 target and killed it
-   * outright - measured. So every step below operates on the full, filtered LIST of each type
-   * currently alive, not a single `.find()`. Tag pairing (step 1) always processes the closest
-   * UNTAGGED instance of EITHER type, and the collision check compares it against every
-   * ALREADY-tagged instance of either type, not just one partner - a third simultaneous
-   * attacker is exactly as much a collision risk as a second one.
-   */
-  private static decideZukTarget(region: Region, player: Player, zuk: Mob): Mob | null {
-    const magers = visibleMobs(region).filter(
-      (mob) => mob.dying === -1 && mob.mobName() === EntityNames.JAL_ZEK,
-    );
-    const rangers = visibleMobs(region).filter(
-      (mob) => mob.dying === -1 && mob.mobName() === EntityNames.JAL_XIL,
-    );
-    const jad =
-      visibleMobs(region).find(
-        (mob) => mob.dying === -1 && mob.mobName() === EntityNames.JAL_TOK_JAD,
-      ) ?? null;
-
-    const isTagged = (mob: Mob) => mob.aggro === player;
-    const shieldAttackers = [...magers, ...rangers];
-    const dist = (mob: Mob) =>
-      Math.max(
-        Math.abs(mob.location.x - player.location.x),
-        Math.abs(mob.location.y - player.location.y),
-      );
-    const nearest = (mobs: Mob[]) =>
-      mobs.length === 0
-        ? null
-        : mobs.reduce((best, mob) => (dist(mob) < dist(best) ? mob : best));
-
-    /**
-     * The overhead a mob needs blocked. Two mobs wanting the SAME one may share a fire tick
-     * freely - one prayer covers both - which is the whole point of the rule below.
-     */
-    const overheadFor = (mob: Mob): string | null =>
-      prayerForAttackStyle(knownAttackStyle(mob) ?? "");
-
-    /**
-     * Roughly when our tag lands: the weapon cannot fire before its own cooldown ends (clicking
-     * only sets aggro; the engine fires at `player.attackStep` once `attackDelay` hits zero),
-     * then the shot flies. Floored at 1 for the input-queue tick, plus 1 for the `isPlayer` bump
-     * `Projectile` adds. An estimate, not a guarantee - see the rule below for why that is now
-     * survivable.
-     */
-    const ticksUntilLanding = (candidate: Mob): number => {
-      const option = attackOptionFor(region, player, candidate);
-      const weapon = option
-        ? (weaponForSet(player, option.set) as { calculateHitDelay?(distance: number): number } | null)
-        : null;
-      const hitDelay = weapon?.calculateHitDelay?.(dist(candidate)) ?? 1;
-      const cooldown = (player as unknown as { attackDelay?: number }).attackDelay ?? 0;
-      return hitDelay + 1 + Math.max(1, cooldown);
-    };
-
-    /**
-     * The tick floor a tag applies, read from the engine rather than hardcoded:
-     * `Unit.processIncomingAttacks` runs `if (attackDelay < flinchDelay + 1) attackDelay =
-     * flinchDelay + 1`. Mager and ranger get 3 from `floor(attackSpeed / 2)` on their shared
-     * speed 4; Jad overrides `flinchDelay` to 2 despite speed 8, so also 3.
-     */
-    const flinchFloor = (mob: Mob): number =>
-      ((mob as unknown as { flinchDelay?: number }).flinchDelay ??
-        Math.floor((mob.attackSpeed ?? 4) / 2)) + 1;
-
-    /**
-     * The tick this mob will fire on if we tag it now - modelling BOTH flinch outcomes.
-     *
-     * The floor is conditional, and that is the half the previous version got wrong: it assumed
-     * every tag re-phases, so it always predicted `landing + 3`. A tag landing while the mob
-     * still has 3 or 4 ticks on its clock changes nothing about its cycle, and the fire tick is
-     * then `landing + whatever the clock reads`, not `landing + 3`. Predicting the wrong branch
-     * is a whole residue wrong.
-     *
-     * A delay at or below zero means the mob is not cycling - inside its spawn delay
-     * (`Mob.attackStep` returns early while `age > 0`, but `Unit.attackStep` has already
-     * decremented, so it counts negative), or stalled with nothing to shoot. Those always take
-     * the floor.
-     */
-    const fireTickIfTaggedNow = (candidate: Mob): number => {
-      const speed = candidate.attackSpeed ?? 4;
-      const now = (candidate as unknown as { attackDelay?: number }).attackDelay ?? 0;
-      const travel = ticksUntilLanding(candidate);
-      const landing = InfernoAutomation.tickCount + travel;
-      const floor = flinchFloor(candidate);
-      // Not cycling: the floor is certain.
-      if (now <= 0) {
-        return landing + floor;
-      }
-      // Cycling: walk the clock forward to the landing tick. Phrased over 1..speed rather than
-      // 0..speed-1 because attackDelay resets TO attackSpeed on the tick it fires.
-      const delayAtLanding = ((((now - 1 - travel) % speed) + speed) % speed) + 1;
-      return landing + (delayAtLanding < floor ? floor : delayAtLanding);
-    };
-
-    /**
-     * Would tagging this mob now put it on the same fire tick as an already-tagged mob that
-     * needs a DIFFERENT overhead?
-     *
-     * STYLE, NOT COUNT, is the constraint. Only one overhead can be up, so two attackers sharing
-     * a tick is only a problem when they want different ones: `planOverheads` then protects the
-     * bigger max hit and eats the other. Mager and mager on one tick is free - a single Protect
-     * from Magic blocks both - and measured, that is most of what happens: a run with three
-     * magers stacked on one residue took ZERO damage from any of them, while a single ranger
-     * sharing a mager's tick did every point of mob damage in the run.
-     *
-     * So capacity is not "4 residues for 4 attackers". It is two styles needing disjoint
-     * residues, and any number of each fits as long as no residue holds both.
-     *
-     * WHY DEFERRING CAN ACTUALLY WORK HERE. The set interval is 350 ticks and 350 mod 4 = 2,
-     * while the mager/ranger spawn offset is 9 - 7 = 2 as well. Both are 2 mod 4, so with
-     * untouched phases set N+1's ranger inherits set N's MAGER residue and vice versa - every
-     * consecutive pair of sets cross-collides, structurally, and simply preserving phase
-     * guarantees the thing we are trying to avoid. The flinch is the only lever that breaks that,
-     * and it is available: waiting a tick moves both the landing tick and the mob's own clock, so
-     * the predicted fire tick sweeps through residues until one is free of the opposite style.
-     */
-    const collidesWithOppositeStyle = (candidate: Mob): boolean => {
-      const candidatePrayer = overheadFor(candidate);
-      if (!candidatePrayer) {
-        return false;
-      }
-      const fireTick = fireTickIfTaggedNow(candidate);
-      for (const other of shieldAttackers) {
-        if (other === candidate || !isTagged(other)) {
-          continue;
-        }
-        if (overheadFor(other) === candidatePrayer) {
-          continue; // same prayer covers both - they may line up freely
-        }
-        const otherDelay = (other as unknown as { attackDelay?: number }).attackDelay ?? 0;
-        const otherFireTick = InfernoAutomation.tickCount + otherDelay;
-        if ((((fireTick - otherFireTick) % 4) + 4) % 4 === 0) {
-          return true;
-        }
-      }
-      return false;
-    };
-
-    // --- 1. Tag pairing: the closest UNTAGGED shield attacker, across every mager/ranger
-    // currently alive, not just one fixed pair. ---
-    if (
-      InfernoAutomation.zukPairForceTarget &&
-      (InfernoAutomation.zukPairForceTarget.dying > -1 ||
-        isTagged(InfernoAutomation.zukPairForceTarget))
-    ) {
-      InfernoAutomation.zukPairForceTarget = null;
-    }
-    if (!InfernoAutomation.zukPairForceTarget) {
-      InfernoAutomation.zukPairForceTarget = nearest(shieldAttackers.filter((mob) => !isTagged(mob)));
-    }
-    const forced = InfernoAutomation.zukPairForceTarget;
-    if (forced) {
-      if (!collidesWithOppositeStyle(forced) && attackOptionFor(region, player, forced) !== null) {
-        return forced;
-      }
-      // Either this tick would line the tag up against the opposite style, or it is not
-      // reachable yet - fall through rather than idle, and next tick re-evaluates with every
-      // delay moved on by one.
-    }
-
-    // --- 2. Rangers, fully committed once tagged - nearest tagged one. ---
-    const taggedRanger = nearest(rangers.filter(isTagged));
-    if (taggedRanger) {
-      return taggedRanger;
-    }
-
-    // --- 3. Magers, deferred until Zuk < 600 - nearest tagged one, once safe to commit. ---
-    const zukHp = zuk.currentStats?.hitpoint ?? 0;
-    if (zukHp < 600) {
-      const taggedMager = nearest(magers.filter(isTagged));
-      if (taggedMager) {
-        return taggedMager;
-      }
-    }
-
-    // --- 4. Jad, tag once - guarded by the same collision check as mager/ranger tagging,
-    // since Jad's 8-tick cycle is a multiple of their 4-tick one (see collidesIfTaggedNow).
-    // No pairing partner of its own, so no "arm and wait" state needed: if this tick would
-    // collide, skip to the fallback and retry next tick once the established delays have
-    // moved on, exactly like step 1 falling through. ---
-    if (jad && jad.aggro !== player) {
-      return jad;
-    }
-
-    // --- 5. Fallback: flat priority. Every mager is excluded while Zuk is still >= 600
-    // (steps 3 owns them once it drops), every UNTAGGED shield attacker is excluded
-    // unconditionally (step 1 owns tagging - this fallback has no collision guard of its
-    // own, so it must never be handed one that is not yet safely tagged), and a tagged Jad
-    // is excluded (step 4 already spent its one hit). ---
-    const exclude: Mob[] = [];
-    if (zukHp >= 600) {
-      exclude.push(...magers);
-    }
-    for (const mob of shieldAttackers) {
-      if (!isTagged(mob)) {
-        exclude.push(mob);
-      }
-    }
-    if (jad) {
-      exclude.push(jad);
-    }
-    return chooseZukWaveTarget(region, player, InfernoAutomation.target, exclude);
-  }
-
-  /**
    * Park the cursor on one of the nine nibbler spawn tiles, picked at random and held.
    *
    * This is a guess, and it has to be. InfernoWaves shuffles the nine tiles and takes the first
@@ -985,11 +741,191 @@ ${spellLine}`);
    * which case attacking must be skipped - `moveTo()` interrupts combat, so issuing both
    * would leave the walk cancelled two steps in.
    */
+  /**
+   * Did this tick issue a walk CLICK, as opposed to letting one already in flight continue?
+   *
+   * The distinction is the difference between a lost attack and a free one. `moveTo` calls
+   * `interruptCombat`, so a new tile click wipes aggro and the two cannot share a tick. But a walk
+   * already under way is not re-clicked - `stepMovement` just returns true and leaves it alone -
+   * and an attack does NOT cancel it back: `setAggro` never touches `destinationLocation`, and
+   * `determineDestination` only overrides the walk when line of sight to the target is missing.
+   * So on a committed-walk tick the bot can shoot and keep walking.
+   */
+  private static walkClickIssued = false;
+
+  /**
+   * When the blowpipe goes on: this many ticks after Zuk's Nth watched attack.
+   *
+   * Timed off the recorded tick of a specific attack rather than off a running count, so the
+   * trigger cannot drift if a fire is ever missed or double-counted.
+   *
+   * Zuk opens at attackDelay 14 and repeats every 10, so its Nth attack lands on tick 4 + 10N -
+   * the sixth at 64. Eight ticks past that is 72, which is exactly when `TzKalZuk.setTimer`
+   * expires and the first mager and ranger spawn.
+   *
+   * Landing BETWEEN Zuk's attacks is the point of the offset rather than an accident of it: a
+   * multiple of 10 would coincide with an attack, and a tick spent equipping is a tick not spent
+   * reacting to one. Eight puts it in the gap after the sixth and before the seventh at 74.
+   */
+  /**
+   * Ticks before the next pair lands that the blowpipe goes on, and the mager-side tile click is
+   * spent.
+   *
+   * Timed off `ZukSetTimer` rather than counted from a Zuk attack. The hit-count version was
+   * always a proxy - Zuk's cadence and the set timer only line up because 350 is a multiple of
+   * 10, and the moment the timer pauses under 600 hitpoints and gains 1:45 they come apart
+   * completely, at exactly the point in the fight where being ready matters most.
+   */
+  private static readonly ZUK_SWAP_BEFORE_SET = 3;
+
+  /**
+   * How many ticks before the shot a weapon change is allowed to happen.
+   *
+   * TWO, so the swap lands on the tick before the cooldown expires and the shot goes out the tick
+   * after. Every earlier tick is left alone.
+   *
+   * Swapping the moment the WANTED weapon changes is what produced the thrash: the wanted weapon
+   * is recomputed from live distance every tick, and distance changes every tick because both the
+   * shield and the mobs are moving - so on a five-tick crossbow cooldown the bot spent three or
+   * four of those ticks changing gear for a shot it could not take yet, then changed back. Across
+   * a 12-seed sweep, a quarter of every tick a set mob sat untagged AND IN REACH was spent
+   * swapping.
+   *
+   * Deciding late costs nothing, because a weapon changed on a cooldown tick buys nothing the same
+   * change would not buy on the last one, and answers the question with the distance that will
+   * actually apply rather than a distance from four ticks ago.
+   */
+  private static readonly ZUK_SWAP_LEAD = 2;
+
+  /**
+   * Where a pair always spawns - `TzKalZuk.attackIfPossible` constructs them at these exact tiles.
+   *
+   * Fixed, so the pre-swap can ask a real question instead of a proxy one: is the weapon we are
+   * about to hold able to reach the tile the mob is about to appear on. The old test was "are we
+   * east", which is not the same question and answered it wrong - measured across 12 seeds, a set
+   * mob was NEVER within blowpipe range while untagged, so the blowpipe was being pre-equipped for
+   * a target it could not hit and swapped straight back off.
+   */
+  private static readonly ZUK_MAGER_SPAWN = { x: 20, y: 21 };
+  private static readonly ZUK_RANGER_SPAWN = { x: 29, y: 21 };
+
+  /**
+   * The line between the mager's half of the arena and the ranger's.
+   *
+   * A set always spawns split - `TzKalZuk.attackIfPossible` puts the mager at x 20 and the ranger
+   * at x 29 - so west of here is the mager's side and east is the ranger's. Which side you are
+   * standing on is something a player just knows by looking, and that is the whole test.
+   *
+   * A constant rather than a reading off the mobs, because the switch can come due on the very
+   * tick they spawn and `visibleMobs` deliberately hides a mob until the tick AFTER it is added -
+   * the renderer has not drawn it yet. Where sets spawn is static knowledge of the fight; the
+   * mobs themselves are not ours to see yet.
+   */
+  private static readonly ZUK_SET_DIVIDE_X = 25;
+
+  /**
+   * The hitpoints below which a tagged mager is worth killing.
+   *
+   * `TzKalZuk.damageTaken` pauses the set timer the first time it drops under 600 and never
+   * restarts it until Jad is out, so racing Zuk to this number is racing to stop any FURTHER
+   * pairs arriving - which is worth more than finishing the one already on the board. Above it,
+   * a tagged mager is already doing its worst and costs nothing extra to leave alive; below it
+   * there is nothing left to race and it can be cleaned up.
+   *
+   * SO THIS NUMBER SPLITS THE FIGHT IN TWO, and it gates the hold below as well as the target
+   * order. Above it, leaving a tagged mager alive is the plan. Below it there is no plan that
+   * involves a live set at all: the pair is cleared to the last one before Zuk is touched again,
+   * because everything after this point - the run to enrage, four healers, a faster Zuk - is hard
+   * enough without a mager still throwing magic through it.
+   */
+  private static readonly ZUK_MAGER_KILL_HP = 600;
+
+  /**
+   * The hitpoints TzKalZuk enrages at - `damageTaken`'s own `< 240`.
+   *
+   * Four `JalMejJak` at once and the attack speed dropping 10 -> 7, which is the single biggest
+   * step change in the fight. Every rule below is about choosing WHEN to cross it.
+   */
+  private static readonly ZUK_ENRAGE_HP = 240;
+
+  /**
+   * Hold Zuk above this while a set is imminent, rather than walking into both at once.
+   *
+   * THE STATE BEING AVOIDED is enrage landing on top of a fresh pair. Crossing ZUK_ENRAGE_HP puts
+   * four healers on the board pouring hitpoints back into Zuk while its attack speed rises; doing
+   * that with a mager and ranger also arriving means the shield is being eaten from three
+   * directions and the healers - the only thing on the board that undoes work already done - are
+   * the ones that go unanswered.
+   *
+   * So the last few hitpoints before enrage are deliberately not spent while a pair is due. The set
+   * is allowed to arrive against a Zuk that is still slow and still unhealed, both halves are
+   * killed, and the timer resets to its full interval - which buys well over the minute this was
+   * holding for, all of it clear, to cross enrage and answer the healers in.
+   *
+   * WRITTEN AS A MARGIN ON ENRAGE, not as a number, because that is what it is: the room for the
+   * LAST shot that goes out before the hold arms. The hold can only be checked between shots, so
+   * whatever is in flight when hitpoints cross the line still lands, and the margin is what stops
+   * that landing inside enrage. It is not a target to coast down to.
+   *
+   * 40 covers a normal roll comfortably. It is still RNG - a big enough hit from just above 280
+   * carries through into enrage anyway - and that is accepted rather than solved.
+   */
+  private static readonly ZUK_HOLD_SET_MARGIN = 40;
+  private static readonly ZUK_HOLD_SET_HP =
+    InfernoAutomation.ZUK_ENRAGE_HP + InfernoAutomation.ZUK_HOLD_SET_MARGIN;
+
+  /** One minute, at 0.6s a tick. How close a pair has to be for ZUK_HOLD_SET_HP to arm. */
+  private static readonly ZUK_HOLD_SET_TICKS = 100;
+
+  /**
+   * Whether enrage has already happened, latched.
+   *
+   * NOT DERIVED FROM HITPOINTS, because `JalMejJak.HealWeapon` rolls a NEGATIVE damage into Zuk -
+   * it genuinely heals it - so Zuk can climb back above ZUK_ENRAGE_HP after enraging and a live
+   * `hp < 240` test would report the fight un-enraged while four healers stood on the board. Once
+   * seen, it is true for the rest of the fight; `setEnabled` clears it with the rest of the state.
+   */
+  private static zukEnraged = false;
+
+  /**
+   * Which side we were on when the blowpipe came due, or null before that.
+   *
+   * LATCHED, not re-read. The bot follows a shield that slides a tile a tick, so a live test
+   * would flip sides mid-fight and thrash the gear a tick at a time. "Which half were we on when
+   * the set landed" has exactly one answer.
+   */
+  private static zukOnRangerSide: boolean | null = null;
+
+  /** Whether the mager-side tile click has already been spent - see where it is issued. */
+  private static zukSelfClicked = false;
+
+  /**
+   * TEST SCAFFOLDING, NOT A FEATURE. Wave 69 only, and temporary.
+   *
+   * THE CLIENT THIS IS PORTED INTO ALREADY HAS A VITALS LANE. Eating, drinking and staying alive
+   * are its job and are not being rebuilt here. This exists only so a wave-69 run in this
+   * simulator does not end with "died at full inventory", which answers nothing about the fight.
+   *
+   * It is NOT a simulation of eating. Hitpoints move directly rather than through an inventory
+   * click, so there is no dose tracking, no four-sip vial, no brew stat drain and no restore to
+   * undo it. The one thing it does model is the only part that changes a decision: healing COSTS
+   * THE TICK, so it competes with attacking exactly as a real sip would.
+   *
+   * Five of twenty is a hundred hitpoints against a 99 pool - roughly a brew and a half - enough
+   * to tell whether a run dies of the fight or dies of never topping up. Delete it rather than
+   * grow it: anything more than this is duplicating a lane that already exists elsewhere.
+   */
+  private static readonly ZUK_HEAL_AMOUNT = 32;
+  private static readonly ZUK_HEAL_COUNT = 5;
+  private static zukHealsUsed = 0;
+
   private static stepMovement(player: Player, region: Region): boolean {
+    InfernoAutomation.walkClickIssued = false;
     // An explicitly queued route wins over any station tile.
     if (!InfernoAutomation.isMoving(player) && InfernoAutomation.route.length > 0) {
       const next = InfernoAutomation.route.shift();
       if (next) {
+        InfernoAutomation.walkClickIssued = true;
         InfernoAutomation.walkTo(player, next.x, next.y);
         InfernoAutomation.walkingTo = { x: next.x, y: next.y };
         return true;
@@ -1017,6 +953,7 @@ ${spellLine}`);
     // want to be. The second case is what happens when a wave spawns mid-way back to the
     // safe spot: getting home is best-effort, and once the wave is live the wave tile
     // matters more than finishing the trip.
+    InfernoAutomation.walkClickIssued = true;
     InfernoAutomation.walkTo(player, station.x, station.y);
     InfernoAutomation.walkingTo = { x: station.x, y: station.y };
     return true;
@@ -1151,6 +1088,38 @@ ${spellLine}`);
       ((player.currentStats as { run?: number })?.run ?? 0) / 100,
     );
     const orb = (player as unknown as { running?: boolean }).running ? "ON" : "OFF";
+
+    // WAVE 69 ONLY: the shield's own state, and the tick Zuk is expected to fire.
+    //
+    // Without these a wave-69 log cannot answer the only question that matters about a Zuk hit -
+    // where the band actually was when the shot was aimed. Position alone is not enough: the
+    // target tile is derived from the shield PROJECTED to the fire tick, so a destination that
+    // walks backwards is either the shield reversing or the shield frozen mid-bounce while the
+    // clock keeps counting, and those are indistinguishable from the outside.
+    //
+    // `frozen` is the one to watch. `ZukShield.movementStep` only steps while it is <= 0, so a
+    // frozen shield holds position while `untilFire` keeps dropping - which drags the projected
+    // band, and therefore the chosen tile, back towards the player a tile per tick.
+    let zukState = "";
+    const shield = visibleMobs(region).find(
+      (mob) => mob.dying <= -1 && mob.mobName() === EntityNames.INFERNO_SHIELD,
+    );
+    if (shield) {
+      const live = shield as unknown as { movementDirection?: boolean; frozen?: number };
+      const covered =
+        player.location.x >= shield.location.x &&
+        player.location.x < shield.location.x + 5 &&
+        player.location.y <= 16;
+      const untilSet = ZukSetTimer.ticksUntilSet();
+      zukState =
+        `shield=${shield.location.x}..${shield.location.x + 4}` +
+        `${live.movementDirection ? "E" : "W"}` +
+        `${(live.frozen ?? 0) > 0 ? `frz${live.frozen}` : ""} ` +
+        `${covered ? "COV" : "EXP"} ` +
+        `zukIn=${ZukAttackClock.ticksUntilNextAttack() ?? "-"} ` +
+        `setIn=${untilSet ?? "-"}${ZukSetTimer.isPaused() ? "P" : ""} `;
+    }
+
     const line =
       `t${String(InfernoAutomation.tickCount).padStart(4)} ` +
       `@${player.location.x},${player.location.y} ` +
@@ -1158,6 +1127,7 @@ ${spellLine}`);
       `pray=${(overhead?.feature() ?? "-").padEnd(5)} ` +
       `hp=${player.currentStats?.hitpoint ?? "?"} ` +
       `run=${energy}% ${orb} ` +
+      zukState +
       `${InfernoAutomation.attackState}`;
 
     InfernoAutomation.log.push(line);
@@ -1172,7 +1142,742 @@ ${spellLine}`);
     }
   }
 
+  /**
+   * The overhead for this tick. Extracted so there is exactly one prayer path: wave 69 has been
+   * stripped back to prayer alone, and it has to be provably the SAME prayer full automation
+   * does, not a second copy that can drift from it.
+   *
+   * Route through the control panel when there IS one, so the on-screen tab and cursor stay in
+   * step with the engine. With no panel - headless - `clickPrayer` returns without doing
+   * anything, so passing it would silently drop every overhead and leave the bot tanking
+   * unprayed. `applyPrayerPlan` falls back to toggling the prayer directly when given no
+   * callback, which is the same state change by a shorter route.
+   */
+  private static prayThisTick(region: Region, player: Player, route?: Location[]) {
+    const clickPrayer = ControlPanelController.controller
+      ? (name: string) => InfernoAutomation.clickPrayer(player, name)
+      : undefined;
+    applyPrayerPlan(player, visibleMobs(region), true, clickPrayer, route);
+  }
+
+  /**
+   * WAVE 69, STRIPPED TO THE FLOOR.
+   *
+   * Four things happen on this wave and nothing else does: the prayer planner runs, every
+   * candidate tile is scored on cover and on distance from the shield's leading face, the bot
+   * walks to the winner, and if it did not have to walk it shoots Zuk. No other target, no
+   * force-attack backstop, no barrage, no supplies - the return in `decide` is what guarantees
+   * it, rather than a flag each of those layers is trusted to check.
+   *
+   * THE ATTACK IS DELIBERATELY THE SIMPLEST ONE THAT EXISTS: Zuk, whenever we are not walking.
+   * No target selection, no priority, nothing about the mager, ranger or Jad that this will
+   * start spawning - `TzKalZuk.damageTaken` pauses the set timer under 600, spawns Jad under
+   * 480 and the healers under 240, and none of that is answered yet. Expect it to die sooner
+   * than the version that never attacked, not later; the point is to put real shots on the
+   * timeline so the player lane can be read against Zuk's.
+   *
+   * MOVEMENT WINS OVER SHOOTING, the same way it does in `decide`. A walk issues `moveTo`, which
+   * calls `interruptCombat` and clears aggro, so the two genuinely cannot both happen on one
+   * tick - and position decides which ticks we get hit on, while a delayed shot costs only
+   * damage output.
+   *
+   * The score is published through the same `scoredTiles` field the old path used, so the 3D
+   * tile grid draws it with no change to InfernoRegion or TileGrid.
+   */
+  private static decideZukWave(region: Region, player: Player) {
+    // No safespot concept on this wave, so the settle-on-arrival hold that guards one never
+    // arms. Cleared rather than left alone, in case a wave was entered from one that had.
+    InfernoAutomation.chosenIsSafeSpot = false;
+    InfernoAutomation.arrivalSettled = false;
+    // Scoring is best-effort and prayer is not - same order and same reasoning as `decide`.
+    // attackState is assigned on BOTH paths, so last tick's failure cannot outlive the tick
+    // that failed.
+    let failed = false;
+    try {
+      InfernoAutomation.scoredTiles = InfernoAutomation.isBetweenWaves(region)
+        ? []
+        : scoreZukTiles(region, player);
+      // Null between waves and whenever nothing beats holding - `stationTile` reads that as
+      // "stay where you are", which is the right answer in both cases.
+      const move = bestMove(region, player, InfernoAutomation.scoredTiles);
+      InfernoAutomation.chosenTile = move?.tile ?? null;
+      InfernoAutomation.chosenPath = move?.route;
+    } catch (e) {
+      failed = true;
+      InfernoAutomation.scoredTiles = [];
+      InfernoAutomation.chosenTile = null;
+      InfernoAutomation.chosenPath = undefined;
+      InfernoAutomation.attackState = `SCORING FAILED: ${(e as Error)?.message ?? e}`;
+    }
+    InfernoAutomation.prayThisTick(region, player, InfernoAutomation.chosenPath);
+
+    // Prayer is above the countdown gate and movement is below it, exactly as in `decide`. The
+    // planner runs a tick ahead, so the overhead chosen on the LAST countdown tick is the one
+    // protecting the FIRST live tick - gating prayer opens the wave unprayed. A walk, in
+    // contrast, is a world action issued into a world tickRegion has frozen: the player turns
+    // to face the tile without moving and the first live tick arrives mid-action. Scoring above
+    // still runs, so the grid is populated and correct before the wave starts - the shield does
+    // not move during the countdown either, so there is nothing to be stale about.
+    if ((region.world?.getReadyTimer ?? 0) > 0) {
+      if (!failed) {
+        InfernoAutomation.attackState = "wave 69: waiting out the countdown";
+      }
+      return;
+    }
+
+    // Run back on, before anything can issue a walk this tick. Part of moving rather than a
+    // fourth behaviour: the shield slides a tile per tick and a WALKING player also does one
+    // tile per tick, so with the orb off the bot can hold station on the leading face but can
+    // never close on it. Running is what makes "follow" mean anything.
+    InfernoAutomation.restoreRun(player);
+
+    // A scoring throw has already put its own message in attackState; nothing below should
+    // overwrite it, since where the bot stands is the more urgent failure.
+    const say = (text: string) => {
+      if (!failed) {
+        InfernoAutomation.attackState = text;
+      }
+    };
+
+    const repositioning = InfernoAutomation.stepMovement(player, region);
+
+    // THE WALK OWNS THE TICK IT IS CLICKED ON. A tile click and an attack click are both world
+    // clicks, one per tick, and `moveTo` -> `interruptCombat` has already cleared aggro by the
+    // time we get here - so this tick's shot is gone whatever we do. Movement takes it, and the
+    // record of the target goes with it so the next attack re-clicks rather than assuming it is
+    // still engaged.
+    if (repositioning && InfernoAutomation.walkClickIssued) {
+      InfernoAutomation.target = null;
+      say("wave 69: following shield");
+      return;
+    }
+
+    // Everything past here spends NO click on movement: either standing on station, or part-way
+    // through a walk that was clicked on an earlier tick and needs no re-click (see
+    // `walkClickIssued`). A shot on those ticks is free - `setAggro` never touches
+    // `destinationLocation`, and `determineDestination` leaves an in-flight walk alone while line
+    // of sight holds - so the walk carries on underneath it.
+
+    // Standing still, so the tick is free to shoot with.
+    //
+    // Reach, line of sight and which gear to use all come from `attackOptionFor`, unchanged from
+    // every other wave: it asks the engine's own `LineOfSight.playerHasLineOfSightOfMob` through
+    // `isAttackable`, and falls back to the long bow when the preferred set cannot reach.
+    //
+    // ASKED, NEVER ASSUMED, because reach is loadout-dependent and the margin is thin. Zuk is a
+    // 7x7 at 22,8, so its southern edge is y 8 and the distance from cover is just `playerY - 8`.
+    // A twisted bow reaches 10 and covers the whole band; a rune crossbow reaches 7, so it needs
+    // y 15 or lower - while the shield covers y 16. Those are NOT the same constraint, and
+    // nothing here yet steers the bot off the one row where it is covered but cannot shoot.
+    // HEALING GOES AHEAD OF ATTACKING, and behind movement. Test scaffolding only - the client
+    // this ports into owns vitals. See the note on ZUK_HEAL_AMOUNT.
+    //
+    // Ahead of attacking because a lost shot is damage output and being dead is the run; behind
+    // movement for the reason every other action on this wave is - the tick a reposition is
+    // clicked on is already gone, and standing still to sip while the shield slides off is how
+    // the 251 lands. See the movement gate above.
+    //
+    // AND ONLY WHILE HEALERS ARE ALIVE. The whole of this exists to cover `JalMejJak`'s AOE, which
+    // is the one source of damage on this wave that no positioning avoids: `AoeWeapon.attack`
+    // aims its first spark at the tile the player is standing on, so it lands whatever the bot
+    // does. Everything else that hits us - the mager, the ranger, Zuk - is a positioning or
+    // tagging failure, and topping those up would hide the failure instead of showing it.
+    //
+    // So no sips before the healers exist, and none once the last one is dead. Nothing is reset
+    // when they die; the budget simply stops being spendable, which is what makes the hitpoints a
+    // run ends on mean something again.
+    const maxHitpoints = player.stats?.hitpoint ?? 0;
+    const hitpoints = player.currentStats?.hitpoint ?? 0;
+    const healersUp = visibleMobs(region).some(
+      (mob) =>
+        mob.dying === -1 &&
+        (mob.mobName() === EntityNames.JAL_MEJ_JAK || mob.mobName() === EntityNames.YT_HUR_KOT),
+    );
+    if (
+      healersUp &&
+      maxHitpoints > 0 &&
+      hitpoints * 2 < maxHitpoints &&
+      InfernoAutomation.zukHealsUsed < InfernoAutomation.ZUK_HEAL_COUNT
+    ) {
+      InfernoAutomation.zukHealsUsed++;
+      player.currentStats.hitpoint = Math.min(
+        maxHitpoints,
+        hitpoints + InfernoAutomation.ZUK_HEAL_AMOUNT,
+      );
+      say(
+        `wave 69: healed ${InfernoAutomation.ZUK_HEAL_AMOUNT} ` +
+          `(${InfernoAutomation.ZUK_HEAL_COUNT - InfernoAutomation.zukHealsUsed} left, ` +
+          `hp ${player.currentStats.hitpoint}/${maxHitpoints})`,
+      );
+      return;
+    }
+
+    const zuk = visibleMobs(region).find(
+      (mob) => mob.dying === -1 && mob.mobName() === EntityNames.TZ_KAL_ZUK,
+    );
+    // ZUK'S REACH IS ZUK'S PROBLEM, not a gate on the whole tick.
+    //
+    // This used to `return` whenever `option` was null - a question about whether ZUK can be shot
+    // from here - and answering "no" cancelled the mager and ranger with it. On the crossbow's 7
+    // that fires the moment the bot stands at y 16 (Zuk's south edge is y 8, so distance 8), so a
+    // set mob three tiles away went unattacked because an unrelated mob was one tile too far.
+    // Zuk is now one candidate among the rest, and its reach is checked where it is used.
+    const option = zuk ? attackOptionFor(region, player, zuk) : null;
+
+    // The blowpipe goes on a fixed number of ticks after a specific watched attack - but ONLY if
+    // we are EAST when it comes due. The pair spawns split, mager west and ranger east, so which
+    // of them we are standing next to is decided by where the shield has carried us by then. The
+    // blowpipe is the ranger's tool; on the mager's side it is the wrong weapon aimed at the
+    // wrong half of the set, so the bow stays on instead.
+    // THE SIDE DECIDES THE WEAPON, NOT THE TARGET. Once the set is due, the mager and the ranger
+    // are what we shoot either way - standing on the mager's half is a reason to keep the bow, not
+    // a reason to go back to plinking Zuk. Only `allowBlowpipe` is gated on being east.
+    // The window is now the last few ticks before the pair actually lands, read off our own copy
+    // of the engine's set timer. Naturally bounded: it opens ZUK_SWAP_BEFORE_SET ticks out and
+    // shuts the moment the set arrives and the clock resets to 350.
+    const untilSet = ZukSetTimer.ticksUntilSet();
+
+    // A PAUSED TIMER IS NOT A COUNTDOWN, AND NOTHING MAY WAIT ON ONE.
+    //
+    // `TzKalZuk.damageTaken` freezes the set timer the first time Zuk drops under 600 and only
+    // restarts it under 480, so between those two numbers the reading is a stopped clock: whatever
+    // it says, no pair is coming and the only thing that can ever make one come is damage on Zuk.
+    //
+    // Every wait below is a wait for a SPAWN, so each of them read a stopped clock as "about to
+    // happen" and held for it. Observed, seed 13: the pause caught the timer at 2, inside
+    // ZUK_SWAP_BEFORE_SET, so the pre-spawn hold armed and never disarmed - the bot held fire for
+    // a set that could not arrive until it stopped holding fire. Zuk sat on 587 hitpoints for
+    // 3200 ticks and the run hit the budget without dying. A deadlock, not a slow kill: the wait
+    // was for an event that the waiting itself prevented.
+    const setCountingDown = untilSet !== null && !ZukSetTimer.isPaused();
+    const inBlowpipeWindow =
+      setCountingDown && (untilSet as number) <= InfernoAutomation.ZUK_SWAP_BEFORE_SET;
+
+    // WHICH SIDE: read live until the pair is actually on the board, then latched.
+    //
+    // Latching it on the tick the TIMER fired is what made "hit 5 + 2" never equip while
+    // "hit 2 + 2" worked. The trigger can be twenty ticks before the set exists, the shield has
+    // carried the bot somewhere else by then, and the answer was frozen regardless - hit 2 landed
+    // east by luck, hit 5 landed west and disabled the blowpipe for the entire fight. Reading it
+    // live until there is a real pair to be on a side OF, and freezing only then, asks the
+    // question that was actually meant and stops the trigger tick deciding the run.
+    const setOnBoard = visibleMobs(region).some(
+      (mob) =>
+        mob.dying === -1 &&
+        (mob.mobName() === EntityNames.JAL_ZEK || mob.mobName() === EntityNames.JAL_XIL),
+    );
+    // WHAT IS UNFINISHED ON THE BOARD, WITHOUT ASKING WHETHER WE CAN REACH IT.
+    //
+    // Separate from the candidate loop below on purpose: that one drops anything out of reach,
+    // because it is choosing something to shoot THIS tick. These two questions are the opposite -
+    // they ask what is outstanding, and something we cannot currently reach is still outstanding.
+    // Folding them into the candidate loop would make both silently false the moment the bot was
+    // too far away, which is exactly the situation they exist to catch.
+    const zukHp = zuk?.currentStats?.hitpoint ?? 0;
+    let healerAlive = false;
+    let rangerAlive = false;
+    let magerAlive = false;
+    let setUntagged = false;
+    for (const mob of visibleMobs(region)) {
+      if (mob.dying !== -1) {
+        continue;
+      }
+      const name = mob.mobName();
+      if (name === EntityNames.JAL_MEJ_JAK || name === EntityNames.YT_HUR_KOT) {
+        healerAlive = true;
+        // A JalMejJak on the board IS the enrage, and this is the only honest record of it. See
+        // `zukEnraged` for why hitpoints cannot be asked instead.
+        if (name === EntityNames.JAL_MEJ_JAK) {
+          InfernoAutomation.zukEnraged = true;
+        }
+        continue;
+      }
+      if (name !== EntityNames.JAL_ZEK && name !== EntityNames.JAL_XIL) {
+        continue;
+      }
+      if (name === EntityNames.JAL_XIL) {
+        rangerAlive = true;
+      } else {
+        magerAlive = true;
+      }
+      if (mob.aggro !== player) {
+        setUntagged = true;
+      }
+    }
+
+    // ZUK IS THE LAST THING TO SHOOT, NOT THE DEFAULT ONE.
+    //
+    // Falling through to Zuk whenever nothing else is in reach reads as free damage and is not:
+    // both of these states are ones where a shot spent on Zuk is a shot the weapon owes back at
+    // the moment it matters. Standing idle costs nothing but time, and time is the resource this
+    // fight has most of.
+    //
+    //  - A HEALER ALIVE, reachable or not. `JalMejJak` spawns at enrage aggroed to Zuk and heals
+    //    it, so every point we put into Zuk while one lives is a point being handed back. Racing
+    //    a healer is losing arithmetic. The scorer is already walking us at them -
+    //    ZUK_HEALER_REACH_BONUS - so the shot wanted here is the tag, a few ticks from now, on a
+    //    weapon that is off cooldown when it arrives.
+    //  - AN UNTAGGED SET WITH THE RANGER STILL UP. Untagged means it is shooting the shield, and
+    //    the shield does not come back. The tag is worth more than any amount of boss damage, and
+    //    the same reasoning as the pre-spawn hold applies: a bow committed to Zuk is five ticks
+    //    from being able to take it. Gated on the ranger living because that is the half we
+    //    actually kill - once it is dead the mager is left tagged-and-alive by design, and holding
+    //    for it would be holding forever.
+    //
+    // Both are checked only where Zuk is the fallback; a reachable set mob is shot regardless.
+    // Belt and braces on the latch: enrage fires on Zuk's own `damageTaken`, and `visibleMobs`
+    // hides a new mob for a tick, so the healers are not on the board on the tick it happens.
+    if (zuk && zukHp < InfernoAutomation.ZUK_ENRAGE_HP) {
+      InfernoAutomation.zukEnraged = true;
+    }
+
+    // DO NOT CROSS ENRAGE WITH A PAIR ABOUT TO LAND. See ZUK_HOLD_SET_HP.
+    //
+    // Arms only BEFORE enrage - afterwards there is nothing left to time, the healers are already
+    // out, and holding would just be refusing to finish the fight. Disarms by itself the moment
+    // the pair spawns, because `ZukSetTimer` resets to its full interval and the set is no longer
+    // "due in under a minute" - at which point the untagged-set rule below takes over and the pair
+    // is what gets shot.
+    const setImminent =
+      setCountingDown && (untilSet as number) <= InfernoAutomation.ZUK_HOLD_SET_TICKS;
+    const holdForSet =
+      !InfernoAutomation.zukEnraged &&
+      zukHp > 0 &&
+      zukHp < InfernoAutomation.ZUK_HOLD_SET_HP &&
+      setImminent;
+
+    // PAST ZUK_MAGER_KILL_HP THE SET IS CLEARED TO THE LAST ONE, mager included.
+    //
+    // Leaving a tagged mager alive is a first-half rule and only a first-half rule: it is paid for
+    // by racing Zuk to 600 to stop further pairs, and once that race is won it buys nothing. What
+    // it costs from then on is a magic attack landing every four ticks through the run to enrage,
+    // for the whole time the healers are being answered - so below 600 it is finished off like the
+    // ranger, and Zuk waits until the board is clear.
+    const holdToClearSet =
+      (rangerAlive || magerAlive) &&
+      zukHp > 0 &&
+      zukHp < InfernoAutomation.ZUK_MAGER_KILL_HP;
+
+    const holdOffZuk =
+      healerAlive || holdToClearSet || (setUntagged && rangerAlive) || holdForSet;
+    const holdReason = healerAlive
+      ? "healer up"
+      : holdToClearSet
+        ? `clearing the set (zuk ${zukHp})`
+        : setUntagged && rangerAlive
+          ? "set untagged, ranger alive"
+          : `banking ${zukHp}hp for the set (due in ${untilSet ?? "-"})`;
+
+    if (setOnBoard && InfernoAutomation.zukOnRangerSide === null) {
+      InfernoAutomation.zukOnRangerSide =
+        player.location.x >= InfernoAutomation.ZUK_SET_DIVIDE_X;
+    }
+    const onRangerSide =
+      InfernoAutomation.zukOnRangerSide ??
+      player.location.x >= InfernoAutomation.ZUK_SET_DIVIDE_X;
+
+
+    // PREFERRED WEAPON, LONG-RANGE FALLBACK - the same shape `attackOptionFor` uses everywhere
+    // else, but with the blowpipe as the preference. It cannot simply BE `attackOptionFor`,
+    // because `requiredSetFor` answers "tbow" for a mager or ranger, so that function would never
+    // reach for the blowpipe at all.
+    //
+    // The reaches are read off the loadout rather than hardcoded, so a crossbow build (7) and a
+    // twisted bow build (10) both work, and neither is assumed to out-reach the blowpipe.
+    const reachOf = (name: GearSetName) =>
+      (weaponForSet(player, name) as { attackRange?: number } | null)?.attackRange ?? 0;
+    const blowpipeReach = reachOf("blowpipe");
+    const bowReach = reachOf("tbow");
+
+    // Targeting is not on a timer: a mager or ranger on the board is what we shoot, whenever
+    // that is. The window only decides which weapon is wanted BEFORE one exists.
+    //
+    // ASKED OF THE SPAWN TILES, not of which half of the arena we are on. The pair lands on two
+    // fixed tiles, so "will the blowpipe reach the nearer of them from here" is answerable exactly,
+    // and it is the only thing that decides whether pre-equipping it is worth a tick. Standing at
+    // y 14 the answer is almost always no - the spawn row is y 21, so `dy` alone is 7 against the
+    // blowpipe's 5 - which is why the bot kept putting on a weapon that could not tag anything.
+    const spawnReach = (spawn: { x: number; y: number }) =>
+      Math.max(
+        Math.abs(spawn.x - player.location.x),
+        Math.abs(spawn.y - player.location.y),
+      );
+    const nearestSpawn = Math.min(
+      spawnReach(InfernoAutomation.ZUK_MAGER_SPAWN),
+      spawnReach(InfernoAutomation.ZUK_RANGER_SPAWN),
+    );
+    const preSwap = inBlowpipeWindow && nearestSpawn <= blowpipeReach;
+
+    // TARGET FIRST, THEN GEAR. Which weapon to hold depends on which mob is being shot and how
+    // far away it is, so choosing the set before the target - as this did - can only ever be a
+    // guess that the later choice then has to live with.
+    let target: Mob = zuk as Mob;
+    let hasSetMob = false;
+
+    {
+      // Candidates are anything either weapon can hit, so a mob outside the blowpipe's reach is
+      // still a target - just one the bow takes instead of dropping it.
+      const furthest = Math.max(blowpipeReach, bowReach);
+      // ANYTHING NOT ALREADY SHOOTING US COMES FIRST, because what it IS shooting is the shield.
+      //
+      // A set spawns with `aggro: this.shield` (TzKalZuk.attackIfPossible) and turns on us only
+      // when we hit it - `JalZek` and `JalXil` override `shouldChangeAggro` to
+      // `this.aggro != projectile.from`, so the flip is permanent and one hit is the whole cost.
+      // Until then every attack it makes lands on 600 hitpoints of cover that never comes back.
+      // So `mob.aggro !== player` is not a tie-break among equals: it separates a mob that is
+      // costing us the shield from one that is costing us nothing extra.
+      //
+      // The flip happens when the PROJECTILE LANDS, not when the click goes out, so a mob already
+      // shot at still reads as untagged for a few ticks and can be picked twice. Wasteful rather
+      // than wrong - fixing it needs remembered state, which is the job the old
+      // `zukPairForceTarget` did. Deliberately not rebuilt yet.
+      // FURTHEST FIRST AMONG THE UNTAGGED, not nearest.
+      //
+      // Everything in this band is already in reach, so nearness buys nothing - both are one hit
+      // and both flip permanently. What separates them is which shot is about to STOP being
+      // available: the near one stays comfortably inside range while the far one sits at the edge
+      // of it, and the shield carries us a tile a tick, so the far one is the shot that expires.
+      // Taking the near one first spends the tick on the shot that would still have been there.
+      //
+      // This is the correct form of an earlier attempt that ordered by who fires soonest. That one
+      // was wrong for the same reason inverted - it deferred a mob already in reach in favour of
+      // one about to fire, the deferred mob drifted out of range, and its tag went from +5 to +38.
+      // Imminence of the SHOT is what matters, not imminence of their attack.
+      let furthestOffUs: Mob | null = null;
+      let furthestOffUsDistance = -Infinity;
+      let closestHealer: Mob | null = null;
+      let closestHealerDistance = Infinity;
+      let closestRanger: Mob | null = null;
+      let closestRangerDistance = Infinity;
+      let closestMager: Mob | null = null;
+      let closestMagerDistance = Infinity;
+      for (const mob of visibleMobs(region)) {
+        const name = mob.mobName();
+        const healer =
+          name === EntityNames.JAL_MEJ_JAK || name === EntityNames.YT_HUR_KOT;
+        // HEALERS ARE A BLOWPIPE JOB OR NOTHING - no long weapon fallback.
+        //
+        // One dart is the whole cost: they flip aggro on the first hit and stop healing, so what
+        // matters is tags per tick, not damage, and that is the blowpipe's 2-tick speed against
+        // the bow's 5. Letting the bow take them at range would spend five ticks doing a job the
+        // blowpipe does in two, from a tile the bot could have walked to in the meantime.
+        //
+        // Out of blowpipe range is therefore not a target at all rather than a slower one. The
+        // scorer already pulls towards them - ZUK_HEALER_REACH_BONUS is +1 for any tile inside
+        // blowpipe range of one - so refusing here is what makes that pull mean something instead
+        // of being quietly satisfied from six tiles away with the wrong weapon.
+        const reachNeeded = healer ? blowpipeReach : furthest;
+        if (
+          mob.dying !== -1 ||
+          (name !== EntityNames.JAL_ZEK &&
+            name !== EntityNames.JAL_XIL &&
+            name !== EntityNames.JAL_TOK_JAD &&
+            !healer) ||
+          !isAttackable(region, player, mob, reachNeeded)
+        ) {
+          continue;
+        }
+        // JAD IS TAGGED ONCE AND THEN LEFT ALONE. It spawns on the shield like the pair, so the
+        // one hit that pulls it off is worth taking - but only that one. `TzKalZuk.damageTaken`
+        // kills every other mob in the region the instant Zuk reaches zero, so a second hit on
+        // Jad is damage that Zuk's own death was going to deliver for free, and Jad's 350
+        // hitpoints are 350 not being spent on the thing that ends the wave. It also has three
+        // healers waiting on `hitpoint < stats.hitpoint / 2` - one tag is nowhere near that, and
+        // committing to the kill wakes them.
+        if (name === EntityNames.JAL_TOK_JAD && mob.aggro === player) {
+          continue;
+        }
+        // Nearest by Chebyshev, which is how OSRS measures distance.
+        const distance = Math.max(
+          Math.abs(mob.location.x - player.location.x),
+          Math.abs(mob.location.y - player.location.y),
+        );
+        if (mob.aggro !== player) {
+          if (distance > furthestOffUsDistance) {
+            furthestOffUs = mob;
+            furthestOffUsDistance = distance;
+          }
+        } else if (healer) {
+          if (distance < closestHealerDistance) {
+            closestHealer = mob;
+            closestHealerDistance = distance;
+          }
+        } else if (name === EntityNames.JAL_XIL) {
+          if (distance < closestRangerDistance) {
+            closestRanger = mob;
+            closestRangerDistance = distance;
+          }
+        } else if (distance < closestMagerDistance) {
+          closestMager = mob;
+          closestMagerDistance = distance;
+        }
+      }
+
+      // THE ORDER, and every band of it reads off live state rather than a remembered phase, so
+      // it self-corrects if automation is toggled off mid-fight:
+      //
+      //  1. ANYTHING STILL ON THE SHIELD - tag it. One hit, permanent, and it stops eating cover.
+      //  2. THE RANGER, once tagged - killed outright, before anything else, while it lives.
+      //  3. THE MAGER is deliberately left alive-but-tagged while Zuk is at or above
+      //     ZUK_MAGER_KILL_HP. Tagged, it is already doing its worst and dying does not undo any
+      //     of it; the hitpoints spent on it buy nothing, whereas the same hitpoints spent on Zuk
+      //     buy the set timer pausing and no FURTHER pair arriving at all.
+      //  4. Nothing from the set - Zuk. Which is also what steps 2 and 3 fall through to when the
+      //     ranger is dead and the mager is being left alone, so "fight Zuk until the next set"
+      //     is not a rule anywhere, it is what is left when the others decline.
+      // A tagged Jad has already dropped out of the candidate list above, so it can only ever
+      // reach `furthestOffUs` - the tag - and never the kill bands below it.
+      // HEALERS OUTRANK EVERYTHING ALREADY TAGGED, because they are the only thing on the board
+      // that undoes work already done. `JalMejJak` spawns from Zuk's enrage aggroed to Zuk and
+      // heals it; `YtHurKot` does the same for Jad. Every tick one lives is damage being handed
+      // back, so they are worth interrupting a mager or ranger kill for.
+      //
+      // An untagged one is caught a band earlier, by `furthestOffUs` - which is right, because
+      // `JalMejJak.attackStyleForNewAttack` returns "heal" while its aggro is Zuk and "aoe" once
+      // it is ours, so the tag itself is what stops the healing. This band is the follow-up: kill
+      // what has already been pulled.
+      const pick =
+        furthestOffUs ??
+        closestHealer ??
+        closestRanger ??
+        (zukHp < InfernoAutomation.ZUK_MAGER_KILL_HP ? closestMager : null);
+      // NO SET MOB MEANS ZUK, NOT NOTHING. `engageSet` is true from the moment the first set is
+      // due and never goes false again, so a hard return here stopped the bot attacking anything
+      // at all in two entirely normal situations: the ticks before the pair actually spawns, and -
+      // permanently - every tick after they are killed. Falling through leaves `target` as the Zuk
+      // it was initialised to.
+      if (pick) {
+        target = pick;
+        hasSetMob = true;
+      }
+    }
+
+    // Nothing from the set, so it falls to Zuk - and only HERE does Zuk's own reach matter. With
+    // neither available there is nothing to shoot at all. Aggro is cleared only while standing:
+    // `applyAttackPlan` pins destinationLocation to the current tile when it drops a target,
+    // which would cancel a walk in progress.
+    if (!hasSetMob) {
+      // Nothing in reach and something outstanding: stand there. Aggro has to actually be dropped
+      // rather than just left unclicked - it is sticky, and the engine re-fires at a standing
+      // target on its own every time the cooldown expires - and clicking the tile already stood on
+      // is how a player drops it, `moveTo` calling `interruptCombat` and moving nobody.
+      //
+      // ONLY WHILE STANDING, for the same reason `applyAttackPlan(null)` is gated below it: that
+      // click writes destinationLocation, so issuing it mid-walk cancels the walk to the shield.
+      // A walk in progress therefore keeps whatever aggro it has and may let one more auto-shot
+      // go; the walk is worth more than the shot.
+      if (holdOffZuk) {
+        if (player.aggro && !repositioning) {
+          InfernoAutomation.walkTo(player, player.location.x, player.location.y);
+          InfernoAutomation.target = null;
+        }
+        say(`wave 69: holding off zuk (${holdReason})`);
+        return;
+      }
+      if (!zuk || !option) {
+        if (!repositioning) {
+          InfernoAutomation.target = applyAttackPlan(
+            region,
+            player,
+            null,
+            InfernoAutomation.target,
+          );
+        }
+        say(zuk ? "wave 69: zuk out of reach, no set mob" : "wave 69: on station");
+        return;
+      }
+      target = zuk;
+    }
+
+    // PREFER THE BLOWPIPE, FALL BACK TO THE LONG WEAPON ONLY WHEN IT CANNOT REACH.
+    //
+    // And with nothing to shoot yet, still put it on. That is the pre-swap: the set is due, it is
+    // about to land, and the blowpipe wants to be in hand when it does rather than costing a tick
+    // afterwards. Previously the set was only chosen inside `if (closest)`, so the gear waited on
+    // a target that does not exist until the pair spawns - which made the trigger timing do
+    // nothing at all, however early it was set.
+    // BLOWPIPE ON THE SET, EITHER OF THEM, WHENEVER IT REACHES.
+    //
+    // Reach is the only thing that decides the weapon once there is something real to shoot.
+    // Which side of the arena we are on gates the PRE-SWAP below - getting it on early, before
+    // the pair exists - and nothing else: a mager standing three tiles away is a blowpipe target
+    // whichever half of the arena it is in, and refusing on the strength of where the shield had
+    // carried us is how it ended up plinking the set with the bow.
+    //
+    // The fallback is the long weapon, whatever the loadout carries - crossbow at 7, twisted bow
+    // at 10 - so a mob outside the blowpipe's 5 is still shot, just not with the blowpipe.
+    //
+    // NO SET MOB MEANS ZUK, ON ZUK'S WEAPON. There was a pre-swap here that put the blowpipe on
+    // early, ready for the pair to land - but `dueBlowpipe` never goes false again, so it held the
+    // blowpipe for every tick the set was not up, and the blowpipe does not reach Zuk. The bot
+    // stood holding the wrong weapon doing nothing instead of putting hitpoints on the boss.
+    // Getting it on costs a tick when the set actually arrives, which is the cheaper of the two.
+    let set: GearSetName = hasSetMob
+      ? isAttackable(region, player, target, blowpipeReach)
+        ? "blowpipe"
+        : "tbow"
+      : preSwap
+        ? "blowpipe"
+        : option?.set ?? "tbow";
+
+    // LATE, ON THE TICK BEFORE THE SHOT. See ZUK_SWAP_LEAD.
+    //
+    // Not a delay for its own sake: it is the difference between changing gear for the shot that
+    // is about to happen and changing gear for a shot four ticks away, whose target and distance
+    // will both have moved by the time it arrives. A cooldown tick spent swapping is a tick the
+    // bot cannot use, and it was spending most of them.
+    //
+    // `earliestShotOffset` is floored at 1 - `attackStep` has already run - so 1 means "the shot
+    // can go next tick" and 2 means "the tick after". Swapping at 2 puts the weapon on with the
+    // cooldown still running and the shot goes out at 1, costing nothing. Swapping at 1 is still
+    // allowed and does cost the shot, but refusing there would leave the wrong weapon on forever.
+    const untilShot = PlayerAttackClock.earliestShotOffset() ?? 1;
+
+    // A SHOT IN HAND BEATS A BETTER WEAPON. See ZUK_SWAP_LEAD for the timing this sits on top of.
+    //
+    // At `untilShot` 1 the shot goes out NEXT tick, so a swap here does not delay it by a tick -
+    // it cancels it, and the cooldown starts again from the swap. Measured on seed 38: six of the
+    // thirteen missed tag opportunities were exactly this, the bot dropping a ready crossbow to
+    // put on a blowpipe for a mob it had not tagged yet.
+    //
+    // The upgrade is only ever DPS - the blowpipe is faster, not more able - and DPS on an
+    // untagged mob is worth nothing next to the tag itself, which is permanent, costs one hit, and
+    // is the entire reason the shield is still alive. So on the last tick the preference is
+    // dropped and whatever is in hand takes the shot, provided it can reach.
+    //
+    // Only on that last tick. At 2 and above there is no shot to lose and the better weapon is
+    // simply put on, which is what ZUK_SWAP_LEAD is for.
+    if (
+      untilShot === 1 &&
+      !isWearing(player, set) &&
+      isAttackable(region, player, target)
+    ) {
+      say(`wave 69: shooting ${target.mobName()} with what is in hand, not swapping to ${set}`);
+      InfernoAutomation.target = applyAttackPlan(
+        region,
+        player,
+        target,
+        InfernoAutomation.target,
+        (mob) =>
+          InfernoAutomation.clickLog.push({
+            tile: { x: mob.location.x, y: mob.location.y },
+          }),
+      );
+      return;
+    }
+
+    if (!isWearing(player, set) && untilShot <= InfernoAutomation.ZUK_SWAP_LEAD) {
+      // The switch costs this tick. Commit to the target before returning so next tick does not
+      // re-decide from nothing and reverse a change we just paid for.
+      InfernoAutomation.equipAndShow(player, set);
+      InfernoAutomation.target = target;
+      const side = onRangerSide ? "east/ranger" : "west/mager";
+      say(
+        `wave 69: switching to ${set} for ${target.mobName()} ` +
+          `(set in ${untilSet ?? "-"}, ${side})`,
+      );
+      return;
+    }
+
+    // MAGER SIDE SPENDS THE SAME TICK, ON ITS OWN TILE.
+    //
+    // East, the set coming due costs a tick to put the blowpipe on. West there is nothing to
+    // swap - the bow is already in hand - so that tick would otherwise be free, and the two sides
+    // would arrive at the set a tick out of step with each other. Clicking the tile already stood
+    // on spends it identically: `moveTo` on the current location moves nobody, so position is
+    // untouched, and the tick lands on the same boundary the swap would have.
+    //
+    // It is not free, and that is the point rather than a cost to work around - `moveTo` calls
+    // `interruptCombat`, so aggro drops exactly as it does when the swap side re-clicks its
+    // target afterwards. Both sides re-acquire on the following tick.
+    //
+    // Once only, latched: this marks the moment the set arrives, not a thing to do every tick.
+    // HOLD FIRE ACROSS THE WHOLE WINDOW, not for one tick of it.
+    //
+    // The point is to arrive at the spawn with the weapon OFF COOLDOWN, so the pair can be tagged
+    // the tick it appears. A single click that cancels the attack achieves nothing if the next
+    // tick starts another one - the bow goes straight back onto its five-tick cooldown and the
+    // mager gets a free hit while it runs down. So this holds for every tick of the window, not
+    // just the first.
+    //
+    // Only the mager side needs it stated. East, the blowpipe goes on and CANNOT reach Zuk, so
+    // holding fire is a side effect of the swap - `setHasLOS` fails on range and nothing fires.
+    // West keeps the bow, which reaches Zuk perfectly well, so the hold has to be explicit.
+    //
+    // NOT SIMPLY DECLINING TO CLICK. Aggro is sticky and the engine re-fires at a standing target
+    // on its own every time the cooldown expires, so "do not call applyAttackPlan" is not the same
+    // as "do not attack". The aggro has to actually be dropped, and clicking the tile already
+    // stood on is how a player drops it - `moveTo` calls `interruptCombat` and moves nobody.
+    // Issued once, because once aggro is null nothing below re-sets it while this branch holds.
+    if (inBlowpipeWindow && !hasSetMob) {
+      if (player.aggro) {
+        InfernoAutomation.walkTo(player, player.location.x, player.location.y);
+        InfernoAutomation.target = null;
+      }
+      say(
+        `wave 69: holding fire for the spawn (set in ${untilSet ?? "-"}, ` +
+          `${onRangerSide ? "east" : "west"})`,
+      );
+      return;
+    }
+
+    // Holding a weapon that cannot reach the target - the blowpipe waiting on a spawn, with only
+    // Zuk on the board six tiles away. Nothing to do but hold. NOT routed through
+    // `applyAttackPlan`, which pins destinationLocation to the current tile when it drops a
+    // target and would cancel a walk in progress.
+    if (!isWearing(player, set)) {
+      say(`wave 69: want ${set} for ${target.mobName()}, swapping in ${untilShot - 1}`);
+      return;
+    }
+
+    if (!isAttackable(region, player, target)) {
+      say(`wave 69: ${set} on, ${target.mobName()} out of its reach (set in ${untilSet ?? "-"})`);
+      return;
+    }
+
+    // DO NOT CLICK THE NPC WHILE THE WEAPON IS STILL COUNTING DOWN.
+    //
+    // Aggro is sticky - `applyAttackPlan` only clicks when it is not already on the target, and
+    // the engine fires by itself the moment the cooldown expires - so a click on a cooldown tick
+    // buys nothing the engine was not going to do anyway. Click on the tick the shot can land,
+    // and no other.
+    //
+    // "CAN LAND NEXT TICK", not "the cooldown has already reached zero". `Player.attackStep`
+    // decrements attackDelay and THEN tests it, so a delay still reading 1 here fires next tick
+    // all the same - waiting for 0 would throw that shot away every cycle.
+    if (PlayerAttackClock.earliestShotOffset() !== 1) {
+      say("wave 69: weapon on cooldown");
+      return;
+    }
+
+    InfernoAutomation.target = applyAttackPlan(
+      region,
+      player,
+      target,
+      InfernoAutomation.target,
+      (mob) =>
+        InfernoAutomation.clickLog.push({
+          tile: { x: mob.location.x, y: mob.location.y },
+        }),
+    );
+    const why =
+      target.aggro !== player
+        ? " (pulling off shield)"
+        : target.mobName() === EntityNames.JAL_ZEK
+          ? " (zuk under 600)"
+          : "";
+    say(
+      `wave 69: ${repositioning ? "shooting mid-walk at" : "attacking"} ${target.mobName()}${why}`,
+    );
+  }
+
   private static decide(region: Region, player: Player) {
+    // Wave 69 forks here, before anything else is even set up. See `decideZukWave`.
+    if (((region as unknown as { wave?: number }).wave ?? 0) === 69) {
+      InfernoAutomation.decideZukWave(region, player);
+      return;
+    }
+
     // Once per tick, before anything asks which pillar a nibbler is heading for. A nibbler's
     // target stays unknown for its first visible tick - see PillarDefence.
     observeNibblers(region);
@@ -1263,16 +1968,7 @@ ${spellLine}`);
     // anything, so passing it would silently drop every overhead and leave the bot tanking
     // unprayed. `applyPrayerPlan` falls back to toggling the prayer directly when given no
     // callback, which is the same state change by a shorter route.
-    const clickPrayer = ControlPanelController.controller
-      ? (name: string) => InfernoAutomation.clickPrayer(player, name)
-      : undefined;
-    applyPrayerPlan(
-      player,
-      visibleMobs(region),
-      true,
-      clickPrayer,
-      InfernoAutomation.chosenPath,
-    );
+    InfernoAutomation.prayThisTick(region, player, InfernoAutomation.chosenPath);
 
     // Run back on, before anything can issue a walk this tick.
     InfernoAutomation.restoreRun(player);
@@ -1476,40 +2172,7 @@ ${spellLine}`);
     // They are both left-clicks on the world and in OSRS the later one wins, so only one can
     // happen per tick. Movement takes precedence: repositioning decides which mobs can hit us
     // and on which ticks, and a delayed attack only costs a little damage output.
-    //
-    // ZUK ONLY, this is inverted. The fight is long, every tbow hit against 1200 hp matters,
-    // and the shield-coverage penalty already carries its own multi-tick buffer (see
-    // ZUK_SHIELD_COVER_BUFFER_TICKS) specifically so a reposition can wait a tick without
-    // losing cover. A "delayed attack" is not free the way it is everywhere else: on any tick
-    // the weapon is ALREADY on cooldown, a move costs nothing (no swing was happening this
-    // tick regardless), but on a tick the swing is actually ready, walking instead of firing
-    // throws a real hit away for a reposition that had slack to wait for it. So on wave 69, if
-    // Zuk is up, reachable RIGHT NOW and the weapon is off cooldown, take the swing and let
-    // the reposition happen next tick instead - it is not being skipped, only sequenced after
-    // the attack it would otherwise have pre-empted for nothing.
-    //
-    // Gated on ACTUALLY STILL COVERED, read straight off this tick's own score for the tile
-    // we are standing on - not inferred from "the scorer wants to move" (buffered repositions
-    // fire well before cover is lost, which is most of why chosenTile differs from here). The
-    // one case that must never take the swing is the tile already carrying
-    // ZUK_SHIELD_UNCOVERED_PENALTY: there, standing still to fire costs a 251 hit to save one
-    // tbow swing, and no amount of DPS is worth that trade.
-    const zuk = visibleMobs(region).find(
-      (mob) => mob.dying === -1 && mob.mobName() === EntityNames.TZ_KAL_ZUK,
-    );
-    const stillCovered = !InfernoAutomation.scoredTiles.some(
-      (scored) =>
-        scored.tile.x === player.location.x &&
-        scored.tile.y === player.location.y &&
-        (scored.parts?.shieldPenalty ?? 0) !== 0,
-    );
-    const zukSwingReady =
-      !!zuk &&
-      stillCovered &&
-      (player.attackDelay ?? 0) <= 0 &&
-      attackOptionFor(region, player, zuk) !== null;
-
-    const repositioning = zukSwingReady ? false : InfernoAutomation.stepMovement(player, region);
+    const repositioning = InfernoAutomation.stepMovement(player, region);
     InfernoAutomation.attackState = repositioning ? "moving" : "-";
 
     if (repositioning) {
@@ -1521,37 +2184,28 @@ ${spellLine}`);
       // within a band. `TargetPlanner.chooseTarget(region, player, snapshot, route, target)` is
       // the real one, which prices a target by simulating the fight without it and already
       // accounts for the pillar damage a nibbler would do.
-      // Zuk wave gets its own flat ranking, checked AHEAD of the Jad-wave case below: the
-      // Zuk-phase Jad spawns with its own healers too, and without this precedence a live Jad
-      // on wave 69 would incorrectly pull in the tag-and-turn mechanic built for a standalone
-      // Jad wave, rather than being treated as one more entry (priority 4) in Zuk's own order.
-      let intended: Mob | null;
-      if (zuk) {
-        intended = InfernoAutomation.decideZukTarget(region, player, zuk);
-      } else {
-        // Jad waves use the tag-and-turn instead of the priority table: blowpipe each healer
-        // still healing (aggro not yet on us), then Jad once all are pulled - and never the
-        // tagged ones. No fallback to the table while a Jad lives, or tagged healers would
-        // come straight back as its top-ranked targets.
-        const jadWave = visibleMobs(region).some(
-          (mob) => mob.dying === -1 && mob.mobName() === EntityNames.JAL_TOK_JAD,
-        );
-        // Nibblers are taken AHEAD of the priority table, and not because they outrank it -
-        // JAL_NIB is already 10, the top of it. It is `chooseByPriority`'s stickiness that has
-        // to be defeated: equal priority is never a reason to switch, so a FROZEN nibbler
-        // already held as the target keeps focus while a loose one walks into a pillar. Asking
-        // `nibblerTarget` first means the freeze-aware pick wins, and it is the same pick the
-        // ice cast makes - one answer, two consumers.
-        //
-        // Not on Jad waves: the tag-and-turn owns targeting entirely there, and nibblers do
-        // not spawn on them anyway.
-        const nibbler = jadWave ? null : InfernoAutomation.nibblerTarget(region, player);
-        intended =
-          nibbler ??
-          (jadWave
-            ? chooseJadWaveTarget(region, player)
-            : chooseByPriority(region, player, InfernoAutomation.target));
-      }
+      // Jad waves use the tag-and-turn instead of the priority table: blowpipe each healer
+      // still healing (aggro not yet on us), then Jad once all are pulled - and never the
+      // tagged ones. No fallback to the table while a Jad lives, or tagged healers would
+      // come straight back as its top-ranked targets.
+      const jadWave = visibleMobs(region).some(
+        (mob) => mob.dying === -1 && mob.mobName() === EntityNames.JAL_TOK_JAD,
+      );
+      // Nibblers are taken AHEAD of the priority table, and not because they outrank it -
+      // JAL_NIB is already 10, the top of it. It is `chooseByPriority`'s stickiness that has
+      // to be defeated: equal priority is never a reason to switch, so a FROZEN nibbler
+      // already held as the target keeps focus while a loose one walks into a pillar. Asking
+      // `nibblerTarget` first means the freeze-aware pick wins, and it is the same pick the
+      // ice cast makes - one answer, two consumers.
+      //
+      // Not on Jad waves: the tag-and-turn owns targeting entirely there, and nibblers do
+      // not spawn on them anyway.
+      const nibbler = jadWave ? null : InfernoAutomation.nibblerTarget(region, player);
+      const intended: Mob | null =
+        nibbler ??
+        (jadWave
+          ? chooseJadWaveTarget(region, player)
+          : chooseByPriority(region, player, InfernoAutomation.target));
 
       if (!intended) {
         InfernoAutomation.attackState = "no target";
@@ -1568,34 +2222,19 @@ ${spellLine}`);
         // autocasts blood, so sustain is purely a gear choice. Kill speed on the tail of a
         // wave is worth less than walking into the next one at full health.
         //
-        // NOT on 67/68/69. Those waves already have dedicated positioning logic (the healer
-        // tag-and-turn, the shield tracker) that a mage-set switch has no business competing
-        // with, and "alive <= 2" trips constantly there for the wrong reason - Jad's own
-        // healers count towards it, and on 69 the shield (which never dies) plus Zuk alone
-        // already satisfies it for most of the fight. Kill speed against a boss is worth more
-        // than topping up, unlike the tail of a regular wave.
+        // NOT on 67/68. Those waves already have dedicated positioning logic (the healer
+        // tag-and-turn) that a mage-set switch has no business competing with, and
+        // "alive <= 2" trips constantly there for the wrong reason - Jad's own healers count
+        // towards it. Kill speed against a boss is worth more than topping up, unlike the tail
+        // of a regular wave. Wave 69 never reaches here; it stops after prayer.
         const wave = (region as unknown as { wave?: number }).wave ?? 0;
         const healing =
           wave < 67 &&
           (player.currentStats?.hitpoint ?? 0) < (player.stats?.hitpoint ?? 0) &&
           visibleMobs(region).filter((mob) => mob.dying === -1).length <= 2;
-        // ZUK WAVE gear, the user's explicit call: blowpipe the ranger and Zuk's own healer
-        // (Jal-MejJak, enrage phase) when in blowpipe range, tbow everything else - Jad's
-        // healers, mager, Jad and Zuk alike. Overrides the general reach-fallback chain below
-        // entirely for this wave; it does not feed into it.
         let set: GearSetName;
         if (stacked || healing) {
           set = "mage";
-        } else if (zuk) {
-          const blowpipe = weaponForSet(player, "blowpipe") as { attackRange?: number } | null;
-          const blowpipeRange = blowpipe?.attackRange ?? 5;
-          const blowpipeMob =
-            intended.mobName() === EntityNames.JAL_XIL ||
-            intended.mobName() === EntityNames.JAL_MEJ_JAK;
-          set =
-            blowpipeMob && isAttackable(region, player, intended, blowpipeRange)
-              ? "blowpipe"
-              : "tbow";
         } else {
           // Otherwise: the SAME decision canReach made - preferred set, or the long-bow
           // fallback that made this mob a candidate at all. Reading requiredSetFor here
