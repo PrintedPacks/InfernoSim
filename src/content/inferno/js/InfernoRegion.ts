@@ -29,6 +29,7 @@ import { canReach } from "./KillPriority";
 import { TileGrid } from "./TileGrid";
 import { PlayerAttackClock } from "./PlayerAttackClock";
 import { ShieldAttackerClock } from "./ShieldAttackerClock";
+import { TagCollisionGate } from "./TagCollisionGate";
 import { ZukAttackClock } from "./ZukAttackClock";
 import { ZukSetTimer } from "./ZukSetTimer";
 import { ZukSimPanel } from "./ZukSimPanel";
@@ -1153,6 +1154,9 @@ export class InfernoRegion extends Region {
 
     ZukAttackClock.observe(this);
     ShieldAttackerClock.observe(this, this.players[0]);
+    // After ShieldAttackerClock on purpose: a committed tag expires on its predicted fire
+    // tick, and the clock has to have SEEN that fire before the projection takes over.
+    TagCollisionGate.observe(this);
     ZukSetTimer.observe(this);
     PlayerAttackClock.observe(this.players[0]);
 

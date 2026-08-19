@@ -12,6 +12,7 @@ import { bestMove, focusNibbler, ScoredTile, scoreCandidates, scoreZukTiles, wav
 import { hasDyingBlob } from "./Trajectory";
 import { PlayerAttackClock } from "./PlayerAttackClock";
 import { ShieldAttackerClock } from "./ShieldAttackerClock";
+import { TagCollisionGate } from "./TagCollisionGate";
 import { ZukAttackClock } from "./ZukAttackClock";
 import { ZukSetTimer } from "./ZukSetTimer";
 import { ArenaSnapshot } from "./ArenaSnapshot";
@@ -1733,6 +1734,16 @@ ${spellLine}`);
     // allowed and does cost the shot, but refusing there would leave the wrong weapon on forever.
     const untilShot = PlayerAttackClock.earliestShotOffset() ?? 1;
 
+    // OFF-TICK GATE, judged before either attack path can fire. A first tag on a set mob or
+    // Jad chooses that mob's attack phase for the rest of its life - the flinch at the tag's
+    // landing is what sets it - so the click is held until the phase it would produce fits the
+    // prayer timeline: never two different overheads demanded on the same tick, and nothing
+    // ever sharing a tick with Jad, whose style cannot be known in time. Waiting moves the
+    // landing and therefore the phase, so a safe tick is always a few ticks out at most.
+    // Everything else - Zuk, healers, a mob already ours or already committed to - passes
+    // straight through. See TagCollisionGate for the full mechanics.
+    const tagGate = TagCollisionGate.evaluate(region, player, target);
+
     // A SHOT IN HAND BEATS A BETTER WEAPON. See ZUK_SWAP_LEAD for the timing this sits on top of.
     //
     // At `untilShot` 1 the shot goes out NEXT tick, so a swap here does not delay it by a tick -
@@ -1749,6 +1760,7 @@ ${spellLine}`);
     // simply put on, which is what ZUK_SWAP_LEAD is for.
     if (
       untilShot === 1 &&
+      tagGate.safe &&
       !isWearing(player, set) &&
       isAttackable(region, player, target)
     ) {
@@ -1763,6 +1775,9 @@ ${spellLine}`);
             tile: { x: mob.location.x, y: mob.location.y },
           }),
       );
+      if (tagGate.prediction && InfernoAutomation.target === target) {
+        TagCollisionGate.noteTag(target, tagGate.prediction);
+      }
       return;
     }
 
@@ -1776,6 +1791,23 @@ ${spellLine}`);
         `wave 69: switching to ${set} for ${target.mobName()} ` +
           `(set in ${untilSet ?? "-"}, ${side})`,
       );
+      return;
+    }
+
+    // THE OFF-TICK HOLD. Below the swap branch on purpose: a blocked tick is exactly the tick
+    // a pending gear change is free to happen in, so the swap gets first refusal and the hold
+    // takes whatever ticks remain. The aggro drop is the same one every other hold here makes,
+    // and for the same reason - aggro is sticky and the engine re-fires at a standing target on
+    // its own, so leaving it set would take the colliding shot anyway. Kept off during a walk,
+    // exactly like the holds above: the tile click would cancel the walk. The weapon sits ready
+    // through the hold (nothing is firing), so the tag goes out on the first tick the gate
+    // clears with no cooldown to wait through.
+    if (!tagGate.safe) {
+      if (player.aggro && !repositioning) {
+        InfernoAutomation.walkTo(player, player.location.x, player.location.y);
+        InfernoAutomation.target = null;
+      }
+      say(`wave 69: holding tag on ${target.mobName()} (${tagGate.reason})`);
       return;
     }
 
@@ -1860,6 +1892,12 @@ ${spellLine}`);
           tile: { x: mob.location.x, y: mob.location.y },
         }),
     );
+    // A first tag the gate just approved: remember the cadence it was approved with, so the
+    // ticks between this click and the projectile landing judge any second tag against what
+    // this mob is ABOUT to do rather than the shield cadence it is still showing.
+    if (tagGate.prediction && InfernoAutomation.target === target) {
+      TagCollisionGate.noteTag(target, tagGate.prediction);
+    }
     const why =
       target.aggro !== player
         ? " (pulling off shield)"

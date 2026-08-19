@@ -102,7 +102,7 @@ interface Tracked {
  * `JadTracker.ANIM_TICK_LAND - ANIM_TICK_COMMIT`, kept in step by hand because that module keeps
  * them private. Three.
  */
-const JAD_LAND_DELAY = 3;
+export const JAD_LAND_DELAY = 3;
 
 /**
  * Ticks until a mob that has never attacked takes its first swing - see the note at the top.
@@ -135,7 +135,7 @@ export const UNKNOWN_STYLE = "unknown";
  * seeded stream, moving the simulation. The honest answer is that the tick is taken and the style
  * is not decided, which is exactly what the lane should show.
  */
-function rangedStyleOf(mob: Mob): string | null {
+export function rangedStyleOf(mob: Mob): string | null {
   const name = mob.mobName();
   if (name === EntityNames.JAL_ZEK) {
     return "magic";
@@ -152,7 +152,7 @@ function rangedStyleOf(mob: Mob): string | null {
  * `withinMeleeRange` only reads x, y and size off its argument, so a shape carrying those three
  * is enough - the cast avoids rebuilding a whole SimMob to ask one geometric question.
  */
-function stylesFor(mob: Mob, player: Player | null | undefined, ranged: string): string[] {
+export function stylesFor(mob: Mob, player: Player | null | undefined, ranged: string): string[] {
   const melee = mob.canMeleeIfClose?.();
   if (!melee || !player) {
     return [ranged];
@@ -196,8 +196,15 @@ export class ShieldAttackerClock {
         untilFirstFire: spawnClock(mob),
         jad: isJad(mob),
       };
-      // The reset that means it fired - see the note at the top.
-      if (previous && delay > previous.lastDelay) {
+      // The reset that means it fired - see the note at the top. ONLY a jump to the FULL
+      // cooldown counts: `didAttack` is the one thing that writes `attackSpeed` into the delay.
+      // Two other things also move it UPWARD and are not attacks - the mager's flicker parks the
+      // delay at 1 the tick before it fires (`JalZek.attackIfPossible`), and a tag landing on a
+      // shield-aggroed mob flinches it to `flinchDelay + 1` (`Unit.processIncomingAttacks`).
+      // Both used to register phantom fires here, and a phantom fire is worse than a missed one:
+      // every projection afterwards is anchored a tick or two early, exactly when the automation
+      // is trying to place a tag BY that projection.
+      if (previous && delay > previous.lastDelay && delay === entry.speed) {
         entry.lastFireTick = ShieldAttackerClock.tick;
       }
       live.set(mob, entry);
@@ -211,9 +218,19 @@ export class ShieldAttackerClock {
    * A mob that has never been seen to attack contributes nothing: there is no phase to project
    * from and inventing one would be exactly the kind of guess this file exists to avoid.
    */
-  static firesInWindow(fromOffset: number, toOffset: number): AttackerFire[] {
+  static firesInWindow(
+    fromOffset: number,
+    toOffset: number,
+    include?: (mob: Mob) => boolean,
+  ): AttackerFire[] {
     const fires: AttackerFire[] = [];
     ShieldAttackerClock.tracked.forEach((entry, mob) => {
+      // An optional filter, because not every caller means "everything on the board". The
+      // off-tick gate asks only about mobs whose attacks actually reach the PLAYER - the ones
+      // it has to fit a new tag around - and which mobs those are is its judgement, not ours.
+      if (include && !include(mob)) {
+        return;
+      }
       // A Jad attack already in flight: the style is no longer a guess and the tick it is tested
       // on is known exactly. This is the useful half of the lane, so it is added on top of the
       // projection rather than instead of it - the projection covers what comes AFTER.
@@ -277,6 +294,18 @@ export class ShieldAttackerClock {
     const since = ShieldAttackerClock.tick - entry.lastFireTick;
     const speed = entry.speed || 1;
     return speed - (since % speed);
+  }
+
+  /**
+   * Whether this mob has ever been watched firing.
+   *
+   * The distinction matters to the off-tick gate because a mager that has NOT fired yet is the
+   * one state where its pre-attack flicker survives across a tick boundary - `JalZek`'s spawn
+   * path arms the flicker the tick before its opening attack, and that armed attack goes
+   * through REGARDLESS of a flinch landing on the same tick. See TagCollisionGate.
+   */
+  static hasFired(mob: Mob): boolean {
+    return (ShieldAttackerClock.tracked.get(mob)?.lastFireTick ?? null) !== null;
   }
 
   static counts(): { total: number; fired: number } {
