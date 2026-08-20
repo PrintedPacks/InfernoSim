@@ -466,7 +466,7 @@ export interface ShieldState {
   frozen: number;
 }
 
-function findShield(region: Region): ShieldState | null {
+export function findShield(region: Region): ShieldState | null {
   const shield = visibleMobs(region).find(
     (mob) => mob.dying <= -1 && mob.mobName() === EntityNames.INFERNO_SHIELD,
   );
@@ -725,12 +725,36 @@ const ZUK_SORTIE_PENALTY = -0.25;
 const ZUK_SORTIE_SAFETY = 1;
 
 /**
- * What the sortie test decided this tick, for the harness to read back.
+ * EXPERIMENT - flip to false to revert in one line.
+ *
+ * While an untagged set mob is stranded BEHIND the band - on the side the shield is moving away
+ * from, out of the long weapon's reach from every covered column - the face preference flips to
+ * the trailing side, and the trailing tile itself is allowed as cover. Both halves spend the
+ * same currency: the four tiles of banked cover the leading face buys are handed over as four
+ * tiles of proximity to the mob, shortening the eventual sortie or reach window by up to two
+ * ticks each way. The trailing tile IS covered at the fire tick by TzKalZuk's own test - what
+ * standing there costs is slack, and while a mob is pouring sixty-damage hits into the shield,
+ * slack is the cheaper thing to spend.
+ *
+ * ONLY while the shield is leaving the mob behind. On the return leg the mob is on the LEADING
+ * side and the normal preference already points at it, so this changes nothing there - which is
+ * also why it cannot help a park the band is already swinging back from, only the drift out.
+ *
+ * Motivated by seed 26 set 8: the westbound band dragged the bot four leading-face tiles
+ * further from a stranded ranger whose sortie trip then missed the enraged budget every cycle,
+ * and the shield's last 72 hitpoints went to the floor before the band came back.
+ */
+const ZUK_STRANDED_FACE_FLIP = true;
+
+/**
+ * What the sortie test decided this tick, for the harness - and the automation - to read back.
  *
  * REPORTED BY THE CODE THAT DECIDES, not reconstructed afterwards. A harness-side copy would need
  * the same routes, the same projected band and the same reach test, and any drift between the two
- * makes the report describe a scorer that does not exist. Diagnostic only - nothing reads it to
- * make a decision.
+ * makes the report describe a scorer that does not exist. No longer purely diagnostic: the
+ * automation reads `canTag` to decide whether holding the weapon for a sortie is worth anything -
+ * a sortie needs the weapon ready on arrival (`untilShot <= arrivalTicks + 1` above), and the
+ * attack layer is the only thing that can keep it ready.
  */
 export interface SortieDebug {
   /** Tiles from which something still on the shield could be shot. */
@@ -1976,6 +2000,34 @@ export function scoreZukTiles(
   const tagWeaponReach =
     (weaponForSet(player, "tbow") as { attackRange?: number } | null)?.attackRange ?? 0;
 
+  // Is something untagged stranded BEHIND the band - see ZUK_STRANDED_FACE_FLIP. "Behind" is
+  // the side the shield is moving away from, and "stranded" means the long weapon cannot reach
+  // it from any covered column, judged against the same projected band the cover test uses.
+  // Line of sight is deliberately not asked here: pretending a blocked shot is reachable only
+  // fails towards the normal face preference, never towards giving up slack for nothing.
+  const strandedBehind =
+    ZUK_STRANDED_FACE_FLIP &&
+    shieldAtFire !== null &&
+    untagged.some((mob) => {
+      const behind = shieldAtFire.direction
+        ? mob.location.x < shieldAtFire.x
+        : mob.location.x > shieldAtFire.x + ZUK_SHIELD_WIDTH - 1;
+      if (!behind) {
+        return false;
+      }
+      const lo = shieldAtFire.x;
+      const hi = shieldAtFire.x + ZUK_SHIELD_WIDTH - 1;
+      const dx = Math.max(lo - (mob.location.x + mob.size - 1), mob.location.x - hi, 0);
+      const dy = Math.max(mob.location.y - ZUK_SHIELD_COVER_MAX_Y, 0);
+      return Math.max(dx, dy) > tagWeaponReach;
+    });
+  // The x the tiebreak pulls towards: the trailing face while something is stranded behind the
+  // band, the leading face otherwise. `leading` is null through a bounce window; the stranded
+  // anchor deliberately is not - `trailAnchorX` is direction-correct mid-bounce, and the drift
+  // away from a stranded mob is exactly when the pull is being paid for.
+  const faceAnchor =
+    strandedBehind && shieldAtFire !== null ? trailAnchorX(shieldAtFire) : leading;
+
   /**
    * Ticks to walk from a tile back into cover, for the shield as it will be when Zuk fires.
    *
@@ -2053,8 +2105,10 @@ export function scoreZukTiles(
         isCoveredByShield(tile.x, tile.y, shieldAtFire.x) &&
         // THE TRAILING TILE IS NOT COVER. It is inside the band by TzKalZuk's own test and the
         // shield's very next step leaves it behind, so treating it as safe banks zero ticks and
-        // is what puts the bot one tile short when the window opens.
-        tile.x !== trailAnchorX(shieldAtFire) &&
+        // is what puts the bot one tile short when the window opens. EXCEPT while something is
+        // stranded behind the band - then the zero ticks of slack are being spent on purpose.
+        // See ZUK_STRANDED_FACE_FLIP.
+        (strandedBehind || tile.x !== trailAnchorX(shieldAtFire)) &&
         unsyncedBand.every((x) => isCoveredByShield(tile.x, tile.y, x)));
     // Can this tile shoot something still on the shield? Asked before cover, because it is what
     // decides whether leaving cover is worth considering at all.
@@ -2123,7 +2177,7 @@ export function scoreZukTiles(
     parts.tagReach = canTag && (safe || sortie) ? ZUK_TAG_REACH_BONUS : 0;
     parts.shieldPenalty = safe || sortie ? 0 : ZUK_SHIELD_UNCOVERED_PENALTY;
     parts.shieldLead =
-      leading === null ? 0 : -SHIELD_FACE_TIEBREAK * Math.abs(tile.x - leading);
+      faceAnchor === null ? 0 : -SHIELD_FACE_TIEBREAK * Math.abs(tile.x - faceAnchor);
     parts.healerAoePenalty = nearHealerAoeLanding(healerAoe, tile)
       ? ZUK_HEALER_AOE_PENALTY
       : 0;

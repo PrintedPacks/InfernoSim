@@ -8,7 +8,7 @@ import { applyAttackPlan } from "./AttackPlanner";
 import { equipSet, GearSetName, isWearing, requiredSetFor, weaponForSet } from "./GearSets";
 import { hasIceBarrageSelected, selectedSpell, selectIceBarrage } from "./SpellCaster";
 import { isAttackable } from "./AttackPlanner";
-import { bestMove, focusNibbler, ScoredTile, scoreCandidates, scoreZukTiles, waveHomeTile } from "./TileScorer";
+import { bestMove, findShield, focusNibbler, isCoveredByShield, projectShield, ScoredTile, scoreCandidates, scoreZukTiles, sortieDebug, waveHomeTile } from "./TileScorer";
 import { hasDyingBlob } from "./Trajectory";
 import { PlayerAttackClock } from "./PlayerAttackClock";
 import { ShieldAttackerClock } from "./ShieldAttackerClock";
@@ -1240,7 +1240,58 @@ ${spellLine}`);
       }
     };
 
-    const repositioning = InfernoAutomation.stepMovement(player, region);
+    // A READY TAG OUTRANKS A ROUTINE WALK CLICK. The walk owning the tick (below) is right when
+    // the walk is survival; it is wrong when the walk is the face preference tidying position
+    // while a one-or-two-tick tag window closes. Measured on seed 26 set 8: the ranger was in
+    // crossbow reach for exactly two ticks - the spawn-visibility tick, unavoidable, and t3008,
+    // which a follow-shield click spent while the player's tile stayed covered for three more
+    // ticks. The westbound shield then pulled the ranger out of reach, its sortie trip never
+    // fit the enraged budget, and it put the shield's last 72 hitpoints into the floor.
+    //
+    // So the walk click is deferred ONE tick when everything needed to tag is already true:
+    // an untagged set mob attackable from this tile, the weapon ready, the gate content, and -
+    // the part that keeps this honest - the tile we would stand on still covered when Zuk's
+    // next shot is aimed. Cover is a deadline, not a standing requirement (see the scorer), so
+    // a tick of stillness inside that deadline is free; when it is not free, the walk keeps the
+    // tick exactly as before.
+    let walkDeferredForTag = false;
+    if (PlayerAttackClock.earliestShotOffset() === 1) {
+      const heavyReach = Math.max(
+        (weaponForSet(player, "blowpipe") as { attackRange?: number } | null)
+          ?.attackRange ?? 0,
+        (weaponForSet(player, "tbow") as { attackRange?: number } | null)
+          ?.attackRange ?? 0,
+      );
+      const tagable = visibleMobs(region).find(
+        (mob) =>
+          mob.dying === -1 &&
+          mob.aggro !== player &&
+          (mob.mobName() === EntityNames.JAL_ZEK ||
+            mob.mobName() === EntityNames.JAL_XIL ||
+            mob.mobName() === EntityNames.JAL_TOK_JAD) &&
+          isAttackable(region, player, mob, heavyReach) &&
+          TagCollisionGate.evaluate(region, player, mob).safe,
+      );
+      if (tagable) {
+        const shieldHere = findShield(region);
+        const untilFire = ZukAttackClock.ticksUntilNextAttack();
+        walkDeferredForTag =
+          shieldHere !== null &&
+          untilFire !== null &&
+          untilFire >= 2 &&
+          isCoveredByShield(
+            player.location.x,
+            player.location.y,
+            projectShield(shieldHere, untilFire).x,
+          );
+      }
+    }
+    if (walkDeferredForTag) {
+      InfernoAutomation.walkClickIssued = false;
+    }
+    const repositioning = walkDeferredForTag
+      ? false
+      : InfernoAutomation.stepMovement(player, region);
 
     // THE WALK OWNS THE TICK IT IS CLICKED ON. A tile click and an attack click are both world
     // clicks, one per tick, and `moveTo` -> `interruptCombat` has already cleared aggro by the
@@ -1514,6 +1565,19 @@ ${spellLine}`);
     // guess that the later choice then has to live with.
     let target: Mob = zuk as Mob;
     let hasSetMob = false;
+    // Filled when the band passed over a gate-blocked candidate, so the state line can say so.
+    let heldOverNote = "";
+    // Anything from the set still on the shield, reachable or not. Reach is a separate question
+    // answered by the candidate scan below; this one exists because a mob OUTSIDE reach is still
+    // a decision - it is what the sortie hold and the worn-weapon rule are both about.
+    const untaggedSetMobOnBoard = visibleMobs(region).some(
+      (mob) =>
+        mob.dying === -1 &&
+        mob.aggro !== player &&
+        (mob.mobName() === EntityNames.JAL_ZEK ||
+          mob.mobName() === EntityNames.JAL_XIL ||
+          mob.mobName() === EntityNames.JAL_TOK_JAD),
+    );
 
     {
       // Candidates are anything either weapon can hit, so a mob outside the blowpipe's reach is
@@ -1544,8 +1608,14 @@ ${spellLine}`);
       // was wrong for the same reason inverted - it deferred a mob already in reach in favour of
       // one about to fire, the deferred mob drifted out of range, and its tag went from +5 to +38.
       // Imminence of the SHOT is what matters, not imminence of their attack.
-      let furthestOffUs: Mob | null = null;
-      let furthestOffUsDistance = -Infinity;
+      // Which way the shield will be carrying us by the time a tag could land - a tag is about
+      // four ticks from click to landing, and `projectShield` replays any bounce inside that
+      // window, so near a wall this answers with the direction that will actually hold rather
+      // than the one about to flip. Null when the shield is gone and there is no drift to read.
+      const shieldNow = findShield(region);
+      const shieldHeadingEast =
+        shieldNow === null ? null : projectShield(shieldNow, 4).direction;
+      const offUs: { mob: Mob; distance: number; expiring: boolean }[] = [];
       let closestHealer: Mob | null = null;
       let closestHealerDistance = Infinity;
       let closestRanger: Mob | null = null;
@@ -1594,10 +1664,29 @@ ${spellLine}`);
           Math.abs(mob.location.y - player.location.y),
         );
         if (mob.aggro !== player) {
-          if (distance > furthestOffUsDistance) {
-            furthestOffUs = mob;
-            furthestOffUsDistance = distance;
-          }
+          // THE EXPIRING SHOT WINS THE UNTAGGED BAND, and expiring is a matter of DIRECTION,
+          // not distance. Distance only changes because the shield drags us, so the shot that
+          // is going away is the one at a mob on the side the shield is moving AWAY from -
+          // whatever the two distances happen to read this tick. A mager momentarily a tile
+          // further but dead ahead of the drift is a shot that is IMPROVING; the nearer ranger
+          // behind the drift is the one about to stop existing. Furthest-first was only ever a
+          // proxy for this - right whenever the far mob was also the abandoned one - and it
+          // still decides between two shots expiring together, or everything when the shield
+          // is gone and nothing drifts.
+          //
+          // Measured both ways round: seed 7 set 4, from 25,14 with the shield heading west,
+          // the eastern ranger was the abandoned shot, list order tagged the mager first, and
+          // the ranger sat on the shield for 35 ticks and 208 damage; seed 84 set 2, from
+          // 27,14 heading EAST, the western mager was abandoned, ranger-first was the wrong
+          // fix, and the mager went unshootable for 19 ticks. Heading east, mobs at or west of
+          // us expire; heading west, mobs at or east of us. Remaining ties go to the ranger -
+          // the mob the kill order takes first anyway.
+          const expiring =
+            shieldHeadingEast !== null &&
+            (shieldHeadingEast
+              ? mob.location.x <= player.location.x
+              : mob.location.x >= player.location.x);
+          offUs.push({ mob, distance, expiring });
         } else if (healer) {
           if (distance < closestHealerDistance) {
             closestHealer = mob;
@@ -1612,6 +1701,55 @@ ${spellLine}`);
           closestMager = mob;
           closestMagerDistance = distance;
         }
+      }
+
+      // The band's order: expiring shots, then furthest, then the directional / ranger tie -
+      // the same beats-logic the loop used to fold inline, expressed once so the whole band can
+      // be ranked rather than only its winner kept.
+      const beatsOffUs = (
+        a: { mob: Mob; distance: number; expiring: boolean },
+        b: { mob: Mob; distance: number; expiring: boolean },
+      ): boolean => {
+        if (a.expiring !== b.expiring) {
+          return a.expiring;
+        }
+        if (a.distance !== b.distance) {
+          return a.distance > b.distance;
+        }
+        return shieldHeadingEast === null
+          ? a.mob.mobName() === EntityNames.JAL_XIL &&
+              b.mob.mobName() === EntityNames.JAL_ZEK
+          : shieldHeadingEast
+            ? a.mob.location.x < b.mob.location.x
+            : a.mob.location.x > b.mob.location.x;
+      };
+      offUs.sort((a, b) => (beatsOffUs(a, b) ? -1 : beatsOffUs(b, a) ? 1 : 0));
+
+      // THE GATE VOTES BEFORE THE BAND SETTLES. Holding the best candidate is only right when
+      // there is nothing else to do with the tick - and there usually is: the OTHER half of the
+      // pair. Measured on seed 16 t428: the ranger's tag was held (its range would have landed
+      // on the old, deliberately-kept-alive mager's magic cadence), the westbound shield
+      // dragged the player out of ranger reach one tick later, and the ranger sat on the shield
+      // for 19 ticks - while the fresh mager, whose magic stacks on the old mager's magic under
+      // one prayer, was tag-safe on that exact tick and got nothing. So the band takes the best
+      // candidate whose tag can go NOW, and only holds when every untagged candidate is
+      // blocked. The verdict is re-asked downstream on the final target; same tick, same
+      // inputs, same answer - this is selection, not a second gate.
+      let furthestOffUs: Mob | null = null;
+      for (const candidate of offUs) {
+        const verdict = TagCollisionGate.evaluate(region, player, candidate.mob);
+        if (verdict.safe) {
+          furthestOffUs = candidate.mob;
+          break;
+        }
+        // Say WHO was passed over and why. "attacking Jal-Zek" alone reads as picking the
+        // wrong mob when the replay viewer can see an untagged ranger standing right there;
+        // the truth - it was evaluated first and refused for cause - was invisible.
+        heldOverNote += ` [${candidate.mob.mobName()} held: ${verdict.reason}]`;
+      }
+      if (furthestOffUs === null && offUs.length > 0) {
+        furthestOffUs = offUs[0].mob;
+        heldOverNote = "";
       }
 
       // THE ORDER, and every band of it reads off live state rather than a remembered phase, so
@@ -1690,6 +1828,47 @@ ${spellLine}`);
       target = zuk;
     }
 
+    // HOLD THE WEAPON FOR THE SORTIE, NOT THE KILL. A sortie is only offered when the weapon
+    // will be ready on arrival (`untilShot <= arrivalTicks + 1` in the scorer), and every shot
+    // spent on a kill target restarts that clock - so the two decisions are coupled, and this
+    // is the attack layer's half of it. Measured on seed 6 set 4: the shield parked at the east
+    // wall with the mager 12+ from every covered tile, the trip out genuinely fit Zuk's cycle,
+    // and the sortie was refused for the weapon every single window - the bot fed each crossbow
+    // shot to the tagged ranger at its feet while the mager put ~250 into the shield. The
+    // ranger was not going anywhere; the shield was.
+    //
+    // Only while the pick is a KILL: an untagged mob in reach is already the target and the
+    // shot goes to it. Healers stay exempt - their band outranks tagged kills for a reason and
+    // their deaths are two darts each. And only while the scorer reports some tile can shoot
+    // the stranded mob at all (`canTag`), so an impossible tag never starves the kill forever.
+    // Aggro is dropped the same way every other hold drops it - the engine re-fires at a
+    // standing target on its own - and never mid-walk, where the click would cancel the walk
+    // that may itself be the sortie going out.
+    {
+      const targetName = target.mobName();
+      const targetIsHealer =
+        targetName === EntityNames.JAL_MEJ_JAK ||
+        targetName === EntityNames.YT_HUR_KOT;
+      const pickIsKill = !hasSetMob || target.aggro === player;
+      if (
+        untaggedSetMobOnBoard &&
+        pickIsKill &&
+        !targetIsHealer &&
+        sortieDebug().canTag > 0
+      ) {
+        if (player.aggro && !repositioning) {
+          InfernoAutomation.walkTo(player, player.location.x, player.location.y);
+          InfernoAutomation.target = null;
+        }
+        const sortieState = sortieDebug();
+        say(
+          `wave 69: weapon held for sortie tag ` +
+            `(trip ${sortieState.bestTrip ?? "-"} vs budget ${sortieState.walkTicks ?? "-"})`,
+        );
+        return;
+      }
+    }
+
     // PREFER THE BLOWPIPE, FALL BACK TO THE LONG WEAPON ONLY WHEN IT CANNOT REACH.
     //
     // And with nothing to shoot yet, still put it on. That is the pre-swap: the set is due, it is
@@ -1720,6 +1899,51 @@ ${spellLine}`);
       : preSwap
         ? "blowpipe"
         : option?.set ?? "tbow";
+
+    // THE WEAPON IN HAND OUTRANKS THE BETTER WEAPON WHILE THE SET STILL NEEDS TAGGING.
+    //
+    // A tag is one hit from ANY weapon - the flip is `shouldChangeAggro`, not damage - so the
+    // blowpipe preference above is only ever buying DPS, and DPS is worth nothing against the
+    // tick the swap costs while a set mob is still pouring damage into 600 hitpoints of shield
+    // that never come back. Measured on seed 7: at t1250 the bot spent three ticks putting the
+    // blowpipe on for the mager it had ALREADY tagged, the ranger entered crossbow reach in the
+    // middle of that, and the swap had to be undone before the ranger could be shot - two
+    // shield hits, 75 damage, for a weapon upgrade on a mob it was not urgent to kill. Set 7 of
+    // the same seed died of the same pattern with the shield at zero.
+    //
+    // So while anything from the set is still untagged, the worn weapon shoots whatever it
+    // reaches: the tag itself (an untagged target), or the kill in progress (a tagged target,
+    // so the weapon is ready the moment the untagged one comes into reach). When the whole set
+    // is tagged there is nothing urgent left and the blowpipe upgrade goes back to normal.
+    //
+    // Healers are deliberately not part of this: their band is blowpipe-or-nothing for tag
+    // CADENCE (three or four of them, two ticks apart on the blowpipe against five on the bow),
+    // and that reasoning survives this one.
+    if (hasSetMob) {
+      const targetName = target.mobName();
+      const wornSet: GearSetName | null = isWearing(player, "blowpipe")
+        ? "blowpipe"
+        : isWearing(player, "tbow")
+          ? "tbow"
+          : null;
+      if (
+        wornSet !== null &&
+        set !== wornSet &&
+        (targetName === EntityNames.JAL_ZEK ||
+          targetName === EntityNames.JAL_XIL ||
+          targetName === EntityNames.JAL_TOK_JAD) &&
+        isAttackable(
+          region,
+          player,
+          target,
+          wornSet === "blowpipe" ? blowpipeReach : bowReach,
+        )
+      ) {
+        if (target.aggro !== player || untaggedSetMobOnBoard) {
+          set = wornSet;
+        }
+      }
+    }
 
     // LATE, ON THE TICK BEFORE THE SHOT. See ZUK_SWAP_LEAD.
     //
@@ -1905,7 +2129,7 @@ ${spellLine}`);
           ? " (zuk under 600)"
           : "";
     say(
-      `wave 69: ${repositioning ? "shooting mid-walk at" : "attacking"} ${target.mobName()}${why}`,
+      `wave 69: ${repositioning ? "shooting mid-walk at" : "attacking"} ${target.mobName()}${why}${heldOverNote}`,
     );
   }
 
