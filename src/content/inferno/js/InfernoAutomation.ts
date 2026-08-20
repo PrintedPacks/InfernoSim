@@ -8,7 +8,7 @@ import { applyAttackPlan } from "./AttackPlanner";
 import { equipSet, GearSetName, isWearing, requiredSetFor, weaponForSet } from "./GearSets";
 import { hasIceBarrageSelected, selectedSpell, selectIceBarrage } from "./SpellCaster";
 import { isAttackable } from "./AttackPlanner";
-import { bestMove, findShield, focusNibbler, isCoveredByShield, projectShield, ScoredTile, scoreCandidates, scoreZukTiles, sortieDebug, waveHomeTile } from "./TileScorer";
+import { bestMove, findShield, focusNibbler, HOME_TILE, isCoveredByShield, projectShield, ScoredTile, scoreCandidates, scoreZukTiles, sortieDebug, waveHomeTile } from "./TileScorer";
 import { hasDyingBlob } from "./Trajectory";
 import { PlayerAttackClock } from "./PlayerAttackClock";
 import { ShieldAttackerClock } from "./ShieldAttackerClock";
@@ -21,14 +21,8 @@ import { nibblerThreats, observeNibblers } from "./PillarDefence";
 import { attackOptionFor, chooseTarget } from "./TargetPlanner";
 import { visibleMobs } from "./Visibility";
 
-/**
- * Safe spot the bot returns to between waves.
- *
- * There are 9 ticks of downtime after the last mob of a wave dies
- * (InfernoRegion.waveCompleteTimer), though that countdown is cancelled outright if bloblets
- * spawn late - so the window is not guaranteed to run its full length.
- */
-const HOME_TILE = { x: 28, y: 17 };
+// HOME_TILE lives in TileScorer now, imported above: the last-npc home pull anchors to it, and
+// the tile the score pulls towards and the tile waited on between waves must be the same one.
 
 /**
  * The nine tiles nibblers can spawn on, straight out of InfernoWaves.spawnNibblers.
@@ -916,8 +910,8 @@ ${spellLine}`);
    * to tell whether a run dies of the fight or dies of never topping up. Delete it rather than
    * grow it: anything more than this is duplicating a lane that already exists elsewhere.
    */
-  private static readonly ZUK_HEAL_AMOUNT = 32;
-  private static readonly ZUK_HEAL_COUNT = 5;
+  private static readonly ZUK_HEAL_AMOUNT = 16;
+  private static readonly ZUK_HEAL_COUNT = 8;
   private static zukHealsUsed = 0;
 
   private static stepMovement(player: Player, region: Region): boolean {

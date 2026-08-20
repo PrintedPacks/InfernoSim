@@ -64,9 +64,9 @@ import { ZukSetTimer } from "./ZukSetTimer";
  * already scores a bloblet as something reachable: the point of the term is not to discover
  * the bloblets but to rank a tile facing them ABOVE a tile facing anything else.
  *
- * `npcReachSoon` prices the fight this tile makes available: NPC_REACH_BONUS for a mob worth
- * shooting, BLOB_REACH_BONUS when a blob is the only thing in reach - the best of what is
- * reachable, not the first found. A fight is available when the tile is close enough to be
+ * `npcReachSoon` prices the fight this tile makes available: NPC_REACH_BONUS for the mager or
+ * a bloblet, NPC_REACH_LESSER_BONUS for anything else worth shooting, BLOB_REACH_BONUS when a
+ * blob is the only thing in reach - the best of what is reachable, not the first found. A fight is available when the tile is close enough to be
  * standing on within NPC_REACH_ARRIVAL_TICKS, and standing there the engine would let a shot off at some mob
  * WHERE IT REALLY STANDS - `snapshotPlayerCanSeeMob` at the mobs' tick-0 positions, the same test
  * `isAttackable` makes, at the range of the weapon that mob's own gear set carries.
@@ -725,6 +725,32 @@ const ZUK_SORTIE_PENALTY = -0.25;
 const ZUK_SORTIE_SAFETY = 1;
 
 /**
+ * ZUK_TAG_REACH_BONUS's twin for the boss himself: paid to a tile that can shoot Zuk, while Zuk
+ * is what the attack layer would actually spend the shot on - see `zukShotWanted` below.
+ *
+ * Reach on Zuk is the crossbow build's standing problem, not an edge case: Zuk's southern edge
+ * is y 8, the covered row at y 16 is therefore distance 8, and the crossbow reaches 7 - so the
+ * bot can sit covered, in the right band, on the one row it cannot shoot from, and nothing else
+ * on the board ever pulls it a row closer. The same single point as the healer and tag bonuses,
+ * so it beats the face tie-break, never beats cover, and - through the same `(safe || sortie)`
+ * test the tag bonus uses - can be earned by a step OUT of cover when the round trip fits Zuk's
+ * clock. That is what turns "covered but out of reach" from a dead cycle into a run-out hit.
+ */
+const ZUK_BOSS_REACH_BONUS = 1;
+
+/**
+ * The attack layer's hold ladder, mirrored so ZUK_BOSS_REACH_BONUS is only ever paid while Zuk
+ * is the thing the shot would actually go to. Kept in step BY HAND with InfernoAutomation's
+ * private ZUK_MAGER_KILL_HP / ZUK_ENRAGE_HP / ZUK_HOLD_SET_HP / ZUK_HOLD_SET_TICKS - the
+ * automation imports this file, so the dependency cannot point the other way. A mismatch only
+ * ever withholds the bonus, which costs a shot, never a position.
+ */
+const ZUK_CLEAR_SET_HP = 600;
+const ZUK_ENRAGE_HP = 240;
+const ZUK_HOLD_SET_HP = 280;
+const ZUK_HOLD_SET_TICKS = 100;
+
+/**
  * EXPERIMENT - flip to false to revert in one line.
  *
  * While an untagged set mob is stranded BEHIND the band - on the side the shield is moving away
@@ -888,23 +914,31 @@ export const NPC_REACH_ARRIVAL_TICKS = 4;
 export const NPC_REACH_WINDOW_TICKS = 4;
 
 /**
- * What a reachable mob is worth, and why a blob is worth less than one.
+ * What a reachable mob is worth, tiered by how much the fight it offers matters.
  *
  * `npcReachSoon` used to be a flat 1 for anything at all, which said a tile facing a blob was
- * as good a place to fight from as a tile facing a bat. It is not: killing a blob is not even
- * pure gain, since it lands three bloblets in exchange (see KillPriority, where JAL_AK is 1).
+ * as good a place to fight from as a tile facing a mager. It is not, and the tiers say why:
  *
- * So the term is the BEST thing this tile can reach rather than the first thing it happens to
- * find - a tile that reaches a blob AND something else is a full point, because the blob is not
- * what we would be shooting from there. Only a tile whose ONLY available fight is a blob is
- * shaded down.
+ *   NPC_REACH_BONUS (1)         the mager, and the three bloblets - the fights worth walking
+ *                               towards. The mager is the kill-priority head of every wave it
+ *                               appears on, and bloblets are two-tick cleanup that only gets
+ *                               more expensive the longer they live.
+ *   NPC_REACH_LESSER_BONUS      everything else - a real fight, but not one worth outbidding a
+ *   (0.75)                      mager tile for.
+ *   BLOB_REACH_BONUS (0.5)      the blob, whose kill is not even pure gain - it lands three
+ *                               bloblets in exchange (see KillPriority, where JAL_AK is 1).
  *
- * Half a point is deliberately a nudge and not a repulsion. What actually keeps the bot off
- * blobs is `damageTaken` pricing their hits and `routeEntersForbiddenZone` deleting their melee
- * zone outright; this only breaks ties those two leave equal. Set BLOB_REACH_BONUS to
- * NPC_REACH_BONUS to turn the distinction off without changing the arithmetic.
+ * The term is the BEST thing this tile can reach rather than the first thing it happens to
+ * find - a tile that reaches a blob AND something else scores as the something else, because
+ * the blob is not what we would be shooting from there.
+ *
+ * Fractions of a point are deliberately a nudge and not a repulsion. What actually keeps the
+ * bot off bad fights is `damageTaken` pricing their hits and `routeEntersForbiddenZone`
+ * deleting melee zones outright; this only breaks ties those two leave equal. Set the lesser
+ * bonuses to NPC_REACH_BONUS to turn the distinctions off without changing the arithmetic.
  */
 export const NPC_REACH_BONUS = 1;
+export const NPC_REACH_LESSER_BONUS = 0.75;
 export const BLOB_REACH_BONUS = 0.5;
 
 /**
@@ -1122,6 +1156,36 @@ export function waveHomeTile(wave: number): Location | null {
  * the whole grid spans about 0.2, less than a third of one safe-spot bonus.
  */
 export const HOME_PULL_PER_TILE = 0.01;
+
+/**
+ * Safe spot the bot returns to between waves, for every wave `waveHomeTile` has no answer for.
+ *
+ * Owned here rather than by the automation so the tile waited on between waves and the tile the
+ * last-npc pull below anchors to are the same constant and cannot disagree. There are 9 ticks of
+ * downtime after the last mob of a wave dies (InfernoRegion.waveCompleteTimer), though that
+ * countdown is cancelled outright if bloblets spawn late - so the window is not guaranteed to
+ * run its full length.
+ */
+export const HOME_TILE: Location = { x: 28, y: 17 };
+
+/**
+ * START THE WALK HOME WHILE THE LAST NPC IS STILL DYING, instead of after it is dead.
+ *
+ * The between-waves return only gets whatever is left of the 9-tick downtime window, so a wave
+ * finished at the far wall spawns the next set with the bot still mid-walk, out of position.
+ * With exactly ONE live npc in the arena the fight is already decided - nothing else needs
+ * dodging or reaching - so distance from home becomes a cost the score can see.
+ *
+ * Free inside LAST_NPC_HOME_FREE_TILES of home, then LAST_NPC_HOME_PULL_PER_TILE per tile
+ * beyond that, capped at LAST_NPC_HOME_PULL_CAP. The shape matters as much as the size: near
+ * home it is silent and the normal terms decide; ten tiles out it reads a full point, enough to
+ * outweigh a reach bonus and start the bot drifting back; and the cap keeps the far corner of
+ * the arena from looking apocalyptic - past fifteen tiles every distant tile is equally wrong
+ * and the real terms tell them apart again.
+ */
+export const LAST_NPC_HOME_PULL_PER_TILE = 0.1;
+export const LAST_NPC_HOME_FREE_TILES = 5;
+export const LAST_NPC_HOME_PULL_CAP = 1;
 
 /**
  * Paid on tiles a shot can be taken from, divided by how many attackers can shoot BACK.
@@ -1478,11 +1542,17 @@ export interface ScoreParts {
   safeSpot: number;
   /** Zero, or negative HOME_PULL_PER_TILE per tile from the wave's home tile (67/68 only). */
   homePull: number;
+  /**
+   * Zero, or negative LAST_NPC_HOME_PULL_PER_TILE per tile beyond LAST_NPC_HOME_FREE_TILES
+   * from home, capped at LAST_NPC_HOME_PULL_CAP - and only while exactly one live npc is in
+   * the arena. See the constants.
+   */
+  lastNpcHomePull: number;
   /** ZUK_SHIELD_UNCOVERED_PENALTY if this route ends uncovered; 0 on every wave but 69. */
   shieldPenalty: number;
   /** A thousandth of a point per tile of x from the shield's leading face; 69 only. */
   shieldLead: number;
-  /** Unused. Kept on the interface so the score dump and its column stay in step. */
+  /** ZUK_BOSS_REACH_BONUS if Zuk can be shot from here while Zuk is the shot's target; 69 only. */
   zukReach: number;
   /** ZUK_HEALER_AOE_PENALTY if this tile is near a live tagged-healer AOE landing; 69 only. */
   healerAoePenalty: number;
@@ -1511,6 +1581,8 @@ function scoreRoute(
   bloblets: ReachTarget[],
   healer: ReachTarget | null,
   home: Location | null,
+  /** Home again, but only while one live npc remains - null otherwise. See the constants. */
+  lastNpcHome: Location | null,
   targets: ReachTarget[],
   reaches: Map<string, number>,
   route: Location[],
@@ -1714,10 +1786,17 @@ function scoreRoute(
           }
           if (snapshotPlayerCanSeeMob(snapshot, px, py, mob.x, mob.y, mob.size, reach)) {
             // isBlob is the parent JAL_AK only - a ghost never sets it, and the three bloblets
-            // it leaves are their own mobs at the full bonus, as `blobletReach` also treats them.
+            // it leaves are their own mobs at the full bonus, as `blobletReach` also treats
+            // them. The full point goes to the mager and the bloblets; every other fight is
+            // the lesser tier - see NPC_REACH_BONUS for the ladder.
             npcReachSoon = Math.max(
               npcReachSoon,
-              mob.isBlob ? BLOB_REACH_BONUS : NPC_REACH_BONUS,
+              mob.isBlob
+                ? BLOB_REACH_BONUS
+                : mob.name === EntityNames.JAL_ZEK ||
+                    BLOBLET_NAMES.includes(mob.name)
+                  ? NPC_REACH_BONUS
+                  : NPC_REACH_LESSER_BONUS,
             );
             if (npcReachSoon >= NPC_REACH_BONUS) {
               break;
@@ -1838,6 +1917,17 @@ function scoreRoute(
     safeSpot,
     // Negative or zero: the drift anchor for the open-arena waves - see HOME_PULL_PER_TILE.
     homePull: home ? -HOME_PULL_PER_TILE * chebyshevDistance(destination, home) : 0,
+    // Negative or zero, and only with one live npc left - see LAST_NPC_HOME_PULL_PER_TILE.
+    lastNpcHomePull: lastNpcHome
+      ? -Math.min(
+          LAST_NPC_HOME_PULL_CAP,
+          LAST_NPC_HOME_PULL_PER_TILE *
+            Math.max(
+              0,
+              chebyshevDistance(destination, lastNpcHome) - LAST_NPC_HOME_FREE_TILES,
+            ),
+        )
+      : 0,
     // Both wave-69 terms live in `scoreZukTiles` now and cannot reach this path - wave 69
     // returns before the loop that calls this. Kept on ScoreParts at zero rather than deleted:
     // DebugPanel dumps every field, and the Zuk harness reads `shieldPenalty` to decide whether
@@ -1866,6 +1956,7 @@ function scoreRoute(
       parts.losBonus +
       parts.safeSpot +
       parts.homePull +
+      parts.lastNpcHomePull +
       parts.shieldPenalty +
 
       parts.healerAoePenalty -
@@ -1913,6 +2004,7 @@ function emptyParts(): ScoreParts {
     losBonus: 0,
     safeSpot: 0,
     homePull: 0,
+    lastNpcHomePull: 0,
     shieldPenalty: 0,
     shieldLead: 0,
     zukReach: 0,
@@ -2062,6 +2154,49 @@ export function scoreZukTiles(
     !ZukSetTimer.isPaused() &&
     untilSet <= ZUK_SPAWN_PREP_TICKS;
 
+  // IS ZUK WHAT THE SHOT WOULD ACTUALLY GO TO? The boss-reach bonus and the sortie it can earn
+  // are bribes to walk somewhere, so they are only paid while the attack layer would spend the
+  // shot on Zuk on arrival. Its hold ladder is mirrored here - see ZUK_BOSS_REACH_BONUS:
+  //
+  //   - anything untagged or any healer alive: those bands outrank Zuk and have their own pulls
+  //   - the ranger alive at all: it is killed outright before Zuk, wherever it stands
+  //   - the mager alive under ZUK_CLEAR_SET_HP: the set is being cleared to the last one
+  //   - pre-enrage, pair imminent, Zuk under ZUK_HOLD_SET_HP: hitpoints are being banked
+  //   - `spawnDue`: the attack layer is holding fire for the spawn whatever is in reach
+  //
+  // Enrage is read as "under ZUK_ENRAGE_HP" rather than latched the way the automation latches
+  // it - a healer can push Zuk back over the line after the latch fired - but any healer that
+  // could is blocking this gate by being alive, and once the last one is dead hitpoints only
+  // fall. At worst the mismatch withholds the bonus for a few ticks, never lures a walk out.
+  let zukRangerAlive = false;
+  let zukMagerAlive = false;
+  let zukMob: Mob | undefined;
+  for (const mob of visibleMobs(region)) {
+    if (mob.dying > -1) {
+      continue;
+    }
+    const name = mob.mobName();
+    if (name === EntityNames.JAL_XIL) {
+      zukRangerAlive = true;
+    } else if (name === EntityNames.JAL_ZEK) {
+      zukMagerAlive = true;
+    } else if (name === EntityNames.TZ_KAL_ZUK) {
+      zukMob = mob;
+    }
+  }
+  const zukHp = zukMob?.currentStats?.hitpoint ?? 0;
+  const setImminent =
+    untilSet !== null && !ZukSetTimer.isPaused() && untilSet <= ZUK_HOLD_SET_TICKS;
+  const zukShotWanted =
+    zukMob !== undefined &&
+    zukHp > 0 &&
+    untagged.length === 0 &&
+    healers.length === 0 &&
+    !zukRangerAlive &&
+    !(zukMagerAlive && zukHp < ZUK_CLEAR_SET_HP) &&
+    !(zukHp >= ZUK_ENRAGE_HP && zukHp < ZUK_HOLD_SET_HP && setImminent) &&
+    !spawnDue;
+
   const blowpipeReach =
     healers.length === 0
       ? 0
@@ -2125,6 +2260,21 @@ export function scoreZukTiles(
           tagWeaponReach,
         ),
       );
+    // The same question asked of the boss, in the ticks where the boss is the answer - see
+    // zukShotWanted. Asked of the long weapon exactly like the tag, because Zuk is the fallback
+    // set's target and on a crossbow build reach is the whole problem this term exists for.
+    const canHitZuk =
+      zukShotWanted &&
+      zukMob !== undefined &&
+      snapshotPlayerCanSeeMob(
+        snapshot,
+        tile.x,
+        tile.y,
+        zukMob.location.x,
+        zukMob.location.y,
+        zukMob.size,
+        tagWeaponReach,
+      );
 
     // THE ROUND TRIP. See ZUK_SORTIE_PENALTY.
     //
@@ -2134,10 +2284,15 @@ export function scoreZukTiles(
     //
     // Plus ZUK_SORTIE_SAFETY. And the weapon has to be up by the time we are stood there, or the
     // trip buys nothing and we have left cover to watch a cooldown run down.
+    //
+    // A Zuk shot earns the trip on exactly the same terms as a tag - see ZUK_BOSS_REACH_BONUS.
+    // The shot is worth less than a tag, but the trip is priced the same way and the budget is
+    // the same clock; the after-the-shot cooldown is what walks the bot straight back, because
+    // `untilShot` stops fitting and the tile falls back to the -1000.
     const backTicks = ticksBackToCover(tile);
     const sortie =
       !safe &&
-      canTag &&
+      (canTag || canHitZuk) &&
       walkTicks !== null &&
       backTicks !== null &&
       shieldAtFire !== null &&
@@ -2175,6 +2330,7 @@ export function scoreZukTiles(
           ).length * ZUK_SPAWN_REACH_BONUS
         : 0;
     parts.tagReach = canTag && (safe || sortie) ? ZUK_TAG_REACH_BONUS : 0;
+    parts.zukReach = canHitZuk && (safe || sortie) ? ZUK_BOSS_REACH_BONUS : 0;
     parts.shieldPenalty = safe || sortie ? 0 : ZUK_SHIELD_UNCOVERED_PENALTY;
     parts.shieldLead =
       faceAnchor === null ? 0 : -SHIELD_FACE_TIEBREAK * Math.abs(tile.x - faceAnchor);
@@ -2236,6 +2392,7 @@ export function scoreZukTiles(
         parts.shieldLead +
         parts.healerAoePenalty +
         parts.tagReach +
+        parts.zukReach +
         parts.spawnReach +
         parts.sortie +
         parts.healerReach,
@@ -2316,6 +2473,15 @@ export function scoreCandidates(
   // tiles worth standing on for a landing trio are worth standing on before it lands.
   const bloblets = blobletTargets(mobs);
 
+  // ONE LIVE NPC MEANS THE WALK HOME HAS STARTED - see LAST_NPC_HOME_PULL_PER_TILE. Ghost
+  // bloblets count as npcs here exactly as they do everywhere else in this score: a dying blob
+  // is three more npcs landing, not an arena about to be empty. Anchored to the same map the
+  // between-waves station uses, so the pull and the station can never point at different tiles.
+  const liveNpcs =
+    visibleMobs(region).filter((mob) => mob.dying === -1).length +
+    mobs.filter((mob) => mob.ghost).length;
+  const lastNpcHome = liveNpcs === 1 ? home ?? HOME_TILE : null;
+
   const scored: ScoredTile[] = [];
   for (const tile of tiles) {
     const route = routes.get(routeKey(tile.x, tile.y));
@@ -2337,6 +2503,7 @@ export function scoreCandidates(
       bloblets,
       healer,
       home,
+      lastNpcHome,
       targets,
       reaches,
       route,
