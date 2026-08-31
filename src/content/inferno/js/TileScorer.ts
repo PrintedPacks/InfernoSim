@@ -4,7 +4,9 @@ import { EntityNames, Location, Mob, Player, Region } from "osrs-sdk";
 
 import { ArenaSnapshot, snapshotPlayerCanSeeMob } from "./ArenaSnapshot";
 import { weaponForSet } from "./GearSets";
-import { planOverheads } from "./OverheadPlanner";
+import { committedJad, HEALER_REACH_SLACK } from "./KillPriority";
+import { planOverheads, prayerForAttackStyle } from "./OverheadPlanner";
+import { ShieldAttackerClock } from "./ShieldAttackerClock";
 import { BARRAGE_RANGE, nibblerAt, NibblerThreat, nibblerThreats } from "./PillarDefence";
 import { attackReachFor, attackReachForName } from "./TargetPlanner";
 import {
@@ -44,9 +46,11 @@ import { ZukSetTimer } from "./ZukSetTimer";
  * count in `quietTicksFor`, which since nothing can see such a tile comes down to how much of
  * the twelve tick window the walk there leaves behind.
  *
- * `healerReach` is 1 if the nearest still-healing Jad healer can be tagged from this tile -
- * the Jad-wave analogue of `barrageReach`, pulling the bot around Jad to where a blowpipe
- * reaches the healers. `losBonus` divides a point by how many attackers get to shoot back
+ * `healerReach` is 1 if the Jad wave's FOCUS can be reached from this tile - the nearest
+ * still-healing healer, or the committed Jad once every healer is tagged. The Jad-wave analogue
+ * of `barrageReach`: it pulls the bot around Jad to where a blowpipe reaches the healers, and
+ * then keeps pulling it towards the Jad instead of letting the term go quiet - see
+ * `jadWaveFocus`. `losBonus` divides a point by how many attackers get to shoot back
  * from here, so of two tiles offering the same fight the quieter one wins.
  *
  * scored over the candidates that survive a filter: a tile is only a candidate at all if it is
@@ -403,13 +407,54 @@ function blobletReach(
 }
 
 /**
- * The Jad healer worth repositioning for: the nearest one still healing (aggro not yet on the
- * player). The Jad-wave analogue of `focusNibbler` - healers cluster on Jad's far side, and
- * the whole tag-and-turn depends on standing somewhere a blowpipe can actually reach them, so
- * the tile score needs a pull towards such tiles just as `barrageReach` pulls towards the
- * nibblers. Tagged healers need nothing: they come to us.
+ * The mob the Jad wave is repositioning around: the nearest still-healing healer, or - when
+ * every healer is tagged or dead - the Jad the attack layer has committed to.
+ *
+ * THE FALLBACK IS THE HALF THAT WAS MISSING. Healers cluster on Jad's far side and the whole
+ * tag-and-turn depends on standing somewhere a blowpipe can reach them, so the healer pull has
+ * always been here. But the moment the last one was tagged this returned null and NOTHING pulled
+ * the bot towards the Jad at all: positioning fell to `npcReachSoon`, which pays the same on
+ * every tile that reaches anything, and `damageTaken`, which on this wave is nearly flat because
+ * Jad's range is 50. The bot drifted for the rest of the fight and shot the Jad only when the
+ * drift happened to leave it in reach.
+ *
+ * Both halves are the SAME PICKS the attack layer makes, imported rather than re-derived. A
+ * focus that disagreed with the target would be worse than none: the score would pull towards a
+ * tile chosen for a mob the attack layer was never going to shoot.
+ *
+ * The healer half carries the tag's one-tile slack for the reason `chooseUntaggedHealer`
+ * documents; the Jad half is read at the weapon's own reach, since there is no click latency to
+ * absorb - the Jad is not going anywhere.
  */
-function focusHealer(region: Region, player: Player): ReachTarget | null {
+/**
+ * Below this many live Jads, a TAGGED healer is allowed to influence where the bot stands again.
+ *
+ * TAGGED ONLY, AND THAT IS THE WHOLE DISTINCTION. An untagged healer is a job: it is healing its
+ * Jad, one blowpipe hit stops it, and the tile scorer has to put us somewhere that shot exists -
+ * so its reach and its focus pull are paid at every Jad count. A tagged one is the opposite. It
+ * chases, so a tile chosen to be near it or away from it is a tile chosen about a mob that simply
+ * follows, and while two or three Jads are up the floor it drags us across is the floor between
+ * their bodies. `HealerTrap` is what answers a tagged healer; the score should not also try.
+ *
+ * So what this silences is narrow: a tagged healer's share of `damageTaken`. Its reach is already
+ * refused unconditionally in `scoreRoute` (see the `chasesPlayer` skip), and the focus pull only
+ * ever looks at untagged ones.
+ *
+ * Down to one Jad the picture inverts - no second body to be caught between, the fight nearly
+ * over, and a healer chewing on us is then the only thing left worth stepping away from.
+ */
+const HEALERS_MOVE_US_BELOW = 2;
+
+function jadWaveFocus(region: Region, player: Player): ReachTarget | null {
+  // AN UNTAGGED HEALER IS THE FOCUS AT ANY JAD COUNT - it is the one thing on this wave that has
+  // to be walked to. It heals its Jad until something hits it, it will not come to us, and the
+  // tag is one blowpipe click. So the pull towards it is not optional and is not gated on how
+  // many Jads are up; the Jad only becomes the focus once every healer is already on us.
+  //
+  // The focus is EXCLUSIVE, which is what makes this move the bot rather than just add a point:
+  // while a healer holds the slot, tiles that only reach the Jad stop earning `healerReach` at
+  // all, so standing still loses the point it was winning on and a tile in blowpipe range of the
+  // healer outscores it.
   let best: Mob | null = null;
   let bestDistance = Infinity;
   for (const mob of visibleMobs(region)) {
@@ -426,14 +471,24 @@ function focusHealer(region: Region, player: Player): ReachTarget | null {
       bestDistance = distance;
     }
   }
-  if (!best) {
+  if (best) {
+    return {
+      x: best.location.x,
+      y: best.location.y,
+      size: best.size,
+      reach: attackReachForName(player, EntityNames.YT_HUR_KOT) + HEALER_REACH_SLACK,
+    };
+  }
+
+  const jad = committedJad(region);
+  if (!jad) {
     return null;
   }
   return {
-    x: best.location.x,
-    y: best.location.y,
-    size: best.size,
-    reach: attackReachForName(player, EntityNames.YT_HUR_KOT),
+    x: jad.location.x,
+    y: jad.location.y,
+    size: jad.size,
+    reach: attackReachForName(player, EntityNames.JAL_TOK_JAD),
   };
 }
 
@@ -739,6 +794,49 @@ const ZUK_SORTIE_SAFETY = 1;
 const ZUK_BOSS_REACH_BONUS = 1;
 
 /**
+ * THE LANE GUARD: the price of a move that re-phases a tagged attacker's attack cycle.
+ *
+ * The off-tick lanes chosen at tag time hold themselves - a parked mager or ranger fires every
+ * 4 ticks forever - with exactly one exception: an attack due on a tick the player is beyond
+ * that mob's reach is REFUSED, the delay keeps counting into negatives, and the mob fires the
+ * instant the player is reachable again. Whatever tick that is becomes its lane for the rest of
+ * its life; there is no re-flinch, so no click can ever move it back. Measured on seed 74,
+ * t1820: the player touched x 39 following the shield east - distance 16 against the mager's
+ * reach of 15, for one tick, but the tick its attack was due - and the re-fire at t1821 put it
+ * on Jad's landing lane. Every eighth tick from there was a mager/Jad share that only Jad's
+ * style roll could price, and two range rolls later the run was dead.
+ *
+ * ONLY THE FIRE TICK MATTERS. The same player was out of reach on t1814-1819 and it cost
+ * nothing: the delay decrements regardless, and reach is only tested when the attack is due.
+ * So the guard charges exactly the moves that have the player out of a tagged attacker's reach
+ * ON one of its fire ticks - the walk's per-tick positions checked against each fire falling
+ * before arrival, and the tile itself against the first cycle after.
+ *
+ * The same starvation, already under way, is also the REPAIR tool: a starved attacker fires on
+ * the first tick it can reach the player, so which lane it re-anchors to is decided by which
+ * tick the player re-enters its range. The guard therefore also charges any move whose
+ * re-entry tick would put a starved attacker onto an occupied lane - occupied meaning a tick
+ * shared, modulo the pair's cycle, with another attacker wanting a DIFFERENT overhead. Same-
+ * prayer sharing stays free, exactly as the tag gate banks it.
+ *
+ * A PENALTY, NOT A VETO, at a weight between the bonuses and the cover penalty: a broken lane
+ * is a ~50 damage coin flip every 8 ticks until the mob dies, worth more than any reach bonus
+ * or tiebreak (all of magnitude ~1) and less than standing in front of Zuk (-1000). If Zuk
+ * ever leaves no covered tile inside every attacker's reach, the bot breaks the lane rather
+ * than eats Zuk - and the repair half then steers the re-anchor onto a free lane on the way
+ * back in.
+ */
+const ZUK_LANE_BREAK_PENALTY = -100;
+
+/**
+ * How far past a route's arrival the lane guard keeps checking fire ticks, in ticks.
+ *
+ * One full pair cycle: any tile held across a fire tick is caught within 4 ticks of arriving,
+ * and the scorer re-runs every tick, so a longer horizon only re-finds the same verdicts.
+ */
+const ZUK_LANE_GUARD_HORIZON = 4;
+
+/**
  * The attack layer's hold ladder, mirrored so ZUK_BOSS_REACH_BONUS is only ever paid while Zuk
  * is the thing the shot would actually go to. Kept in step BY HAND with InfernoAutomation's
  * private ZUK_MAGER_KILL_HP / ZUK_ENRAGE_HP / ZUK_HOLD_SET_HP / ZUK_HOLD_SET_TICKS - the
@@ -855,6 +953,62 @@ function nearHealerAoeLanding(landings: Location[], destination: Location): bool
 const ZUK_SHIELD_COVER_BUFFER_TICKS = 3;
 
 /**
+ * Ticks from Zuk becoming visible to its FIRST attack.
+ *
+ * Static knowledge about the fight, in exactly the way `ZukSetTimer`'s OPENING_INTERVAL is:
+ * `TzKalZuk` is built with `attackDelay = 14`, that countdown only runs on live ticks, and the
+ * first live tick is the first tick `visibleMobs` shows the boss at all. So the opener lands 13
+ * ticks after the bot first sees Zuk, every run - the same kind of thing a player knows when they
+ * say Zuk's first shot is about eight seconds in.
+ *
+ * MEASURED AT SPAWN + 21, 6/6 captures. That is the same instant read off a different clock: the
+ * capture's spawn is 8 ticks earlier than anything the automation can see, because the get-ready
+ * countdown and the wave transition both run before `visibleMobs` returns the boss. The bot has
+ * to anchor on what it can observe, so the offset is absorbed here and nowhere else - what is
+ * preserved is the shape of the rule, slack until three ticks before the opener.
+ */
+const ZUK_OPENING_FIRST_ATTACK_TICK = 13;
+
+/**
+ * How long before that opener the slack is given up - spawn + 18 in capture ticks.
+ *
+ * Three ticks is two walk clicks, because the click issued on a tick has moved the player two
+ * tiles by the next one, and the tick that counts is the one BEFORE the fire (Zuk reads the
+ * position the player ended it on). Two clicks is four tiles of travel against two tiles of band
+ * slide, which is what sets ZUK_OPENING_SLACK_TILES.
+ */
+const ZUK_OPENING_TIGHTEN_TICKS = 3;
+
+/**
+ * How far off the band a tile may sit and still count as cover, during the opening ONLY.
+ *
+ * Zuk cannot fire before ZUK_OPENING_FIRST_ATTACK_TICK, so for the whole run-up the cover test is
+ * answering a question about a shot that does not exist yet. Held to the tick-exact rule anyway,
+ * the bot chases the band a tile a tick for the entire opening - measured on the seed-1 traces,
+ * nine of the thirteen ticks before Zuk's opener went on walk clicks, and a walk click and a shot
+ * cannot share a tick. The slack buys those ticks back: stand, shoot, and let the band slide until
+ * it has genuinely gone.
+ *
+ * TWO TILES, NOT THREE, and the walk home is why. The tighten window is two clicks - four tiles of
+ * travel - while the band slides two tiles of its own in the same time, so two tiles out is
+ * regained exactly and three is not. Slack in x only: y 16 is not a face the shield slides along,
+ * it is the line north of which there is no cover at any x.
+ *
+ * NOTHING AFTER THE OPENER USES THIS. From the first observed fire the clock has a phase, cover is
+ * judged at the exact tick the shot is aimed, and the slack is zero for the rest of the fight.
+ */
+const ZUK_OPENING_SLACK_TILES = 2;
+
+/** `isCoveredByShield` with the band widened by `slack` tiles at each end. Slack 0 is identical. */
+function isCoveredWithSlack(px: number, py: number, shieldX: number, slack: number): boolean {
+  return (
+    px >= shieldX - slack &&
+    px < shieldX + ZUK_SHIELD_WIDTH + slack &&
+    py <= ZUK_SHIELD_COVER_MAX_Y
+  );
+}
+
+/**
  * How close to a wall the shield has to be for the leading face to stop meaning anything.
  *
  * The leading face is worth chasing only while the shield keeps going that way, and this close
@@ -940,6 +1094,27 @@ export const NPC_REACH_WINDOW_TICKS = 4;
 export const NPC_REACH_BONUS = 1;
 export const NPC_REACH_LESSER_BONUS = 0.75;
 export const BLOB_REACH_BONUS = 0.5;
+
+/**
+ * The two mobs of waves 67/68, promoted to the FULL bonus so the reach band is flat there.
+ *
+ * The ladder above exists to rank fights against each other, and on those waves there is no
+ * ranking to do: a Jad and its healers are the only things on the board, they are both worth
+ * standing in reach of, and the whole tag-and-turn is a sequence of both. Leaving them on the
+ * lesser tier priced every reachable tile on the wave at 0.75, which is not a different answer
+ * from 1 - nothing on the board competes with them - but it IS a different number for
+ * `losBonus`, `homePull` and the safe-spot shading to be measured against, and those are the
+ * terms that then decide where the bot actually stands.
+ *
+ * Named rather than folded into the condition so the promotion is greppable, and so the rest of
+ * the ladder - which every wave from 1 to 66 still depends on - is visibly untouched. Neither
+ * mob appears outside 67/68/69, and wave 69 scores through `scoreZukTiles` and never reaches
+ * this loop, so nothing else in the game can see this list.
+ */
+const FULL_REACH_JAD_WAVE_MOBS: string[] = [
+  EntityNames.JAL_TOK_JAD,
+  EntityNames.YT_HUR_KOT,
+];
 
 /**
  * How far a mob standing over the player can move next tick, in tiles.
@@ -1071,6 +1246,33 @@ function routeEntersForbiddenZone(mobs: SimMob[], route: Location[]): boolean {
     }
   }
   return false;
+}
+
+/**
+ * Is this tile, right now, under or melee-adjacent to one of the coin-flip mobs?
+ *
+ * The same question `insideForbiddenZone` answers inside a scoring pass, exposed for the two
+ * callers outside one - both in `InfernoAutomation`, and both about a decision the scoring pass
+ * cannot make:
+ *
+ *   - THE CLICK-PROCESS TEST. A walk is scored, clicked, and processed a tick later from a tile
+ *     the player has since moved to, against mobs that have since moved themselves. The route
+ *     veto ran against the board as it was when the tile was chosen; this re-asks the cheap half
+ *     of the question - is the destination itself forbidden NOW - before the commitment to that
+ *     walk is renewed. It is deliberately the destination rather than a fresh route: the route
+ *     is a breadth-first sweep and re-running one every tick to re-check a walk already in
+ *     progress costs more than the walk is worth, while a Jad stepping onto the destination is
+ *     the hazard that actually happens.
+ *
+ *   - THE ESCAPE TEST. Holding position is exempt from the route veto, which is correct - a veto
+ *     that could refuse to stand still would have nothing to fall back on. But it means a bot
+ *     already inside a melee ring is allowed to stay there and keep shooting. Asking this
+ *     directly is what lets `decide` treat that as the one state where leaving outranks fighting.
+ *
+ * Snapshot built fresh, because both callers ask between scoring passes and mobs have moved.
+ */
+export function tileIsForbidden(region: Region, player: Player, tile: Location): boolean {
+  return insideForbiddenZone(snapshotMobs(region, player, true), tile.x, tile.y);
 }
 
 /**
@@ -1528,8 +1730,8 @@ export interface ScoreParts {
   /** BLOBLET_REACH_BONUS if any bloblet is in barrage range of here - see `blobletReach`. */
   blobletReach: number;
   /**
-   * Waves 67/68: 1 if the nearest still-healing Jad healer can be tagged from here - see
-   * `focusHealer`. Wave 69: ZUK_HEALER_REACH_BONUS if any healer is inside BLOWPIPE range AND the
+   * Waves 67/68: 1 if the wave's focus can be reached from here - the nearest still-healing
+   * healer, or the committed Jad once they are all tagged. See `jadWaveFocus`. Wave 69: ZUK_HEALER_REACH_BONUS if any healer is inside BLOWPIPE range AND the
    * weapon is off cooldown by the time this tile can be stood on - reach with no shot behind it
    * pays for a walk that buys nothing.
    */
@@ -1562,6 +1764,8 @@ export interface ScoreParts {
   sortie: number;
   /** ZUK_SPAWN_REACH_BONUS per spawn tile this tile can shoot, with a pair due; 69 only. */
   spawnReach: number;
+  /** ZUK_LANE_BREAK_PENALTY if this move re-phases a tagged attacker's cycle; 69 only. */
+  laneBreak: number;
   damageTaken: number;
   threats: number;
 }
@@ -1784,6 +1988,20 @@ function scoreRoute(
           if (reach === undefined) {
             continue;
           }
+          // A HEALER IS ONLY WORTH REACHING WHILE IT IS STILL HEALING. The reach term pays for
+          // standing where a shot is available, and the only shot a healer ever needs is the one
+          // that tags it - after that it walks to us of its own accord and there is nothing
+          // positional left to buy. Paying reach for a tagged one is paying to stay beside a mob
+          // that is already coming, on a wave where the tiles beside a healer are the tiles the
+          // trap exists to get us off.
+          //
+          // `chasesPlayer` is the tag: it is `mob.aggro === player`, which is the same test
+          // `chooseJadWaveTarget` and `HealerTrap` use, so all three agree about what tagged
+          // means. Name alone cannot express this, which is why it is here and not a deletion
+          // from `reaches`.
+          if (mob.name === EntityNames.YT_HUR_KOT && mob.chasesPlayer) {
+            continue;
+          }
           if (snapshotPlayerCanSeeMob(snapshot, px, py, mob.x, mob.y, mob.size, reach)) {
             // isBlob is the parent JAL_AK only - a ghost never sets it, and the three bloblets
             // it leaves are their own mobs at the full bonus, as `blobletReach` also treats
@@ -1794,7 +2012,8 @@ function scoreRoute(
               mob.isBlob
                 ? BLOB_REACH_BONUS
                 : mob.name === EntityNames.JAL_ZEK ||
-                    BLOBLET_NAMES.includes(mob.name)
+                    BLOBLET_NAMES.includes(mob.name) ||
+                    FULL_REACH_JAD_WAVE_MOBS.includes(mob.name)
                   ? NPC_REACH_BONUS
                   : NPC_REACH_LESSER_BONUS,
             );
@@ -1827,28 +2046,35 @@ function scoreRoute(
   const destinationExposed = watchers.size > 0;
 
   /**
-   * A healer's hit only prices if it lands on the very NEXT tick - discarded past that, no
-   * matter how far into the horizon the projection sees one catching up.
+   * EVERY THREAT AT ITS FULL HORIZON, healers included.
    *
-   * Everything else in `damageTaken` keeps the full 12 ticks; this is deliberately narrower,
-   * because a healer is not like the rest of the board. Jad hits everywhere (range 50), a
-   * mager or ranger parks once it acquires and stays a fixed threat - but a HEALER is a
-   * chaser whose position twelve ticks out is the projection's guess, not a fact, and pricing
-   * that guess as a real cost on every candidate tile is what sent the bot sprinting real
-   * distance to dodge a hit still eight ticks away. Measured (wave 68, dump): every tile
-   * within reach of a chasing healer's eventual catch-up scored worse than one seven tiles
-   * further out, by exactly the avoided hit's max hit - the bot was buying a temporary
-   * reprieve at the cost of DPS uptime against Jad, re-buying the same reprieve every tick,
-   * forever.
+   * There used to be a healer exemption here: a healer's hit only priced if it landed within two
+   * ticks, discarded past that. Its reasoning was that a chaser's position twelve ticks out is
+   * the projection's guess rather than a fact, and that pricing the guess sent the bot sprinting
+   * real distance to dodge a hit still eight ticks away - re-buying the same reprieve every tick
+   * at the cost of DPS uptime.
    *
-   * Scoring re-runs from scratch next tick with a real position instead of a projection, so a
-   * catch-up eight ticks out will be priced honestly when it is actually one or two ticks out
-   * - nothing is lost by not reacting to it now. Scoped to healers by name; every other
-   * chaser's full-horizon price is untouched.
+   * That was the wrong fix for a real problem. The exemption did not make the dodge cheaper, it
+   * made the healer INVISIBLE until it was already on top of us, and the wave-68 sweeps show
+   * what that costs: every point of damage taken across three seeds came from Yt-HurKot, none of
+   * it from a Jad. What actually stops the sprint is the rest of the score having something to
+   * say - the focus pull now reaches past the last tagged healer to the Jad, so a tile is chosen
+   * for the fight it offers rather than only for the hit it avoids.
+   *
+   * Kept as a named pass-through rather than deleted so the shape of the pricing step, and the
+   * fact that nothing is filtered out of it, stay visible at the call site.
    */
-  const priced = threats.filter(
-    (threat) => threat.name !== EntityNames.YT_HUR_KOT || threat.tick <= 2,
-  );
+  // Healers are not priced while two or more Jads are alive - see HEALERS_MOVE_US_BELOW. Counted
+  // off `mobs`, the same frozen snapshot every candidate is scored against, so the rule cannot
+  // disagree with the board the simulation actually ran on. Ghosts are bloblets, never Jads, but
+  // the filter is explicit so it stays right if that ever changes.
+  const liveJads = mobs.filter(
+    (mob) => !mob.ghost && mob.name === EntityNames.JAL_TOK_JAD,
+  ).length;
+  const priced =
+    liveJads >= HEALERS_MOVE_US_BELOW
+      ? threats.filter((threat) => threat.name !== EntityNames.YT_HUR_KOT)
+      : threats;
   const damageTaken = planOverheads(priced).damage;
 
   // Safe means: something is on the board to be safe FROM, the walk is clean (whatever fires
@@ -1939,6 +2165,7 @@ function scoreRoute(
     tagReach: 0,
     spawnReach: 0,
     sortie: 0,
+    laneBreak: 0,
     damageTaken,
     // priced.length, not threats.length - the dump's threat count should match what was
     // actually charged, or a healer-chase-eight-ticks-out would read as a threat that costs
@@ -2012,6 +2239,7 @@ function emptyParts(): ScoreParts {
     tagReach: 0,
     spawnReach: 0,
     sortie: 0,
+    laneBreak: 0,
     damageTaken: 0,
     threats: 0,
   };
@@ -2061,6 +2289,17 @@ export function scoreZukTiles(
   // Ticks of walking available before the position is locked in - one less than the deadline,
   // because mobs step before players. Zero means "wherever you are now is what Zuk will see".
   const walkTicks = untilFire === null ? null : Math.max(0, untilFire - 1);
+  // The opening's slack, in tiles, and zero for the whole of the fight after Zuk's first shot.
+  // `untilFire` is null for exactly as long as no attack has been watched, so the two conditions
+  // are the same window read two ways - the tick count is what ends it EARLY, three ticks before
+  // the opener rather than on it. See ZUK_OPENING_SLACK_TILES.
+  const sinceSpawn = ZukAttackClock.ticksSinceSpawn();
+  const openingSlack =
+    untilFire === null &&
+    sinceSpawn !== null &&
+    sinceSpawn < ZUK_OPENING_FIRST_ATTACK_TICK - ZUK_OPENING_TIGHTEN_TICKS
+      ? ZUK_OPENING_SLACK_TILES
+      : 0;
   // Null with no shield on the board, and null through a bounce window - both mean "no opinion
   // about x", which is exactly what a flat band is. See SHIELD_BOUNCE_PREP_TILES.
   // Null with no shield on the board, and null through a bounce window - both mean "no opinion
@@ -2117,8 +2356,23 @@ export function scoreZukTiles(
   // band, the leading face otherwise. `leading` is null through a bounce window; the stranded
   // anchor deliberately is not - `trailAnchorX` is direction-correct mid-bounce, and the drift
   // away from a stranded mob is exactly when the pull is being paid for.
-  const faceAnchor =
-    strandedBehind && shieldAtFire !== null ? trailAnchorX(shieldAtFire) : leading;
+  //
+  // STANDING STILL IS THE POINT OF THE SLACK, and the face pull is what would take it away. It is
+  // SHIELD_FACE_TIEBREAK per tile and `bestMove` only needs STRICTLY better than holding, so one
+  // tile of drift towards the leading face buys a walk click on its own - which is the every-tick
+  // chase the slack exists to stop. So while the tile underfoot is still inside the slack the band
+  // has no opinion about x at all, the same null the bounce window uses. The moment it is not, the
+  // pull is back and the walk that follows goes to the leading face rather than to the nearest
+  // tile that scrapes in: one walk that banks the whole band, instead of one a single step undoes.
+  const holdingInSlack =
+    openingSlack > 0 &&
+    shieldAtFire !== null &&
+    isCoveredWithSlack(player.location.x, player.location.y, shieldAtFire.x, openingSlack);
+  const faceAnchor = holdingInSlack
+    ? null
+    : strandedBehind && shieldAtFire !== null
+      ? trailAnchorX(shieldAtFire)
+      : leading;
 
   /**
    * Ticks to walk from a tile back into cover, for the shield as it will be when Zuk fires.
@@ -2206,6 +2460,93 @@ export function scoreZukTiles(
   // objection rather than as a refusal, since an unknown cooldown is not evidence of one.
   const untilShot = PlayerAttackClock.earliestShotOffset();
 
+  // ---- LANE GUARD SETUP - see ZUK_LANE_BREAK_PENALTY for the whole story. ----
+  //
+  // The attackers whose lanes are being defended: the pair, tagged, alive. Jad is deliberately
+  // absent - its reach is 50, the whole arena, so no position can starve it - but its lane
+  // still counts as OCCUPIED when a starved attacker's re-entry tick is judged below, because
+  // `firesInWindow` projects it like everything else.
+  const laneAttackers = visibleMobs(region).filter(
+    (mob) =>
+      mob.dying <= -1 &&
+      mob.aggro === player &&
+      (mob.mobName() === EntityNames.JAL_ZEK || mob.mobName() === EntityNames.JAL_XIL),
+  );
+  // A healthy parked attacker reads delay 1..4 at postTick - it resets to full speed the tick
+  // it fires. At or below zero the attack is already overdue: the starved state, where the
+  // first reachable tick becomes its new lane.
+  const laneOnCadence = laneAttackers.filter((mob) => (mob.attackDelay ?? 0) > 0);
+  const laneStarved = laneAttackers.filter((mob) => (mob.attackDelay ?? 0) <= 0);
+
+  /** The player's tile at the end of tick `ticksAhead` along this route, parked on arrival. */
+  const routePositionAt = (route: Location[], ticksAhead: number): Location =>
+    route[Math.min(ticksAhead * ZUK_TILES_PER_TICK, route.length - 1)];
+
+  /** Reach exactly as the engine tests it: chebyshev to the closest tile of the mob's box. */
+  const withinAttackerReach = (mob: Mob, position: Location): boolean => {
+    const closest = mob.getClosestTileTo(position.x, position.y);
+    return (
+      Math.max(Math.abs(closest[0] - position.x), Math.abs(closest[1] - position.y)) <=
+      mob.attackRange
+    );
+  };
+
+  /** Does this move re-phase a tagged attacker, or re-anchor a starved one onto a bad lane? */
+  const breaksLane = (route: Location[], arrival: number): boolean => {
+    const horizon = arrival + ZUK_LANE_GUARD_HORIZON;
+    for (const mob of laneOnCadence) {
+      const untilAttackerFire = ShieldAttackerClock.ticksUntilFire(mob);
+      if (untilAttackerFire === null) {
+        continue; // spawned so recently there is no cadence to defend yet
+      }
+      const speed = mob.attackSpeed ?? 4;
+      for (let fire = untilAttackerFire; fire <= horizon; fire += speed) {
+        // The engine resolves the attack against the player's tile at the END of the fire
+        // tick - measured on seed 74, where the t1821 re-fire hit a player who stepped back
+        // into reach that same tick. At worst this carries the usual one-tile mid-walk blur.
+        if (!withinAttackerReach(mob, routePositionAt(route, fire))) {
+          return true;
+        }
+      }
+    }
+    for (const mob of laneStarved) {
+      // Already broken: its next fire is the first tick this route makes the player
+      // reachable, and that tick IS its new lane. Steer it onto a free one - free meaning no
+      // other attacker tests the overhead on that tick modulo the shared cycle, unless it
+      // wants the SAME prayer, which stays banked exactly as the tag gate banks it.
+      const speed = mob.attackSpeed ?? 4;
+      let reentry: number | null = null;
+      for (let ahead = 1; ahead <= horizon; ahead++) {
+        if (withinAttackerReach(mob, routePositionAt(route, ahead))) {
+          reentry = ahead;
+          break;
+        }
+      }
+      if (reentry === null) {
+        continue; // stays starved past the horizon; re-judged next tick from fresher state
+      }
+      const mine = prayerForAttackStyle(
+        mob.mobName() === EntityNames.JAL_ZEK ? "magic" : "range",
+      );
+      const anchor = reentry;
+      const clash = ShieldAttackerClock.firesInWindow(
+        anchor,
+        anchor + 2 * speed,
+        (other) => other !== mob && other.aggro === player,
+      ).some((fire) => {
+        if ((fire.offset - anchor) % speed !== 0) {
+          return false;
+        }
+        const theirs = fire.styles.length === 1 ? prayerForAttackStyle(fire.styles[0]) : null;
+        return mine === null || theirs === null || theirs !== mine;
+      });
+      if (clash) {
+        return true;
+      }
+    }
+    return false;
+  };
+
   const sortieReport: SortieDebug = {
     canTag: 0,
     canTagCovered: 0,
@@ -2237,14 +2578,20 @@ export function scoreZukTiles(
     const safe =
       shieldAtFire === null ||
       (inPlace &&
-        isCoveredByShield(tile.x, tile.y, shieldAtFire.x) &&
-        // THE TRAILING TILE IS NOT COVER. It is inside the band by TzKalZuk's own test and the
-        // shield's very next step leaves it behind, so treating it as safe banks zero ticks and
-        // is what puts the bot one tile short when the window opens. EXCEPT while something is
-        // stranded behind the band - then the zero ticks of slack are being spent on purpose.
-        // See ZUK_STRANDED_FACE_FLIP.
-        (strandedBehind || tile.x !== trailAnchorX(shieldAtFire)) &&
-        unsyncedBand.every((x) => isCoveredByShield(tile.x, tile.y, x)));
+        (openingSlack > 0
+          ? // THE OPENING, WHERE THE DEADLINE IS KNOWN TO BE FAR OFF. Both hedges below exist
+            // because the tick the shot is aimed on is unknown; here it is known to be at least
+            // ZUK_OPENING_TIGHTEN_TICKS away, so neither is bought and the band is simply widened.
+            // See ZUK_OPENING_SLACK_TILES.
+            isCoveredWithSlack(tile.x, tile.y, shieldAtFire.x, openingSlack)
+          : isCoveredByShield(tile.x, tile.y, shieldAtFire.x) &&
+            // THE TRAILING TILE IS NOT COVER. It is inside the band by TzKalZuk's own test and the
+            // shield's very next step leaves it behind, so treating it as safe banks zero ticks and
+            // is what puts the bot one tile short when the window opens. EXCEPT while something is
+            // stranded behind the band - then the zero ticks of slack are being spent on purpose.
+            // See ZUK_STRANDED_FACE_FLIP.
+            (strandedBehind || tile.x !== trailAnchorX(shieldAtFire)) &&
+            unsyncedBand.every((x) => isCoveredByShield(tile.x, tile.y, x))));
     // Can this tile shoot something still on the shield? Asked before cover, because it is what
     // decides whether leaving cover is worth considering at all.
     const canTag =
@@ -2321,6 +2668,7 @@ export function scoreZukTiles(
     }
 
     parts.sortie = sortie ? ZUK_SORTIE_PENALTY : 0;
+    parts.laneBreak = breaksLane(route, arrivalTicks) ? ZUK_LANE_BREAK_PENALTY : 0;
     // Safe tiles only. A tile that reaches the spawn but does not survive the next shot is not a
     // firing position, it is a death with good sightlines.
     parts.spawnReach =
@@ -2395,6 +2743,7 @@ export function scoreZukTiles(
         parts.zukReach +
         parts.spawnReach +
         parts.sortie +
+        parts.laneBreak +
         parts.healerReach,
       route,
       parts,
@@ -2436,9 +2785,29 @@ export function scoreCandidates(
   const cooldownTicks = Math.max(0, player.attackDelay ?? 0);
   // The Jad-wave analogue of the focus nibbler: null on every other wave, so this costs
   // nothing outside 67+.
-  const healer = focusHealer(region, player);
-  // The drift anchor for the open-arena waves; null everywhere else.
-  const home = waveHomeTile((region as unknown as { wave?: number }).wave ?? 0);
+  const healer = jadWaveFocus(region, player);
+  const wave = (region as unknown as { wave?: number }).wave ?? 0;
+  const waveHome = waveHomeTile(wave);
+  /**
+   * HOME PULL IS OFF ON THE JAD WAVES, and the dump that killed it is worth recording.
+   *
+   * With three Jads up and the healers silenced, every tile in the band scored identically -
+   * focus 1, reach 1, los 0.25 - and the ONLY thing separating them was this term at 0.01 per
+   * tile. Wave 68's home tile is 25,27, which is exactly where the wave spawns the player. So the
+   * tile the bot was already standing on was the unique maximum of the whole grid, `bestMove`
+   * needs a STRICT improvement to move, and the bot was pinned to its spawn tile for as long as
+   * the real terms stayed flat. The anchor meant to stop drift had become an anchor full stop.
+   *
+   * Removing it does not reintroduce drift, which is what it was added for. A tie holds: with
+   * `IMPROVEMENT_MARGIN` at 0 and a strict `>`, a candidate equal to holding never wins, so a
+   * flat grid parks the bot where it stands rather than walking it to a wall. What moves it now
+   * is a tile that genuinely scores higher - the focus pull, reach, line of sight - which is the
+   * only reason worth moving for on a wave with no pillars to hide behind.
+   *
+   * `waveHome` itself is kept: the between-waves station and the last-npc walk home both anchor
+   * to it, and neither is a per-tile gradient over a live fight.
+   */
+  const home = wave >= 67 && wave <= 68 ? null : waveHome;
   // Frozen once and shared by all 441 simulations. Rebuilt each call rather than cached, because
   // mobs move and pillars die.
   // Jad included: the tile score is the one consumer that has to see it hitting, or the grid
@@ -2480,7 +2849,7 @@ export function scoreCandidates(
   const liveNpcs =
     visibleMobs(region).filter((mob) => mob.dying === -1).length +
     mobs.filter((mob) => mob.ghost).length;
-  const lastNpcHome = liveNpcs === 1 ? home ?? HOME_TILE : null;
+  const lastNpcHome = liveNpcs === 1 ? waveHome ?? HOME_TILE : null;
 
   const scored: ScoredTile[] = [];
   for (const tile of tiles) {
@@ -2566,13 +2935,42 @@ export function bestMove(
     return null;
   }
 
-  let best = holding;
+  // STANDING IN A MELEE RING IS THE ONE STATE WHERE HOLDING IS NOT AN OPTION.
+  //
+  // The route veto exempts holding on purpose - a veto able to refuse standing still has nothing
+  // left to fall back on - but the exemption has a hole at exactly the moment it matters. Inside
+  // a mager, ranger, blob or Jad's ring, the tile under our feet is scored like any other, and
+  // since every candidate that would LEAVE has to beat it by the margin, a bad enough position
+  // can simply hold. That is the bot choosing to stand in a coin flip it cannot pray.
+  //
+  // So while the current tile is forbidden, it is struck from the comparison entirely: the winner
+  // is the best tile that is not this one, whatever it scores. Every candidate still in the list
+  // has already passed the route veto, so any of them is an exit. Re-decided from scratch each
+  // tick, which is what re-clicks the escape rather than trusting a walk issued three ticks ago.
+  const escaping = insideForbiddenZone(snapshotMobs(region, player, true), here.x, here.y);
+
+  let best = escaping ? null : holding;
   for (const candidate of candidates) {
+    if (escaping) {
+      if (candidate.tile.x === here.x && candidate.tile.y === here.y) {
+        continue; // the tile we are escaping FROM is not an escape
+      }
+      if (
+        !best ||
+        candidate.score > best.score ||
+        (candidate.score === best.score && candidate.route.length < best.route.length)
+      ) {
+        best = candidate;
+      }
+      continue;
+    }
+    // `best` is only ever null on the escape path above, which never falls through to here.
+    const incumbent = best as ScoredTile;
     // Has to beat HOLDING by the margin to be worth moving to at all.
     if (candidate.score <= holding.score + IMPROVEMENT_MARGIN) {
       continue;
     }
-    const better = candidate.score > best.score;
+    const better = candidate.score > incumbent.score;
     // Ties break on the length of the walk. Without this the winner was simply whichever
     // qualifying tile came first out of candidateTiles - which scans y then x from the corner of
     // the box, so it was always the lowest-x, lowest-y tile that qualified. With a binary score
@@ -2583,7 +2981,7 @@ export function bestMove(
     // there: a tile six tiles off but behind a pillar is a longer walk than one eight tiles off
     // in the open, and the route is already computed.
     const equalButNearer =
-      candidate.score === best.score && candidate.route.length < best.route.length;
+      candidate.score === incumbent.score && candidate.route.length < incumbent.route.length;
     if (better || equalButNearer) {
       best = candidate;
     }

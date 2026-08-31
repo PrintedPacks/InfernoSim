@@ -12,7 +12,7 @@ import {
   RANGE_PRAYER,
 } from "./OverheadPlanner";
 import { ArenaSnapshot } from "./ArenaSnapshot";
-import { simulateTrajectory, snapshotMobs, Threat } from "./Trajectory";
+import { SimMob, simulateTrajectory, snapshotMobs, Threat, withinMeleeRange } from "./Trajectory";
 
 /**
  * Decides which overhead prayer must be lit, based on which mobs are about to attack.
@@ -349,6 +349,47 @@ export function plannedOverhead(
     if (styleToPrayer(threat.style)) {
       threats.push({ tick: 1, styles: [threat.style], maxHit: threat.maxHit, name: "Jad" });
     }
+  }
+
+  // THE MELEE NET. Jad's ranged attack is the one this planner watches for, because it is the
+  // one with three ticks of warning - but it is not the only thing Jad does.
+  //
+  // `Mob.attack()` re-rolls at fire time: with `canMeleeIfClose()` truthy and the player inside
+  // the melee ring, a coin flip replaces the ranged style with a stab, at the same 113. That
+  // roll happens on the FIRE tick, not three ticks earlier, so it never passes through
+  // JadTracker's ledger and the ranged threat above says nothing about it. Standing in the ring
+  // with Magic up, the whole plan is blind to the half of the attack that is coming as melee.
+  //
+  // Filed on the next tick when Jad's cooldown is spent (`attackDelay <= 1`), which is exactly
+  // when a fire can happen. It is a real entry in the plan rather than a veto: `planOverheads`
+  // weighs it against whatever else lands on that tick and spends the slot on the bigger number,
+  // which is the right answer when both are 113 and only one of them can be blocked.
+  //
+  // This does not make standing next to Jad acceptable - `TileScorer.routeEntersForbiddenZone`
+  // still deletes those tiles outright. It covers the ticks where the bot is in the ring anyway:
+  // walking out of it, or shoved into it by a Jad that closed the distance itself.
+  for (const mob of mobs) {
+    if (!isJad(mob) || mob.dying > -1) {
+      continue;
+    }
+    const melee = mob.canMeleeIfClose?.();
+    if (!melee || ((mob as unknown as { attackDelay?: number }).attackDelay ?? 0) > 1) {
+      continue;
+    }
+    const box = {
+      x: mob.location.x,
+      y: mob.location.y,
+      size: mob.size,
+    } as unknown as SimMob;
+    if (!withinMeleeRange(box, here.x, here.y)) {
+      continue;
+    }
+    threats.push({
+      tick: 1,
+      styles: [melee],
+      maxHit: mob.maxHit ?? 0,
+      name: "Jad melee",
+    });
   }
 
   return planOverheads(threats).plan.get(1) ?? null;

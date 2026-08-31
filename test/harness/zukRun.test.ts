@@ -37,12 +37,15 @@ import { EntityNames, ItemName, Player } from "osrs-sdk";
 import { weaponForSet } from "../../src/content/inferno/js/GearSets";
 
 import { committedStyle, isJad, ticksUntilJadLands } from "../../src/content/inferno/js/JadTracker";
+import { prayerForAttackStyle } from "../../src/content/inferno/js/OverheadPlanner";
+import { JAD_LAND_DELAY } from "../../src/content/inferno/js/ShieldAttackerClock";
 import { InfernoAutomation } from "../../src/content/inferno/js/InfernoAutomation";
 import { isCoveredByShield, projectShield, sortieDebug } from "../../src/content/inferno/js/TileScorer";
 import { PlayerAttackClock } from "../../src/content/inferno/js/PlayerAttackClock";
 import { ZukAttackClock } from "../../src/content/inferno/js/ZukAttackClock";
 import type { ShieldDirection } from "../../src/content/inferno/js/ZukShield";
 import { seedEverything } from "../../src/content/inferno/js/SeededRandom";
+import { ZukSetTimer } from "../../src/content/inferno/js/ZukSetTimer";
 import { bootHarness, out, restoreConsole, silenceConsole } from "./bootHarness";
 import { buildReplayHtml } from "./replayHtml";
 
@@ -109,6 +112,13 @@ const TRACE = (() => {
   const match = raw.match(/^(\d+)\s*-\s*(\d+)$/);
   return match ? { from: parseInt(match[1], 10), to: parseInt(match[2], 10) } : null;
 })();
+/**
+ * Where the trace file lands. The default carries both the seed and the shield direction, so a
+ * west run and an east run of the same seed sit side by side instead of overwriting each other.
+ */
+const TRACE_OUT =
+  process.env.ZUK_TRACE_OUT ||
+  path.resolve("test/harness/zuk-results", `seed-${SEED}-${SHIELD}.trace.log`);
 
 // Must match the sidebar's <select id="loadouts"> options - an unknown value would set the
 // select to "" and InfernoLoadout.getLoadout() would return nothing.
@@ -121,6 +131,7 @@ const VALID_LOADOUTS = [
   "rcb",
   "zerker",
   "pure",
+  "pure_rcb",
   "max_melee",
 ];
 
@@ -412,6 +423,8 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
   const sortieRefusals = new Map<string, number>();
   let sortieOfferedTicks = 0;
   let sortieWantedTicks = 0;
+  /** One pipe-separated line per traced tick, plus FIRED lines - written to TRACE_OUT. */
+  const traceLines: string[] = [];
   /** One frame per tick when ZUK_REPLAY=1 - see REPLAY. */
   const replayFrames: {
     t: number;
@@ -510,6 +523,28 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
   let crossStyleCollisions = 0;
   let sameStyleCollisions = 0;
   let maxTagged = 0;
+  // ---- FIRE WATCH state: observed attacks, not delay arithmetic. A fire is the delay RESET
+  // (attackDelay jumping to the full attackSpeed - `didAttack` is the only writer that does
+  // that), the same rule ShieldAttackerClock uses. Everything the off-tick verdict reports is
+  // derived from these observed events, because `(tick + attackDelay) % 4` is only meaningful
+  // for a mob ON its firing cycle - pre-opening and walking mobs have a drifting negative delay
+  // and produced phantom collisions (seeds 29 and 75 of the 2026-08-22 sweep). ----
+  const lastDelayByMob = new Map<unknown, number>();
+  /** Per tracked attacker: every observed fire, with the overhead that was up when it mattered. */
+  const fireHistory = new Map<
+    unknown,
+    { name: string; speed: number; demands: { tick: number; atPlayer: boolean }[] }
+  >();
+  /**
+   * Prayer-demand ledger, keyed by the tick the overhead is actually tested on: the FIRE tick
+   * for the pair (damage is rolled, and blocked, at fire time), the LANDING tick for Jad
+   * (JadMagicWeapon/JadRangeWeapon defer the real attack by JAD_LAND_DELAY).
+   */
+  const demandsByTick = new Map<
+    number,
+    { name: string; style: string; prayer: string | null }[]
+  >();
+  let unprayedFires = 0;
   let lastSupplies = startingSupplies;
   let uncoveredTicks = 0;
   let damageTaken = 0;
@@ -582,6 +617,16 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
       const hpBefore = hp();
       const zukBefore = (findLive(EntityNames.TZ_KAL_ZUK) as { currentStats?: { hitpoint: number } } | null)
         ?.currentStats?.hitpoint;
+      // For the FIRED trace lines. A shot that goes out THIS tick uses the aggro and the weapon
+      // from before tickWorld runs: aggro set by a click only changes in postTick, after the
+      // attack has already resolved, and a queued gear switch only matures when the timers
+      // advance below - so the post-tick readings can both belong to the NEXT shot, not this one.
+      const wornBefore =
+        (anyPlayer as unknown as { equipment?: { weapon?: { itemName?: string } } }).equipment
+          ?.weapon?.itemName ?? "none";
+      const aggroBefore =
+        (anyPlayer as unknown as { aggro?: { mobName?: () => string } }).aggro?.mobName?.() ??
+        null;
 
       // An engine throw is a finding about the sim, not a harness failure - capture it, then fail
       // the test explicitly below once the report has printed.
@@ -711,7 +756,7 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
       if (TRACE && tick >= TRACE.from && tick <= TRACE.to) {
         const shieldMob = liveMobs().find(
           (mob) => mob.mobName() === EntityNames.INFERNO_SHIELD,
-        ) as { location?: { x: number }; movementDirection?: boolean; currentStats?: { hitpoint: number } } | undefined;
+        ) as { location?: { x: number }; movementDirection?: boolean; frozen?: number; currentStats?: { hitpoint: number } } | undefined;
         const band = shieldMob?.location
           ? `${shieldMob.location.x}..${shieldMob.location.x + 4}${shieldMob.movementDirection ? "E" : "W"}`
           : "gone";
@@ -734,6 +779,72 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
             `| ${mobs || "no set mobs"} ` +
             `| ${InfernoAutomation.getAttackState?.() ?? "-"}`,
         );
+
+        // ---- The file line: every field of the decision, one line per tick. Same readings as
+        // the console line where the two overlap, so they cannot disagree. ----
+        const fileBand = shieldMob?.location
+          ? `${shieldMob.location.x}..${shieldMob.location.x + 4}|` +
+            `${shieldMob.movementDirection ? "E" : "W"}|frz${shieldMob.frozen ?? 0}`
+          : "gone";
+        const untilSet = ZukSetTimer.ticksUntilSet();
+        const setIn = `${untilSet ?? "-"}${ZukSetTimer.isPaused() ? "P" : ""}`;
+        const zukNowHp =
+          (findLive(EntityNames.TZ_KAL_ZUK) as { currentStats?: { hitpoint: number } } | null)
+            ?.currentStats?.hitpoint ?? "-";
+        const chosen = InfernoAutomation.getChosenTile?.() ?? null;
+        const dest =
+          (anyPlayer as unknown as { destinationLocation?: { x: number; y: number } | null })
+            .destinationLocation ?? null;
+        const walking =
+          dest && (dest.x !== anyPlayer.location.x || dest.y !== anyPlayer.location.y)
+            ? `->${dest.x},${dest.y}`
+            : "-";
+        const worn =
+          (anyPlayer as unknown as { equipment?: { weapon?: { itemName?: string } } }).equipment
+            ?.weapon?.itemName ?? "none";
+        const decision = InfernoAutomation.getZukDecision?.() ?? {
+          target: null,
+          band: "-",
+          tagGate: null,
+        };
+        const gate =
+          decision.tagGate === null
+            ? "-"
+            : decision.tagGate.safe
+              ? "ok"
+              : `HELD: ${decision.tagGate.reason ?? "?"}`;
+        const board = liveMobs()
+          .filter((mob) => mob.mobName() !== EntityNames.INFERNO_SHIELD)
+          .map((mob) => {
+            const name = mob.mobName();
+            const tagged =
+              (mob as { aggro?: unknown }).aggro === anyPlayer
+                ? "TAGGED"
+                : name === EntityNames.JAL_ZEK ||
+                    name === EntityNames.JAL_XIL ||
+                    name === EntityNames.JAL_TOK_JAD
+                  ? "onShield"
+                  : "untagged";
+            return `${name.replace("Jal-", "")}@${mob.location.x},${mob.location.y} ${tagged}`;
+          })
+          .join("; ");
+        traceLines.push(
+          `t${tick} | ${anyPlayer.location.x},${anyPlayer.location.y} | ${fileBand} | ` +
+            `zukIn ${ZukAttackClock.ticksUntilNextAttack() ?? "-"} | setIn ${setIn} | ` +
+            `zukHp ${zukNowHp} | chosen ${chosen ? `${chosen.x},${chosen.y}` : "-"} | ` +
+            `walk ${walking} | weapon ${worn} | ` +
+            `untilShot ${PlayerAttackClock.earliestShotOffset() ?? "-"} | ` +
+            `target ${decision.target ?? "-"}[${decision.band}] | gate ${gate} | ` +
+            `overhead ${overhead()} | ${board || "no mobs"}`,
+        );
+        // The clock's own fire signal - attackDelay going up this tick - so this cannot disagree
+        // with what the engine did. Weapon and target are the pre-tick readings; see wornBefore.
+        if (PlayerAttackClock.firedOnTickOffset(0)) {
+          traceLines.push(
+            `FIRED t${tick} | ${anyPlayer.location.x},${anyPlayer.location.y} | ` +
+              `${wornBefore} | ${aggroBefore ?? "-"}`,
+          );
+        }
       }
 
       if (REPLAY) {
@@ -1023,54 +1134,97 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
         );
       }
 
-      // ---- OFF-TICK WATCH. Only one overhead can be up, so two tagged attackers sharing a fire
-      // tick matters ONLY when they need different prayers: same-style mobs are covered by one
-      // prayer and cost nothing (measured - three magers stacked on one residue did zero damage,
-      // while one ranger sharing a mager's tick did all 74 points of mob damage). Restricted to
-      // attackSpeed 4, the shared cycle: Zuk is speed 14 (7 enraged) and has no stable mod-4
-      // residue, so counting it here reported collisions that did not exist. ----
-      const tagged = liveMobs().filter((mob) => mob.aggro === player && mob.attackSpeed === 4);
-      const byResidue = new Map<number, { name: string; style: string }[]>();
-      for (const mob of tagged) {
-        const residue = (((tick + (mob.attackDelay ?? 0)) % 4) + 4) % 4;
-        let style = "?";
-        try {
-          style = mob.attackStyleForNewAttack?.() ?? "?";
-        } catch (e) {
-          // A style that cannot be read yet is not one that can be prayed against either.
+      // ---- OFF-TICK WATCH, from OBSERVED fires. Two attackers only cost hitpoints when their
+      // prayer demands land on the SAME tick needing DIFFERENT overheads, so that - and nothing
+      // reconstructed from attackDelay arithmetic - is what gets counted. The pair's demand tick
+      // is its fire tick (Weapon.attack rolls and blocks damage at fire time); Jad's is its
+      // LANDING tick, JAD_LAND_DELAY after the fire, because its weapons defer the real attack.
+      // Zuk stays out: its hits are positional and no overhead answers them. ----
+      {
+        // 1. Detect this tick's fires: attackDelay jumping UP to the full attackSpeed. The two
+        // other upward writers are not attacks and do not match it - the flinch parks the delay
+        // at flinchDelay + 1 (3) and the mager's resurrection branch writes a flat 8.
+        const watched = liveMobs().filter((mob) => {
+          const name = mob.mobName();
+          return (
+            name === EntityNames.JAL_ZEK || name === EntityNames.JAL_XIL || isJad(mob)
+          );
+        });
+        for (const mob of watched) {
+          const delay = mob.attackDelay ?? 0;
+          const previous = lastDelayByMob.get(mob);
+          lastDelayByMob.set(mob, delay);
+          if (previous === undefined || delay <= previous || delay !== (mob.attackSpeed ?? 4)) {
+            continue;
+          }
+          const jad = isJad(mob);
+          const name = mob.mobName();
+          // Style by name for the pair - constant, and asking attackStyleForNewAttack would be
+          // honest too but Jad's version is a fresh seeded draw, so names keep the rule uniform.
+          // Jad's real style was captured at the animation commit by JadTracker this very tick.
+          const style = jad
+            ? committedStyle(mob) ?? "unknown"
+            : name === EntityNames.JAL_ZEK
+              ? "magic"
+              : "range";
+          const atPlayer = mob.aggro === player;
+          const demandTick = tick + (jad ? JAD_LAND_DELAY : 0);
+          const record = fireHistory.get(mob) ?? {
+            name,
+            speed: mob.attackSpeed ?? 4,
+            demands: [],
+          };
+          record.demands.push({ tick: demandTick, atPlayer });
+          fireHistory.set(mob, record);
+          if (atPlayer) {
+            const list = demandsByTick.get(demandTick) ?? [];
+            list.push({ name, style, prayer: prayerForAttackStyle(style) });
+            demandsByTick.set(demandTick, list);
+          }
         }
-        const list = byResidue.get(residue) ?? [];
-        list.push({ name: mob.mobName(), style });
-        byResidue.set(residue, list);
+
+        // 2. Judge THIS tick's demands against the overhead that was actually up while its
+        // attacks resolved. Reading the controller HERE, after tickWorld, is deliberate: a
+        // toggle made in postTick lives in `nextActiveState` until BasePrayer.tick() commits it
+        // during the NEXT tick, so the isActive-based reading at this point is exactly the
+        // overhead this tick's attackSteps saw - postTick's fresh clicks are not yet in it.
+        // Jad's entry was filed JAD_LAND_DELAY ticks ago and the pair's just now, so by this
+        // point the ledger for the current tick is complete.
+        const overheadThisTick = overhead();
+        const due = demandsByTick.get(tick) ?? [];
+        demandsByTick.delete(tick);
+        for (const demand of due) {
+          if (demand.prayer !== null && demand.prayer !== overheadThisTick) {
+            unprayedFires++;
+            note(
+              `UNPRAYED ${demand.name}(${demand.style}) fire judged this tick - ` +
+                `overhead was ${overheadThisTick}`,
+            );
+          }
+        }
+        if (due.length >= 2) {
+          const prayers = due
+            .map((demand) => demand.prayer)
+            .filter((value, index, all) => all.indexOf(value) === index);
+          const names = due.map((demand) => `${demand.name}(${demand.style})`).join(" + ");
+          const key = `${tick}:${names}`;
+          if (!collisionsSeen.has(key)) {
+            collisionsSeen.add(key);
+            if (prayers.length > 1 || prayers.includes(null)) {
+              crossStyleCollisions++;
+              note(`OFF-TICK OVERLAP t${tick}: ${names} - one of these is unblockable`);
+            } else {
+              sameStyleCollisions++;
+              note(`same-style overlap t${tick}: ${names} - one prayer covers both, free`);
+            }
+          }
+        }
+        // Kept for the summary's peak-attackers figure, same meaning as before.
+        maxTagged = Math.max(
+          maxTagged,
+          liveMobs().filter((mob) => mob.aggro === player && mob.attackSpeed === 4).length,
+        );
       }
-      byResidue.forEach((members, residue) => {
-        if (members.length < 2) {
-          return;
-        }
-        const styles = members.map((m) => m.style).filter((v, i, a) => a.indexOf(v) === i);
-        const names = members.map((m) => m.name).sort().join("+");
-        const key = residue + ":" + names;
-        if (collisionsSeen.has(key)) {
-          return;
-        }
-        collisionsSeen.add(key);
-        if (styles.length > 1) {
-          crossStyleCollisions++;
-          note(
-            "CROSS-STYLE COLLISION on residue " + residue + ": " +
-              members.map((m) => m.name + "(" + m.style + ")").join(" + ") +
-              " - one of these is unblockable",
-          );
-        } else {
-          sameStyleCollisions++;
-          note(
-            "same-style collision on residue " + residue + ": " +
-              members.map((m) => m.name).join(" + ") +
-              " (" + styles[0] + ") - one prayer covers all, free",
-          );
-        }
-      });
-      maxTagged = Math.max(maxTagged, tagged.length);
 
       // ---- Supply watch, in doses: what the bot drank, and when. ----
       const nowSupplies = supplies();
@@ -1310,6 +1464,54 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
         `${entry.rephased ? "RE-PHASED" : "phase kept"}${entry.preFirstShot ? " | pre-first-shot" : ""}`,
     );
   }
+
+  // ---- Lanes: each attacker's OBSERVED demand ticks, the ground truth the residue arithmetic
+  // above only approximates. A "slip" is a consecutive pair of at-player demands whose gap is
+  // not a multiple of the mob's speed - the cadence re-anchoring mid-life, which nothing in the
+  // automation currently detects or repairs. The first at-player demand is exempt: the jump
+  // from shield cadence to tag cadence is the flinch doing its job, not a slip. ----
+  const lanes: {
+    name: string;
+    speed: number;
+    firstAtPlayer: number | null;
+    residues: number[];
+    demands: number;
+    slips: number;
+  }[] = [];
+  out("");
+  out("lanes (observed fires; demand tick = fire for the pair, landing for Jad):");
+  if (fireHistory.size === 0) {
+    out("  (no set mob or Jad ever fired)");
+  }
+  fireHistory.forEach((record) => {
+    const atPlayer = record.demands.filter((demand) => demand.atPlayer).map((d) => d.tick);
+    let slips = 0;
+    for (let i = 1; i < atPlayer.length; i++) {
+      if ((atPlayer[i] - atPlayer[i - 1]) % record.speed !== 0) {
+        slips++;
+      }
+    }
+    const residues = atPlayer
+      .map((t) => ((t % 4) + 4) % 4)
+      .filter((value, index, all) => all.indexOf(value) === index);
+    lanes.push({
+      name: record.name,
+      speed: record.speed,
+      firstAtPlayer: atPlayer[0] ?? null,
+      residues,
+      demands: atPlayer.length,
+      slips,
+    });
+    out(
+      `  ${record.name.padEnd(11)} speed ${record.speed} | ` +
+        `${String(record.demands.length).padStart(3)} fires, ` +
+        `${String(atPlayer.length).padStart(3)} at player` +
+        (atPlayer.length > 0
+          ? ` from t${atPlayer[0]} | residues mod4 [${residues.join(",")}] | ` +
+            `${slips === 0 ? "cadence held" : `${slips} SLIP${slips === 1 ? "" : "S"}`}`
+          : ""),
+    );
+  });
 
   out("");
   out("unattributed damage (no projectile to blame - see the note in the source):");
@@ -1738,6 +1940,8 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
     tagCollisions: collisionsSeen.size,
     crossStyleCollisions,
     sameStyleCollisions,
+    unprayedFires,
+    lanes,
     tags: tagLog,
     maxTagged,
     forcedAttacks: InfernoAutomation.getForcedAttackCount?.() ?? 0,
@@ -1774,8 +1978,9 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
       `restore doses ${endingSupplies.restores}/${startingSupplies.restores}`,
   );
   out(
-    `off-tick: ${crossStyleCollisions} CROSS-STYLE collision${crossStyleCollisions === 1 ? "" : "s"} (these cost hp) | ` +
-      `${sameStyleCollisions} same-style (free) | peak ${maxTagged} tagged speed-4 attackers`,
+    `off-tick (observed fires): ${crossStyleCollisions} CROSS-STYLE overlap tick${crossStyleCollisions === 1 ? "" : "s"} (these cost hp) | ` +
+      `${sameStyleCollisions} same-style (free) | ${unprayedFires} UNPRAYED fire${unprayedFires === 1 ? "" : "s"} | ` +
+      `peak ${maxTagged} tagged speed-4 attackers`,
   );
   out(
     `shield ${shieldGoneTick === null ? `${summary.shieldHp} hp` : `DESTROYED on tick ${shieldGoneTick}`} | ` +
@@ -1788,6 +1993,12 @@ test("seeded Zuk fight through the real InfernoAutomation.onTick", () => {
   // Machine-readable, one line, for zukSweep.js. Kept last so a truncated log still ends with it.
   out(`ZUK_JSON ${JSON.stringify(summary)}`);
   out("");
+
+  if (TRACE) {
+    fs.mkdirSync(path.dirname(TRACE_OUT), { recursive: true });
+    fs.writeFileSync(TRACE_OUT, traceLines.join("\n") + "\n");
+    out(`trace written: ${TRACE_OUT} (${traceLines.length} lines)`);
+  }
 
   if (REPLAY) {
     // Beside the log when the sweep says where, otherwise beside the results folder so a bare

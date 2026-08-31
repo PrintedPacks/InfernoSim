@@ -484,6 +484,23 @@ export class InfernoLoadout {
     };
   }
 
+  /**
+   * The pure set with a rune crossbow where the twisted bow was.
+   *
+   * Same derivation as `loadoutMaxRcbSpeedrunner` and for the same reason: everything except
+   * the weapon and its ammo stays `loadoutPure`'s, so a sweep against the pure loadout is
+   * measuring the weapon and nothing else. The Mages Book stays worn through the wave-67 swap -
+   * the crossbow is one-handed so nothing knocks it off, and the pure carries no Crystal Shield
+   * for `gearSetItems` to put on in its place.
+   */
+  loadoutPureRcb(): UnitOptions {
+    const loadout = this.loadoutPure() as UnitOptions;
+    loadout.equipment.ammo = new DiamondBoltsE();
+    loadout.inventory[this.findItemByName(loadout.inventory, ItemName.TWISTED_BOW)] =
+      new InfernoRuneCrossbow();
+    return loadout;
+  }
+
   findItemByName(list: Item[], name: ItemName) {
     return indexOf(map(list, "itemName"), name);
   }
@@ -512,6 +529,7 @@ export class InfernoLoadout {
         player.currentStats.defence = 45;
         break;
       case "pure":
+      case "pure_rcb":
         player.stats.prayer = 52;
         player.currentStats.prayer = 52;
         player.stats.defence = 1;
@@ -543,6 +561,9 @@ export class InfernoLoadout {
         break;
       case "pure":
         loadout = this.loadoutPure();
+        break;
+      case "pure_rcb":
+        loadout = this.loadoutPureRcb();
         break;
       case "rcb":
         loadout = this.loadoutRcb();
@@ -598,7 +619,7 @@ export class InfernoLoadout {
       }
     }
 
-    if (this.onTask && this.loadoutType !== "pure") {
+    if (this.onTask && this.loadoutType !== "pure" && this.loadoutType !== "pure_rcb") {
       loadout.equipment.helmet = new SlayerHelmet();
     }
 

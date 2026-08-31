@@ -10,6 +10,7 @@ coverage/
 .eslintcache
 test/harness/sweep-results/
 test/harness/zuk-results/
+test/harness/wave68-results/
 
 # Editors
 .vscode/

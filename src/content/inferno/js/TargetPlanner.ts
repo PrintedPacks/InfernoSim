@@ -413,6 +413,15 @@ export function attackOptionFor(
     return null;
   }
 
+  // A HEALER IS A BLOWPIPE JOB OR NOTHING. The tag is one hit, and the fallback below would
+  // answer with the heavy bow whenever the blowpipe cannot reach - so a healer at 6 or 7 tiles
+  // was picked, the bot switched to the crossbow, and tagged it with that instead. The set and
+  // the range are decided together here, so refusing the fallback for healers is what makes
+  // "blowpipe only" true at the pick, the gear switch and the click alike.
+  if (mob.mobName() === EntityNames.YT_HUR_KOT) {
+    return null;
+  }
+
   const bow = weaponForSet(player, "tbow") as { attackRange?: number } | null;
   const bowRange = bow?.attackRange ?? 0;
   if (bowRange > preferredRange && isAttackable(region, player, mob, bowRange)) {

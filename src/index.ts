@@ -3,6 +3,7 @@
 import { Settings, Region, World, Viewport, MapController, TileMarker, Assets, Location, Chrome, ImageLoader, Trainer, ControlPanelController } from "osrs-sdk";
 
 import { InfernoRegion } from "./content/inferno/js/InfernoRegion";
+import { FightCavesRegion } from "./content/fightcaves/js/FightCavesRegion";
 import { InfernoAutomation } from "./content/inferno/js/InfernoAutomation";
 import { InfernoSettings } from "./content/inferno/js/InfernoSettings";
 import { seedEverything } from "./content/inferno/js/SeededRandom";
@@ -62,6 +63,7 @@ InfernoSettings.readFromStorage();
 // Choose the region based on the URL.
 const AVAILABLE_REGIONS = {
   'inferno.html': new InfernoRegion(),
+  'fightcaves.html': new FightCavesRegion(),
 };
 const DEFAULT_REGION_PATH = 'inferno.html';
 

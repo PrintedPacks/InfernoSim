@@ -33,6 +33,18 @@ const ANIM_TICK_COMMIT = 1;
  */
 const ANIM_TICK_LAND = 4;
 
+/**
+ * Ticks between a Jad attack STARTING and its damage resolving - the tick the overhead is
+ * actually tested on.
+ *
+ * Owned here, where the two animation ticks it is derived from live, and re-exported by
+ * `ShieldAttackerClock` for the callers that already import it from there. It used to be a hand
+ * -copied 3 in that file with a comment admitting it was kept in step by hand; every consumer
+ * that shifts a Jad threat to its landing tick - the lane, the tile scorer's damage model, the
+ * harnesses' prayer ledgers - now reads one number.
+ */
+export const JAD_LAND_DELAY = ANIM_TICK_LAND - ANIM_TICK_COMMIT;
+
 const COMMITTED_STYLE = "__automationCommittedStyle";
 
 type JadLike = Mob & {

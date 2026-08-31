@@ -2,7 +2,7 @@
 
 import { EntityNames, Mob, Player, Region } from "osrs-sdk";
 
-import { committedStyle, isJad, ticksUntilJadLands } from "./JadTracker";
+import { committedStyle, isJad, JAD_LAND_DELAY, ticksUntilJadLands } from "./JadTracker";
 import { SimMob, withinMeleeRange } from "./Trajectory";
 import { visibleMobs } from "./Visibility";
 
@@ -99,10 +99,10 @@ interface Tracked {
 /**
  * Ticks between a Jad attack starting and the overhead being tested.
  *
- * `JadTracker.ANIM_TICK_LAND - ANIM_TICK_COMMIT`, kept in step by hand because that module keeps
- * them private. Three.
+ * Re-exported from `JadTracker`, which derives it from the two animation ticks it sits between.
+ * It used to be a hand-copied 3 here; the copy is gone rather than kept in step by hand.
  */
-export const JAD_LAND_DELAY = 3;
+export { JAD_LAND_DELAY };
 
 /**
  * Ticks until a mob that has never attacked takes its first swing - see the note at the top.

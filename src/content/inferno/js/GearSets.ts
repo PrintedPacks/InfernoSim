@@ -152,9 +152,10 @@ export function requiredSetFor(mob: Mob): GearSetName {
     case EntityNames.JAL_AK_REK_MEJ: // magic bloblet
     case EntityNames.JAL_AK_REK_XIL: // ranged bloblet
     case EntityNames.YT_HUR_KOT: // Jad healer - tagged with the blowpipe, one hit each
+    case EntityNames.JAL_TOK_JAD: // Jad is a blowpipe job, matching the client
       return "blowpipe";
     default:
-      // Rangers, magers, Jad, Zuk - anything worth the Twisted Bow's accuracy.
+      // Rangers, magers, Zuk - anything worth the Twisted Bow's accuracy.
       return "tbow";
   }
 }

@@ -3,7 +3,7 @@
 import { EntityNames, Location, Mob, Player, Region } from "osrs-sdk";
 
 import { ArenaSnapshot, snapshotHasLineOfSight } from "./ArenaSnapshot";
-import { isJad } from "./JadTracker";
+import { isJad, JAD_LAND_DELAY } from "./JadTracker";
 import { knownAttackStyle } from "./PrayerPlanner";
 import { visibleMobs } from "./Visibility";
 
@@ -164,9 +164,10 @@ const key = (x: number, y: number) => `${x},${y}`;
  * What Jad contributes is deliberately a BAD attack to be standing near rather than a precise
  * schedule: its styles are left unknown, so `stylesAtFireTime` reports the range/magic coin
  * flip (plus stab when adjacent, which is what makes standing next to it properly expensive)
- * and `planOverheads` prices the cost of guessing. The ticks it lands on are the animation
- * ticks rather than the landing ticks three later - the total over a horizon is what the tile
- * score needs, and the exact tick only matters to the prayer plan, which does not use this.
+ * and `planOverheads` prices the cost of guessing. The TICKS, though, are exact: each fire is
+ * filed JAD_LAND_DELAY later, on the tick the deferred attack really tests the overhead. The
+ * total over a horizon is not the only thing the tile score needs - `planOverheads` decides one
+ * overhead per tick, so which threats share a tick is what the plan is built out of.
  *
  * Nibblers are the exception and are dropped entirely: JalNib.consumesSpace returns null, so
  * they neither block anything nor get blocked - passing null as mobToAvoid makes the engine's
@@ -836,8 +837,24 @@ export function simulateTrajectory(
       if (mob.delay > 0 || !sees || under) {
         continue;
       }
+      // JAD IS FILED ON THE TICK ITS DAMAGE RESOLVES, not the tick its animation starts.
+      //
+      // `JadMagicWeapon`/`JadRangeWeapon` defer the real `super.attack()` by JAD_LAND_DELAY, so
+      // the fire and the overhead test are three ticks apart. Everything else on the board tests
+      // the prayer at the moment it fires, which is why this loop could file at `tick` for years
+      // without anyone noticing - Jad is the only mob it is wrong for.
+      //
+      // It matters because `planOverheads` reasons per tick. Filed three ticks early, a Jad
+      // landing is planned against whatever else was firing at the ANIMATION tick and is free of
+      // whatever it really collides with - so the plan that comes back is optimal for a tick
+      // pattern the fight does not have. On three Jads held 3 ticks apart by their spawn stuns
+      // that is precisely the difference between "these never collide" and "these always do".
+      //
+      // Deliberately NOT dropped when the landing falls past the horizon: the fire happened
+      // inside the window being priced and the hit is a consequence of it. The horizon governs
+      // how far the board is stepped, not how far a shot already in the air is allowed to fly.
       threats.push({
-        tick,
+        tick: tick + (mob.name === EntityNames.JAL_TOK_JAD ? JAD_LAND_DELAY : 0),
         styles: stylesAtFireTime(mob, px, py),
         maxHit: mob.maxHit,
         name: mob.name,

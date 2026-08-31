@@ -11,6 +11,8 @@
     "test:sweep": "node test/harness/sweep.js",
     "test:zuk": "jest --config jest.zuk.config.js",
     "test:zuk-sweep": "node test/harness/zukSweep.js",
+    "test:wave68": "jest --config jest.wave68.config.js",
+    "test:wave68-sweep": "node test/harness/wave68Sweep.js",
     "lint": "eslint . --ext .ts --fix",
     "prettier": "prettier --write ."
   },

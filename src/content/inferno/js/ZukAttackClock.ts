@@ -36,6 +36,18 @@ export class ZukAttackClock {
   /** The tick we last SAW Zuk attack, or null if we never have. */
   private static lastFireTick: number | null = null;
   /**
+   * The tick Zuk was FIRST seen on, or null while it is not on the board.
+   *
+   * The opening is the one stretch of this fight with no cadence to read, so it is the one
+   * stretch that has to be counted from somewhere else. This is that somewhere: the first tick
+   * the boss is visible AT ALL, which is also the first live tick of the wave - `visibleMobs`
+   * shows nothing while the get-ready countdown runs, and mobs do not step during it either.
+   *
+   * Still nothing a player cannot see. Where `lastFireTick` records an attack happening, this
+   * records the boss appearing; both are events on screen, and neither reads a private counter.
+   */
+  private static spawnTick: number | null = null;
+  /**
    * The attackSpeed Zuk had ON that fire, which is the length of the cycle now running.
    *
    * NOT the same as its speed today, and the difference killed a run. `didAttack` sets
@@ -79,7 +91,12 @@ export class ZukAttackClock {
       ZukAttackClock.lastFireTick = null;
       ZukAttackClock.speedAtLastFire = 0;
       ZukAttackClock.fireTicks = [];
+      ZukAttackClock.spawnTick = null;
       return;
+    }
+
+    if (ZukAttackClock.spawnTick === null) {
+      ZukAttackClock.spawnTick = ZukAttackClock.tick;
     }
 
     const delay = zuk.attackDelay ?? 0;
@@ -122,6 +139,20 @@ export class ZukAttackClock {
   static ticksSinceNthAttack(n: number): number | null {
     const at = ZukAttackClock.fireTicks[n - 1];
     return at === undefined ? null : ZukAttackClock.tick - at;
+  }
+
+  /**
+   * Ticks since Zuk first appeared - 0 on that tick itself - or null while it is not on the board.
+   *
+   * The only clock there is before Zuk has been watched to attack, and deliberately used for
+   * nothing else: from the first observed fire onwards `ticksUntilNextAttack` answers a better
+   * question about every tick that follows, and a count from the spawn would only drift against
+   * it.
+   */
+  static ticksSinceSpawn(): number | null {
+    return ZukAttackClock.spawnTick === null
+      ? null
+      : ZukAttackClock.tick - ZukAttackClock.spawnTick;
   }
 
   /** Zuk as it can be seen this tick - hitpoints above its head, and its known cadence. */

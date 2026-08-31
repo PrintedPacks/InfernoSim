@@ -8,7 +8,7 @@ import { applyAttackPlan } from "./AttackPlanner";
 import { equipSet, GearSetName, isWearing, requiredSetFor, weaponForSet } from "./GearSets";
 import { hasIceBarrageSelected, selectedSpell, selectIceBarrage } from "./SpellCaster";
 import { isAttackable } from "./AttackPlanner";
-import { bestMove, findShield, focusNibbler, HOME_TILE, isCoveredByShield, projectShield, ScoredTile, scoreCandidates, scoreZukTiles, sortieDebug, waveHomeTile } from "./TileScorer";
+import { bestMove, findShield, focusNibbler, HOME_TILE, isCoveredByShield, projectShield, ScoredTile, scoreCandidates, scoreZukTiles, sortieDebug, tileIsForbidden, waveHomeTile } from "./TileScorer";
 import { hasDyingBlob } from "./Trajectory";
 import { PlayerAttackClock } from "./PlayerAttackClock";
 import { ShieldAttackerClock } from "./ShieldAttackerClock";
@@ -16,9 +16,20 @@ import { TagCollisionGate } from "./TagCollisionGate";
 import { ZukAttackClock } from "./ZukAttackClock";
 import { ZukSetTimer } from "./ZukSetTimer";
 import { ArenaSnapshot } from "./ArenaSnapshot";
-import { chooseByPriority, chooseJadWaveTarget, killPriority } from "./KillPriority";
+import { chooseByPriority, chooseJadWaveTarget, committedJad, killPriority, resetJadLock } from "./KillPriority";
+import {
+  healerSwungThisTick,
+  nearestWallTile,
+  planSteppedCrossing,
+  planHealerApproach,
+  readyToTrap,
+  steppedRoute,
+  taggedHealers,
+  trapIsSpent,
+  TrapPhase,
+} from "./HealerTrap";
 import { nibblerThreats, observeNibblers } from "./PillarDefence";
-import { attackOptionFor, chooseTarget } from "./TargetPlanner";
+import { attackOptionFor, attackReachForName, chooseTarget } from "./TargetPlanner";
 import { visibleMobs } from "./Visibility";
 
 // HOME_TILE lives in TileScorer now, imported above: the last-npc home pull anchors to it, and
@@ -121,6 +132,20 @@ export class InfernoAutomation {
   private static attackState = "-";
 
   /**
+   * The wave-69 target decision, broken into the parts `attackState` folds into prose.
+   *
+   * Instrumentation only - nothing in here is read back into a decision. `band` names which
+   * priority band produced the target (untagged-tag / healer / ranger-kill / mager-kill / zuk),
+   * or "held" when the tag gate refused the click; `tagGate` is the gate's verdict verbatim on
+   * the tick it was asked, null on ticks it never got that far.
+   */
+  private static zukDecision: {
+    target: string | null;
+    band: string;
+    tagGate: { safe: boolean; reason: string | null } | null;
+  } = { target: null, band: "-", tagGate: null };
+
+  /**
    * Rolling per-tick log, written to the sidebar rather than the canvas overlay.
    *
    * The overlay banner shows the current tick and cannot be selected, which is useless for
@@ -156,6 +181,14 @@ export class InfernoAutomation {
     return InfernoAutomation.chosenTile;
   }
 
+  static getZukDecision(): {
+    target: string | null;
+    band: string;
+    tagGate: { safe: boolean; reason: string | null } | null;
+  } {
+    return InfernoAutomation.zukDecision;
+  }
+
   static getScoredTiles(): ScoredTile[] {
     return InfernoAutomation.scoredTiles;
   }
@@ -176,6 +209,36 @@ export class InfernoAutomation {
    * re-issued every tick, and one going the wrong way can be redirected.
    */
   private static walkingTo: Location | null = null;
+
+  /**
+   * The Jad the healer trap is being run against, or null when no trap is running.
+   *
+   * Held rather than re-derived so the trap can be abandoned the instant its wall dies - see
+   * `HealerTrap.trapIsSpent`. It is also what tells the weave and the movement layer to stand
+   * down: the trap owns the walk from the moment it starts, and a tick spent shooting or
+   * re-scoring mid-trap is a tick the healers spend spreading back out.
+   */
+  private static trapJad: Mob | null = null;
+
+  /** Where the trap has got to. See `HealerTrap` for what each phase is waiting on. */
+  private static trapPhase: TrapPhase = "idle";
+
+  /**
+   * The untagged healer currently being walked to, or null.
+   *
+   * A committed walk, not a scoring preference - see `HealerTrap.planHealerApproach` for why the
+   * `healerReach` pull could never move the bot on its own. Held so the walk survives the ticks
+   * it takes, and dropped the moment the healer is tagged, dies, or comes into reach.
+   */
+  private static approachHealer: Mob | null = null;
+
+  /**
+   * One trap per set of healers. Latched when a crossing finishes, cleared when the set changes.
+   *
+   * Without it the entry condition - healers tagged, none left healing - is still true the tick
+   * the crossing ends, so the bot would set off for the wall again and never do anything else.
+   */
+  private static trapDone = false;
 
   /**
    * Whether the current `chosenTile` earned the safe-spot bonus when it was chosen.
@@ -292,6 +355,13 @@ export class InfernoAutomation {
     InfernoAutomation.hoverTile = null;
     InfernoAutomation.log = [];
     InfernoAutomation.tickCount = 0;
+    // The Jad wave's target lock lives in KillPriority, so it needs clearing from here like
+    // every other piece of per-run state - see `lockedJad`.
+    resetJadLock();
+    InfernoAutomation.trapJad = null;
+    InfernoAutomation.trapPhase = "idle";
+    InfernoAutomation.trapDone = false;
+    InfernoAutomation.approachHealer = null;
 
     if (enabled) {
       AutomationOverlay.show(() => InfernoAutomation.setEnabled(false));
@@ -739,12 +809,20 @@ ${spellLine}`);
   /**
    * Did this tick issue a walk CLICK, as opposed to letting one already in flight continue?
    *
-   * The distinction is the difference between a lost attack and a free one. `moveTo` calls
-   * `interruptCombat`, so a new tile click wipes aggro and the two cannot share a tick. But a walk
-   * already under way is not re-clicked - `stepMovement` just returns true and leaves it alone -
-   * and an attack does NOT cancel it back: `setAggro` never touches `destinationLocation`, and
-   * `determineDestination` only overrides the walk when line of sight to the target is missing.
-   * So on a committed-walk tick the bot can shoot and keep walking.
+   * The distinction decides which tick a shot may share. `moveTo` calls `interruptCombat`, so a
+   * new tile click wipes aggro and the two cannot share a tick. A walk already under way is not
+   * re-clicked - `stepMovement` just returns true and leaves it alone.
+   *
+   * CORRECTED 2026-08-21 (test/harness/clickPhysics.probe.test.ts): an attack DOES end the walk.
+   * This comment used to claim `setAggro` never touches `destinationLocation` and the walk
+   * carries on underneath a shot - wrong against the current engine, and the client port died on
+   * inheriting it (capture 1787316434906). `Player.determineDestination` runs every movement
+   * step: while aggro holds with the target in range and sight it clamps the destination to the
+   * standing tile (the player STOPS on the shot tick and stays stopped), and out of range it
+   * paths TOWARD the target - the drag. The walk resumes only because `stepMovement` reads
+   * `isMoving` false on the next pass and re-clicks, so a mid-walk shot costs exactly ONE
+   * stationary tick. The cadence keeps pace with the shield anyway: 2 tiles a tick of run
+   * against 1 tile a tick of band.
    */
   private static walkClickIssued = false;
 
@@ -914,6 +992,210 @@ ${spellLine}`);
   private static readonly ZUK_HEAL_COUNT = 8;
   private static zukHealsUsed = 0;
 
+  /**
+   * Waves the attack weave applies to. 67 and 68 - the Jad fights.
+   *
+   * SCOPED, NOT GLOBAL, and deliberately so. Inverting movement and attacking is a real change to
+   * how every tick of every wave is spent, and waves 1-66 are the measured baseline every scoring
+   * change is judged against - re-basing them is a decision to take on purpose with a sweep to
+   * back it, not a side effect of fixing the Jad waves. Widening it is this list.
+   */
+  private static readonly WEAVE_WAVES: number[] = [67, 68];
+
+  /**
+   * Does a ready weapon hold this tick's walk?
+   *
+   * THE GENERAL RULE - movement first, always - is right on a normal wave and wrong on a Jad one,
+   * and the difference is what the movement is FOR. Everywhere else, repositioning is dodging:
+   * which tiles are safe changes every tick, so a tick spent walking buys real damage avoided. On
+   * 67/68 there is nothing to dodge. Jad's range is 50 and it sees the whole arena, so no tile is
+   * safer than another, and what the tile score is actually choosing between is angles on the
+   * same fight. Meanwhile `IMPROVEMENT_MARGIN` is zero, so a tile a single hundredth better wins
+   * and issues a walk - and a walk calls `interruptCombat`. Three Jads at 350 hitpoints each, and
+   * the bot can spend the entire fight one hundredth ahead of itself, never shooting.
+   *
+   * So on those waves a click that will actually fire outranks a reposition. The walk is not
+   * cancelled, only skipped for this tick: nothing here clears `chosenTile`, scoring re-runs next
+   * tick, and the walk re-issues then - which is exactly what a player does, weaving a step
+   * between attacks rather than choosing one or the other for the fight.
+   *
+   * All four conditions have to hold, and the last two are what keep this from being "never
+   * move": the weapon must be off cooldown, something must be worth clicking, and the gear for it
+   * must ALREADY be worn - a tick that would be spent switching is a tick that should be spent
+   * walking instead, since the switch happens either way. And an escape outranks everything: a
+   * bot standing inside a melee ring must leave, whatever its weapon is doing.
+   */
+  private static weaveHoldsWalk(region: Region, player: Player): boolean {
+    if (InfernoAutomation.trapJad || InfernoAutomation.approachHealer) {
+      return false; // a committed walk owns the tick
+    }
+    const wave = (region as unknown as { wave?: number }).wave ?? 0;
+    if (!InfernoAutomation.WEAVE_WAVES.includes(wave)) {
+      return false;
+    }
+    if ((player.attackDelay ?? 0) > 0) {
+      return false;
+    }
+    if (tileIsForbidden(region, player, player.location)) {
+      return false; // escaping beats shooting - see bestMove's escape branch
+    }
+    const target = chooseJadWaveTarget(region, player);
+    if (!target) {
+      return false;
+    }
+    const set = attackOptionFor(region, player, target)?.set ?? requiredSetFor(target);
+    return isWearing(player, set);
+  }
+
+  /**
+   * Drive the healer trap: to the wall, wait for a swing, cross to the far side of Jad.
+   *
+   * Owns `route` for the duration. `stepMovement` already walks a queued route in preference to
+   * the scored station tile, and holds the walk while `trapJad` is set, so once a leg is queued
+   * this only has to decide when that leg is over.
+   *
+   * ABANDONING CLEARS THE ROUTE rather than letting it drain. A crossing whose wall has died is a
+   * walk around empty floor, and the remaining waypoints would keep the bot out of the fight for
+   * several more ticks while healers that are no longer blocked by anything close back in.
+   */
+  /**
+   * Walk to where the nearest untagged healer can be blowpiped, in steps, then hand back over.
+   *
+   * Dropped the moment the healer is tagged, dies, or is close enough to click - at which point
+   * the ordinary attack path picks it up as `chooseJadWaveTarget`'s top choice and fires. The walk
+   * exists only to close a distance the score could not.
+   */
+  private static stepHealerApproach(region: Region, player: Player) {
+    // NEVER WHILE A TRAP IS RUNNING. Both own `route`, and this one runs first - so a healer
+    // coming into view mid-crossing would overwrite the walk the trap had committed to, sending
+    // the bot back the way it came. That is the step-forward-step-back. The trap finishes, then
+    // this picks up whatever is still untagged.
+    if (InfernoAutomation.trapJad) {
+      return;
+    }
+    const reach = attackReachForName(player, EntityNames.YT_HUR_KOT);
+
+    if (InfernoAutomation.approachHealer) {
+      const healer = InfernoAutomation.approachHealer;
+      const done =
+        healer.dying > -1 ||
+        healer.aggro === player ||
+        Math.max(
+          Math.abs(healer.location.x - player.location.x),
+          Math.abs(healer.location.y - player.location.y),
+        ) <= reach;
+      if (done) {
+        InfernoAutomation.approachHealer = null;
+        InfernoAutomation.clearRoute();
+        return;
+      }
+      if (InfernoAutomation.route.length === 0 && !InfernoAutomation.isMoving(player)) {
+        InfernoAutomation.approachHealer = null; // arrived but still short - re-plan next tick
+        return;
+      }
+      InfernoAutomation.attackState = "walking to tag a healer";
+      return;
+    }
+
+    const plan = planHealerApproach(region, player, reach);
+    if (!plan) {
+      return;
+    }
+    InfernoAutomation.approachHealer = plan.healer;
+    InfernoAutomation.setRoute(plan.route);
+    InfernoAutomation.attackState = "walking to tag a healer";
+  }
+
+  private static stepTrap(region: Region, player: Player) {
+    if (InfernoAutomation.trapJad) {
+      if (trapIsSpent(region, player, InfernoAutomation.trapJad)) {
+        InfernoAutomation.trapJad = null;
+        InfernoAutomation.trapPhase = "idle";
+        InfernoAutomation.clearRoute();
+        return;
+      }
+
+      const arrived =
+        InfernoAutomation.route.length === 0 && !InfernoAutomation.isMoving(player);
+
+      if (InfernoAutomation.trapPhase === "to-wall") {
+        if (arrived) {
+          InfernoAutomation.trapPhase = "at-wall";
+        }
+        InfernoAutomation.attackState = "trap: backing into the wall";
+        return;
+      }
+
+      if (InfernoAutomation.trapPhase === "at-wall") {
+        // THE SWING IS THE STARTING GUN. Waiting for it is what makes the crossing a fact rather
+        // than a guess: a healer that has just attacked is adjacent, has spent its tick, and its
+        // next step is computed from where it stands now - bunched against us at the wall - so
+        // the body lands squarely on its line the moment we are across.
+        if (healerSwungThisTick(region, player)) {
+          const crossing = planSteppedCrossing(
+            region,
+            player,
+            taggedHealers(region, player),
+            InfernoAutomation.trapJad,
+          );
+          if (crossing.length === 0) {
+            return; // no clean way round yet - hold at the wall and try again next tick
+          }
+          // Every waypoint against every melee ring on the board, not just this Jad's. The ring
+          // is two tiles clear of ITS OWN wall by construction, but on wave 68 the other two Jads
+          // stand on the same floor and a crossing can pass through one of them.
+          if (crossing.some((tile) => tileIsForbidden(region, player, tile))) {
+            InfernoAutomation.trapJad = null;
+            InfernoAutomation.trapPhase = "idle";
+            InfernoAutomation.trapDone = true; // do not thrash at the wall retrying every tick
+            return;
+          }
+          InfernoAutomation.setRoute(crossing);
+          InfernoAutomation.trapPhase = "crossing";
+          InfernoAutomation.attackState = "trap: crossing to the far side of jad";
+          return;
+        }
+        InfernoAutomation.attackState = "trap: at the wall, waiting for a swing";
+        return;
+      }
+
+      if (InfernoAutomation.trapPhase === "crossing") {
+        if (arrived) {
+          InfernoAutomation.trapJad = null;
+          InfernoAutomation.trapPhase = "done";
+          InfernoAutomation.trapDone = true;
+        } else {
+          InfernoAutomation.attackState = "trap: crossing to the far side of jad";
+        }
+        return;
+      }
+      return;
+    }
+
+    // A NEW SET OF HEALERS RE-ARMS THE TRAP. The latch is about not repeating a trap for the same
+    // healers; a Jad dropping below half spawns three more that have never been trapped.
+    if (InfernoAutomation.trapDone && taggedHealers(region, player).length === 0) {
+      InfernoAutomation.trapDone = false;
+    }
+    if (InfernoAutomation.trapDone || !readyToTrap(region, player)) {
+      return;
+    }
+
+    const wall = nearestWallTile(region);
+    if (tileIsForbidden(region, player, wall)) {
+      return; // a Jad is parked on the wall we would back into; not this tick
+    }
+    // Stepped and mob-aware, or it is a blind run straight through whatever is in the way.
+    const toWall = steppedRoute(region, player.location, wall);
+    if (toWall.length === 0) {
+      return;
+    }
+    InfernoAutomation.trapJad = committedJad(region);
+    InfernoAutomation.trapPhase = "to-wall";
+    InfernoAutomation.setRoute(toWall);
+    InfernoAutomation.attackState = "trap: backing into the wall";
+  }
+
   private static stepMovement(player: Player, region: Region): boolean {
     InfernoAutomation.walkClickIssued = false;
     // An explicitly queued route wins over any station tile.
@@ -927,19 +1209,47 @@ ${spellLine}`);
       }
     }
 
+    // MID-LEG, THE LAP KEEPS THE WALK. The branch above only fires on a tick the player is
+    // standing still, so while it is walking between two corners the code below would ask the
+    // tile scorer where to be, get a different answer - it has no idea a lap is running - and
+    // re-click there, abandoning the circuit on its second tick. Every leg would be cut short and
+    // the lap would never trap anything.
+    //
+    // Gated on the lap rather than on `route.length`, because the final leg has already been
+    // shifted off the queue and would otherwise be the one leg left unprotected. `stepTrap` runs
+    // before this and clears `trapJad` the moment the last waypoint is reached, so this cannot
+    // outlive the circuit.
+    if (InfernoAutomation.trapJad || InfernoAutomation.approachHealer) {
+      return true;
+    }
+
     const station = InfernoAutomation.stationTile(region, player);
     if (player.location.x === station.x && player.location.y === station.y) {
       InfernoAutomation.walkingTo = null;
       return false;
     }
 
-    // Already walking to the right place - stay committed.
+    // Already walking to the right place - stay committed, UNLESS the destination has become a
+    // melee ring since the walk was clicked.
+    //
+    // THE CLICK-PROCESS TEST. The route veto runs inside scoring, against the board as it stood
+    // when the tile was chosen. The click is processed a tick later, from a tile the player has
+    // moved to, against mobs that have moved themselves - and this branch is where a walk chosen
+    // on an older board survives, because "already going there" short-circuits every check that
+    // would re-ask. A Jad that stepped onto the destination in the meantime is the case that
+    // actually happens: the tile was legal when it was picked and is inside a ring by the time
+    // the player arrives on it.
+    //
+    // Re-asked of the DESTINATION rather than the whole route on purpose - see `tileIsForbidden`.
+    // Failing it drops the commitment rather than stopping the bot: the code below re-clicks at
+    // whatever the fresh station is, which scoring has already vetted against the current board.
     const walkingTo = InfernoAutomation.walkingTo;
     if (
       InfernoAutomation.isMoving(player) &&
       walkingTo &&
       walkingTo.x === station.x &&
-      walkingTo.y === station.y
+      walkingTo.y === station.y &&
+      !tileIsForbidden(region, player, walkingTo)
     ) {
       return true;
     }
@@ -1180,6 +1490,9 @@ ${spellLine}`);
    * tile grid draws it with no change to InfernoRegion or TileGrid.
    */
   private static decideZukWave(region: Region, player: Player) {
+    // Fresh every tick, so a tick that returns before target selection cannot inherit last
+    // tick's decision. Instrumentation only - see the field.
+    InfernoAutomation.zukDecision = { target: null, band: "-", tagGate: null };
     // No safespot concept on this wave, so the settle-on-arrival hold that guards one never
     // arms. Cleared rather than left alone, in case a wave was entered from one that had.
     InfernoAutomation.chosenIsSafeSpot = false;
@@ -1300,9 +1613,10 @@ ${spellLine}`);
 
     // Everything past here spends NO click on movement: either standing on station, or part-way
     // through a walk that was clicked on an earlier tick and needs no re-click (see
-    // `walkClickIssued`). A shot on those ticks is free - `setAggro` never touches
-    // `destinationLocation`, and `determineDestination` leaves an in-flight walk alone while line
-    // of sight holds - so the walk carries on underneath it.
+    // `walkClickIssued`). A shot on those ticks is NOT free - setAggro ends the in-flight walk
+    // (the engine clamps the destination to the standing tile while aggro holds; probed by
+    // clickPhysics.probe.test.ts) - but it costs exactly one stationary tick, because
+    // `stepMovement` reads isMoving false on the next pass and re-clicks the walk.
 
     // Standing still, so the tick is free to shoot with.
     //
@@ -1783,6 +2097,17 @@ ${spellLine}`);
         target = pick;
         hasSetMob = true;
       }
+      // Which band won, recorded in the same order the pick fell through. Instrumentation only.
+      InfernoAutomation.zukDecision.target = (pick ?? zuk)?.mobName() ?? null;
+      InfernoAutomation.zukDecision.band = furthestOffUs
+        ? "untagged-tag"
+        : closestHealer
+          ? "healer"
+          : closestRanger
+            ? "ranger-kill"
+            : pick
+              ? "mager-kill"
+              : "zuk";
     }
 
     // Nothing from the set, so it falls to Zuk - and only HERE does Zuk's own reach matter. With
@@ -1961,6 +2286,7 @@ ${spellLine}`);
     // Everything else - Zuk, healers, a mob already ours or already committed to - passes
     // straight through. See TagCollisionGate for the full mechanics.
     const tagGate = TagCollisionGate.evaluate(region, player, target);
+    InfernoAutomation.zukDecision.tagGate = { safe: tagGate.safe, reason: tagGate.reason };
 
     // A SHOT IN HAND BEATS A BETTER WEAPON. See ZUK_SWAP_LEAD for the timing this sits on top of.
     //
@@ -2021,6 +2347,7 @@ ${spellLine}`);
     // through the hold (nothing is firing), so the tag goes out on the first tick the gate
     // clears with no cooldown to wait through.
     if (!tagGate.safe) {
+      InfernoAutomation.zukDecision.band = "held";
       if (player.aggro && !repositioning) {
         InfernoAutomation.walkTo(player, player.location.x, player.location.y);
         InfernoAutomation.target = null;
@@ -2422,13 +2749,30 @@ ${spellLine}`);
       }
     }
 
+    // ---- GO AND TAG THE FAR HEALER. Above the trap, because the trap does not start until every
+    // healer is on us, and above movement because it is a committed walk. See
+    // `HealerTrap.planHealerApproach`.
+    InfernoAutomation.stepHealerApproach(region, player);
+
+    // ---- THE HEALER TRAP. Above movement and attacking both, because it is a committed
+    // sequence rather than a per-tick preference. See HealerTrap.
+    if (!InfernoAutomation.approachHealer) {
+      InfernoAutomation.stepTrap(region, player);
+    }
+
     // Movement and attacking are NOT independent, and the engine enforces it both ways:
     //   Player.moveTo()  -> interruptCombat() -> setAggro(null)   walking drops the target
     //   setAggro(inRangeMob)                                      attacking stops the walk
     // They are both left-clicks on the world and in OSRS the later one wins, so only one can
     // happen per tick. Movement takes precedence: repositioning decides which mobs can hit us
     // and on which ticks, and a delayed attack only costs a little damage output.
-    const repositioning = InfernoAutomation.stepMovement(player, region);
+    //
+    // THE JAD-WAVE WEAVE IS THE EXCEPTION, and it inverts that precedence for one specific tick:
+    // the one where the weapon is off cooldown and something is already in reach. See
+    // `weaveHoldsWalk` for why the general rule is wrong there and stays right everywhere else.
+    const repositioning = InfernoAutomation.weaveHoldsWalk(region, player)
+      ? false
+      : InfernoAutomation.stepMovement(player, region);
     InfernoAutomation.attackState = repositioning ? "moving" : "-";
 
     if (repositioning) {

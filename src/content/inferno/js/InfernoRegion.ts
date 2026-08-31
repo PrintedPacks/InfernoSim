@@ -786,26 +786,36 @@ export class InfernoRegion extends Region {
 
       player.location = { x: 25, y: 27 };
 
-      const stunTimers = [1, 4, 7].sort(() => 0.5 - Math.random());
-
+      // THE SAME STUNS A REAL RUN ARRIVES AT WAVE 68 WITH: 1, 7, 4, matching `spawnNextWave`.
+      //
+      // This block used to shuffle `[1, 4, 7]` while the progression path assigned them fixed, so
+      // booting straight to 68 - which is what every harness run does - produced a wave nobody
+      // ever plays, and a browser at /?wave=68 disagreed with the same wave reached by clearing
+      // 67. The stuns are not cosmetic: they are what holds the three Jads 3 ticks apart, and
+      // that offset IS the attack grid everything downstream is timed against. Shuffled, the
+      // harness varied a phase a real run never varies, so a seed sweep measured the bot against
+      // arrangements the game does not produce.
+      //
+      // Fixed here rather than shuffled there, because the progression path is what a real wave
+      // is, and a harness exists to reproduce it.
       const jad1 = new JalTokJad(
         this,
         { x: 18, y: 24 },
-        { aggro: player, attackSpeed: 9, stun: stunTimers[0], healers: 3, isZukWave: false },
+        { aggro: player, attackSpeed: 9, stun: 1, healers: 3, isZukWave: false },
       );
       this.addMob(jad1);
 
       const jad2 = new JalTokJad(
         this,
         { x: 28, y: 24 },
-        { aggro: player, attackSpeed: 9, stun: stunTimers[1], healers: 3, isZukWave: false },
+        { aggro: player, attackSpeed: 9, stun: 7, healers: 3, isZukWave: false },
       );
       this.addMob(jad2);
 
       const jad3 = new JalTokJad(
         this,
         { x: 23, y: 35 },
-        { aggro: player, attackSpeed: 9, stun: stunTimers[2], healers: 3, isZukWave: false },
+        { aggro: player, attackSpeed: 9, stun: 4, healers: 3, isZukWave: false },
       );
       this.addMob(jad3);
     } else if (this.wave === 69) {

@@ -161,6 +161,7 @@ const VALID_LOADOUTS = [
   "rcb",
   "zerker",
   "pure",
+  "pure_rcb",
   "max_melee",
 ];
 

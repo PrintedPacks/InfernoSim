@@ -24,7 +24,7 @@
 import * as fs from "fs";
 import * as path from "path";
 
-import { Random, Settings, Viewport, World } from "osrs-sdk";
+import { ControlPanelController, Random, Settings, Viewport, World } from "osrs-sdk";
 
 import { InfernoRegion } from "../../src/content/inferno/js/InfernoRegion";
 import { InfernoSettings } from "../../src/content/inferno/js/InfernoSettings";
@@ -132,6 +132,17 @@ export function bootHarness(options: BootOptions): BootedRun {
 
   Viewport.setupViewport(region, true); // force 2D: jsdom has no WebGL
   Viewport.viewport.setPlayer(player); // also wires Trainer.player, which the panels click on
+
+  // Run the control panel's layout pass once, exactly as the browser's first rendered frame
+  // does via ControlPanelController.draw(). getTabScale() is where the engine replaces the
+  // controlPanelScale placeholder (1.5) with the real ratio - and headless, with no render
+  // loop, nothing else ever calls it. Without this, the FIRST panel click of a run computes
+  // its pixel coordinates against the placeholder while controlPosition() - called inside the
+  // same click - corrects the scale before panelClickDown decodes those pixels, so the click
+  // decodes to an empty slot and dies silently. Measured on the 2026-08-22 sweeps: the run's
+  // first prayer flick missed on 150/150 seeds, costing the first set's opening hit (~26 hp
+  // average) - an artifact the browser never shows, because its scale settles at frame one.
+  ControlPanelController.controller?.getTabScale();
 
   player.perceivedLocation = player.location;
   player.destinationLocation = player.location;
